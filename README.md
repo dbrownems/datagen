@@ -1,81 +1,218 @@
 # Datagen
 
-Generate realistic Delta tables and Direct Lake semantic models from Power BI model metadata (`.vpax` files).
+Generate realistic test data and semantic models from Power BI `.vpax` files in Microsoft Fabric.
 
-## Overview
+Datagen reads a `.vpax` export (from [DAX Studio](https://daxstudio.org/) or [VertiPaq Analyzer](https://www.sqlbi.com/tools/vertipaq-analyzer/)), generates Delta tables in a Fabric Lakehouse that match the original model's table sizes, column cardinality, and data distributions, then deploys a semantic model (Direct Lake or Import) with all the measures, relationships, format strings, and display folders from the original model.
 
-Datagen is a pipeline with three commands:
+## Getting Started
 
-1. **`parse`** — Extract table/column statistics from a `.vpax` file → tweakable YAML config
-2. **`generate`** — Create Delta tables in Fabric Spark matching size, cardinality, and distributions
-3. **`model`** — Generate a Direct Lake semantic model definition (TMDL) from the `.vpax` metadata
+### Prerequisites
 
-## Installation
+- A Microsoft Fabric workspace with a Lakehouse
+- A `.vpax` file exported from an existing Power BI semantic model
+- A Fabric notebook attached to the Lakehouse
+
+### Step 1 — Get the wheel
+
+Build from source:
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/dbrownems/datagen.git
+cd datagen
+pip install build
+python -m build --wheel
 ```
 
-In Fabric, only `pyyaml` needs to be installed — `pyspark`, `numpy`, `pandas`, and `delta-spark` are pre-installed.
+This produces `dist/datagen_fabric-0.3.0-py3-none-any.whl`.
 
-## Quick Start
+### Step 2 — Upload to your Lakehouse
 
-### One call does everything (Fabric notebook)
+Upload these files to your Lakehouse **Files/** folder:
+
+| File | Purpose |
+|---|---|
+| `datagen_fabric-0.3.0-py3-none-any.whl` | The datagen package |
+| `YourModel.vpax` | Your model export from DAX Studio |
+
+### Step 3 — Run in a Fabric notebook
 
 ```python
+# Cell 1 — Install
+%pip install /lakehouse/default/Files/datagen_fabric-0.3.0-py3-none-any.whl semantic-link-labs -q
+
+# Cell 2 — Generate everything
 from datagen import generate
 
-generate(spark, "/lakehouse/default/Files/model.vpax")
+report = generate(spark, "/lakehouse/default/Files/YourModel.vpax", overwrite=True)
 ```
 
-This single call:
-1. Reads the `.vpax` and infers data distributions from the column statistics
-2. Generates Delta tables matching the original size and cardinality
-3. Deploys a Direct Lake semantic model with all measures, relationships,
-   format strings, and display folders from the `.vpax`
+That's it. This single call:
 
-Options:
+1. **Parses** the `.vpax` and infers data distributions from column statistics
+2. **Generates** Delta tables matching the original row counts and cardinality
+3. **Deploys** a Direct Lake semantic model with all measures, relationships, and column metadata
+4. **Compares** the generated model against the source `.vpax` and prints an accuracy report
+
+### Options
+
 ```python
 generate(spark, "model.vpax",
-    output_path="Tables/",       # Delta table location
-    seed=42,                     # reproducible generation
-    deploy_model=True,           # False to skip model deployment
-    dataset="MyModel",           # override model name
-    overwrite=True,              # overwrite existing model
+    output_path="Tables/",           # where Delta tables are written
+    seed=42,                         # reproducible generation
+    mode="direct_lake",              # "direct_lake" or "import"
+    deploy_model=True,               # False to skip model deployment
+    compare=True,                    # False to skip comparison report
+    dataset="MyModel",               # override the model name
+    overwrite=True,                  # overwrite existing model
 )
 ```
 
-### Advanced: tweak distributions before generating
+## Semantic Model Modes
 
-If you want to adjust the inferred distributions (cardinality, skewness,
-row counts, etc.), use the multi-step workflow:
+### Direct Lake (default)
+
+Tables reference Delta files directly through entity partitions — no data import needed. Queries read from OneLake at query time.
+
+```python
+generate(spark, "model.vpax", mode="direct_lake")
+```
+
+### Import
+
+Tables use Power Query (M) expressions to read from the Lakehouse SQL endpoint. Data is imported into the model and cached in memory. The model is automatically refreshed after deployment.
+
+```python
+generate(spark, "model.vpax", mode="import")
+```
+
+## Exporting a VPAX File
+
+You need a `.vpax` file from an existing Power BI semantic model. Two ways to get one:
+
+### From DAX Studio
+
+1. Open [DAX Studio](https://daxstudio.org/) and connect to your model
+2. Go to **Advanced → Export Metrics** (or **View → Model Metrics → Export**)
+3. Save the `.vpax` file
+
+### From VertiPaq Analyzer (Bravo)
+
+1. Open [Bravo for Power BI](https://bravo.bi/)
+2. Connect to your model
+3. Export the VertiPaq statistics as a `.vpax` file
+
+## Advanced Workflows
+
+### Tweak distributions before generating
+
+If you want to adjust row counts, cardinality, skewness, or other parameters before generating data, use the multi-step workflow:
 
 ```bash
 # 1. Parse VPAX → editable YAML config
 python -m datagen parse model.vpax -o config.yaml
 
-# 2. Edit config.yaml as needed ...
+# 2. Edit config.yaml as needed (change row counts, distributions, etc.)
 
-# 3. Generate Delta tables from the config
-python -m datagen generate config.yaml
+# 3. Generate Delta tables
+python -m datagen generate config.yaml -o Tables/
 ```
 
-Then deploy the semantic model separately in a Fabric notebook:
+Then deploy the semantic model separately in a notebook:
+
 ```python
 from datagen.model_builder import deploy_semantic_model
-deploy_semantic_model("/lakehouse/default/Files/model.vpax")
+
+deploy_semantic_model("/lakehouse/default/Files/model.vpax", overwrite=True)
 ```
 
-The config YAML controls data generation only; the `.vpax` is always the
-source for the semantic model definition.
+The config YAML controls data generation only. The `.vpax` is always the source for the semantic model definition (measures, relationships, column metadata).
 
-**Offline TMDL generation** (for version control or manual import):
+### Compare a deployed model against the source
+
+```python
+from datagen.compare import compare_model
+
+report = compare_model(
+    source_vpax_path="/lakehouse/default/Files/model.vpax",
+    dataset="MyModel",
+)
+```
+
+This runs `vertipaq_analyzer` on the deployed model and prints a report like:
+
+```
+Table Row Counts:
+  ✓ DimCustomer       expected=  18,484  actual=  18,484  (100.0%)
+  ✓ FactSales         expected=  60,398  actual=  60,398  (100.0%)
+
+Column Cardinality:
+  FactSales:
+    ✓ SalesKey         expected=  60,398  actual=  60,398  (100.0%)
+    ✓ ProductKey       expected=     158  actual=     158  (100.0%)
+    ≈ SalesAmount      expected=   1,021  actual=     987  ( 96.7%)
+
+Overall Accuracy: 98.3%
+  ✓ Exact matches: 28    ≈ Close: 4    ✗ Misses: 0
+```
+
+### Generate TMDL offline (for version control)
 
 ```bash
-python -m datagen model model.vpax --lakehouse MyLakehouse -o MyModel.SemanticModel
+python -m datagen model model.vpax -o MyModel.SemanticModel --mode import
 ```
 
+This generates a TMDL folder that can be committed to Git, imported via MCP `ImportFromTmdlFolder`, or used as a Power BI Project (`.pbip`) definition.
+
+## How Data Generation Works
+
+### Key Column Detection
+
+Columns are automatically identified as keys using a scoring heuristic:
+
+| Signal | Score |
+|---|---|
+| Name ends with Key, ID, Code, Number, etc. | +3 |
+| Column participates in a model relationship | +3 |
+| Cardinality > 90% of row count | +2 |
+
+Score ≥ 3 → marked as a key column. The key generation style is inferred from the data type:
+
+| Data Type | Key Style | Example Values |
+|---|---|---|
+| `int64` | `sequential` | 1, 2, 3, 4, … |
+| `string` (short) | `prefixed` | PROD-001, PROD-002, … |
+| `string` (GUID-like name or length 32-40) | `guid` | `550e8400-e29b-41d4-a716-…` |
+
+Primary keys (cardinality ≥ row count) use direct ID-based indexing so every value appears exactly once. Foreign keys use pool-based selection with realistic frequency skew.
+
+### Value Generation
+
+| Data Type | Method |
+|---|---|
+| **Strings** | Docker-style names: `bold_raven`, `ancient_ivory_cascade`. Length varies naturally around the target average. |
+| **Integers/Doubles** | Skew-normal distribution (scipy if available, numpy fallback). Parameters inferred from VPAX min/max. |
+| **Dates** | Random sampling within a date range anchored to Jan 1 of the current year. |
+| **Booleans** | Bernoulli sampling with configurable `true_ratio`. |
+
+### Value Frequency
+
+Values are selected from pre-generated pools using either:
+
+- **`uniform`** — equal probability for each value
+- **`zipf`** — power-law distribution (some values appear much more frequently)
+
+The `zipf_exponent` controls the skew: `1.0` = moderate, `2.0` = heavy concentration on the most common values.
+
+### Spark Performance
+
+- **`mapInPandas`** — single-pass generation of all columns per partition (no N-way joins)
+- **Broadcast value pools** — unique values generated on the driver, broadcast to executors
+- **Vectorized numpy** — all value selection uses numpy array operations, not Python loops
+- **Deterministic** — same seed produces identical data across runs
+
 ## Config Reference
+
+The YAML config is optional — it's auto-generated from the VPAX. But you can edit it to fine-tune generation parameters:
 
 ```yaml
 model_name: "AdventureWorks"
@@ -86,52 +223,20 @@ tables:
   - name: "Sales"
     row_count: 1000000
     columns:
-      # --- Sequential integer key (primary) ---
       - name: "SalesKey"
         data_type: "int64"
         cardinality: 1000000
         is_key: true
-        key_style: "sequential"       # 1, 2, 3, ...
-        selection: "uniform"
-        distribution:
-          min: 1
-
-      # --- Foreign key (references DimProduct) ---
-      - name: "ProductKey"
-        data_type: "int64"
-        cardinality: 5000
-        is_key: true
         key_style: "sequential"
-        selection: "zipf"             # some products sold more often
-        zipf_exponent: 1.3
+        selection: "uniform"
         distribution:
           min: 1
 
-      # --- Prefixed string key ---
-      - name: "InvoiceID"
-        data_type: "string"
-        cardinality: 1000000
-        is_key: true
-        key_style: "prefixed"         # INV-000001, INV-000002, ...
-        selection: "uniform"
-        distribution:
-          prefix: "INV"
-
-      # --- GUID key ---
-      - name: "TransactionGUID"
-        data_type: "string"
-        cardinality: 1000000
-        is_key: true
-        key_style: "guid"             # random UUID v4 strings
-        selection: "uniform"
-
-      # --- Numeric column ---
       - name: "SalesAmount"
         data_type: "double"
         cardinality: 50000
         selection: "zipf"
         zipf_exponent: 1.2
-        nullable: false
         distribution:
           mean: 150.0
           std_dev: 75.0
@@ -139,7 +244,6 @@ tables:
           min: 0.01
           max: 10000.0
 
-      # --- String column (docker-style names) ---
       - name: "ProductName"
         data_type: "string"
         cardinality: 5000
@@ -147,118 +251,106 @@ tables:
         zipf_exponent: 1.5
         distribution:
           avg_length: 18
-          style: "docker"             # docker | hex | alpha
+          style: "docker"        # docker | hex | alpha
 
-      # --- Date column ---
       - name: "OrderDate"
         data_type: "datetime"
         cardinality: 730
-        selection: "uniform"
         distribution:
           start: "2024-01-01"
           end: "2026-01-01"
 
-      # --- Boolean column ---
       - name: "IsReturned"
         data_type: "boolean"
         cardinality: 2
         distribution:
           true_ratio: 0.05
-
-      # --- Integer column ---
-      - name: "Quantity"
-        data_type: "int64"
-        cardinality: 100
-        selection: "zipf"
-        zipf_exponent: 1.8
-        distribution:
-          mean: 5
-          std_dev: 3
-          min: 1
-          max: 100
 ```
 
-### Key Parameters
+### Config Parameters
 
 | Parameter | Description |
 |---|---|
 | `cardinality` | Number of unique values in the column |
-| `is_key` | `true` if the column is a key (auto-detected from name, relationships, cardinality) |
-| `key_style` | `sequential` (1,2,3…), `prefixed` (PROD-001,PROD-002…), or `guid` (UUID v4 strings) |
-| `selection` | How values are picked: `uniform` (equal frequency) or `zipf` (power-law skew) |
-| `zipf_exponent` | Controls skew in `zipf` selection. `1.0` = moderate, `2.0` = heavy concentration on top values |
-| `distribution.mean/std_dev/skewness` | Shape of the numeric value pool |
-| `distribution.min` | Start value for sequential keys, or lower bound for numeric distributions |
-| `distribution.prefix` | String prefix for `prefixed` key style (auto-derived from column name) |
-| `distribution.avg_length` | Target average string length for text columns |
-| `distribution.style` | String generation style: `docker` (human-readable adj_noun), `hex`, `alpha` |
-| `distribution.true_ratio` | Probability of `True` for boolean columns |
-| `distribution.start/end` | Date range (defaults anchor to Jan 1 of the current year) |
-| `null_ratio` | Fraction of values that should be null (0.0–1.0) |
-
-### Key Column Detection
-
-When parsing a `.vpax` file, columns are scored as potential keys using:
-- **Name** (+3): ends with Key, ID, Code, Number, etc.
-- **Relationships** (+3): column participates in a model relationship
-- **Cardinality** (+2): unique values > 90% of row count
-
-Score ≥ 3 → marked as key. Key style is then inferred:
-- `int64` → `sequential`
-- `string` with GUID-like name or avg length 32–40 → `guid`
-- `string` otherwise → `prefixed`
-
-Primary keys (cardinality ≥ row_count) use direct ID-based indexing so every
-value appears exactly once. Foreign keys use normal pool-based selection.
-
-### String Styles
-
-- **`docker`** — Human-readable names like `bold_raven`, `ancient_ivory_cascade`. Length varies naturally.
-- **`hex`** — Random hex strings like `a3f7b2c1`. Fixed length.
-- **`alpha`** — Random alphabetic strings like `qvxmtb`. Fixed length.
+| `is_key` / `key_style` | Key column detection override. Styles: `sequential`, `prefixed`, `guid` |
+| `selection` | Value frequency: `uniform` or `zipf` |
+| `zipf_exponent` | Skew strength (`1.0` = moderate, `2.0` = heavy) |
+| `distribution.mean/std_dev/skewness` | Numeric value pool shape |
+| `distribution.min/max` | Value bounds |
+| `distribution.prefix` | Prefix for `prefixed` key style (auto-derived from column name) |
+| `distribution.avg_length` | Target average string length |
+| `distribution.style` | String style: `docker`, `hex`, `alpha` |
+| `distribution.start/end` | Date range boundaries |
+| `distribution.true_ratio` | Boolean probability of `True` |
+| `null_ratio` | Fraction of null values (0.0–1.0) |
 
 ## Architecture
 
 ```
                     ┌──────────────────┐    ┌────────────┐    ┌─────────────┐
                ┌───▶│ config_generator │───▶│ config.yaml│───▶│ Spark       │───▶ Delta Tables
-┌──────────┐   │    └──────────────────┘    │ (tweak me) │    │ generator   │
+┌──────────┐   │    └──────────────────┘    │ (optional) │    │ generator   │
 │ .vpax    │───┤                            └────────────┘    └─────────────┘
-│ file     │   │                                                    │
-└──────────┘   │    ┌──────────────────┐    ┌────────────┐    ┌─────┴───────┐
-               └───▶│ model_builder    │───▶│ TMDL folder│───▶│ MCP Deploy  │───▶ Semantic Model
-                    │ (Direct Lake)    │    │            │    │ to Fabric   │
-                    └──────────────────┘    └────────────┘    └─────────────┘
+│ file     │   │
+└──────────┘   │    ┌──────────────────┐    ┌─────────────────────────────────┐
+               ├───▶│ model_builder    │───▶│ Semantic Model (Direct Lake     │
+               │    │ (sempy_labs)     │    │ or Import via Power Query)      │
+               │    └──────────────────┘    └─────────────────────────────────┘
+               │
+               │    ┌──────────────────┐    ┌─────────────────────────────────┐
+               └───▶│ compare          │───▶│ Accuracy Report (row counts,    │
+                    │ (vertipaq_analyzer)   │ cardinality, sizes)             │
+                    └──────────────────┘    └─────────────────────────────────┘
 ```
 
-### Performance Design
-
-- **`mapInPandas`** — Single-pass generation of all columns per partition. No N-way joins.
-- **Broadcast pools** — Unique value pools are pre-generated on the driver and broadcast to executors.
-- **Vectorized numpy** — All value selection uses numpy array operations, not Python loops.
-- **Deterministic** — Same seed produces the same data across runs.
-
-## API Usage
+## API Reference
 
 ```python
-# ── Simplest: one call ──
+# ── One call does everything ──
 from datagen import generate
 
-generate(spark, "model.vpax")
+report = generate(spark, "model.vpax")
+report = generate(spark, "model.vpax", mode="import", overwrite=True)
 
-
-# ── Fine-grained: separate steps ──
+# ── Individual components ──
 from datagen.vpax_parser import parse_vpax
 from datagen.config_generator import generate_config
 from datagen.config import save_config, load_config
 from datagen.spark_generator import generate_all_tables
-from datagen.model_builder import deploy_semantic_model
+from datagen.model_builder import deploy_semantic_model, build_tmdl
+from datagen.compare import compare_model, compare_vpax
 
-# Infer config from VPAX (optionally save/edit it)
+# Parse VPAX
 model = parse_vpax("model.vpax")
-config = generate_config(model)
-save_config(config, "config.yaml")       # optional — edit then reload
 
-generate_all_tables(spark, config)        # or load_config("config.yaml")
-deploy_semantic_model("model.vpax")       # model definition from VPAX
+# Generate config (optionally save/edit)
+config = generate_config(model)
+save_config(config, "config.yaml")
+
+# Generate Delta tables
+generate_all_tables(spark, config)
+# or: generate_all_tables(spark, load_config("config.yaml"))
+
+# Deploy semantic model
+deploy_semantic_model("model.vpax", mode="import", overwrite=True)
+
+# Compare
+report = compare_model("model.vpax", dataset="MyModel")
+
+# Offline TMDL
+build_tmdl("model.vpax", "MyModel.SemanticModel", mode="import")
+```
+
+## CLI Reference
+
+```bash
+# Parse VPAX → YAML config
+python -m datagen parse model.vpax -o config.yaml
+
+# Generate Delta tables from config
+python -m datagen generate config.yaml -o Tables/
+
+# Generate TMDL folder
+python -m datagen model model.vpax --mode direct_lake
+python -m datagen model model.vpax --mode import --lakehouse MyLakehouse
 ```
