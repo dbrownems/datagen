@@ -473,6 +473,23 @@ def deploy_semantic_model(
     )
 
     # ------------------------------------------------------------------
+    # 1b. Set up the lakehouse connection (shared expression)
+    #     Required before adding Direct Lake tables and for Import M partitions.
+    # ------------------------------------------------------------------
+    from sempy_labs.directlake import generate_shared_expression
+
+    shared_expr = generate_shared_expression(
+        item_name=lakehouse,
+        item_type="Lakehouse",
+        workspace=lakehouse_workspace or workspace,
+    )
+
+    with connect_semantic_model(
+        dataset=name, workspace=workspace, readonly=False
+    ) as tom:
+        tom.add_expression(name="DatabaseSource", expression=shared_expr)
+
+    # ------------------------------------------------------------------
     # 2. Add tables — method depends on mode
     # ------------------------------------------------------------------
     if mode == "import":
@@ -581,21 +598,11 @@ _SLL_DATA_TYPE = {
 def _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspace):
     """Add tables in Import mode with M partitions reading from lakehouse."""
     from sempy_labs.tom import connect_semantic_model
-    from sempy_labs.directlake import generate_shared_expression
 
-    # Generate the shared expression for the lakehouse SQL endpoint
-    shared_expr = generate_shared_expression(
-        item_name=lakehouse,
-        item_type="Lakehouse",
-        workspace=lakehouse_workspace or workspace,
-    )
-
+    # Shared expression is already set up by deploy_semantic_model
     with connect_semantic_model(
         dataset=name, workspace=workspace, readonly=False
     ) as tom:
-        # Add shared expression
-        tom.add_expression(name="DatabaseSource", expression=shared_expr)
-
         for table in tables:
             tname = table["name"]
             print(f"  Adding table (Import): {tname}")
