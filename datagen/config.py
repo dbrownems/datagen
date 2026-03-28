@@ -47,6 +47,20 @@ class ColumnConfig:
     is_key: bool = False
     key_style: Optional[str] = None  # "sequential" | "prefixed" | "guid"
 
+    # Fixed values to include in the pool.
+    # Each entry is either a plain value or a dict with "value" and "frequency".
+    # Plain values appear with the same frequency as generated values.
+    # Frequency is a percentage of total rows (0-100) that should contain this value.
+    # Example:
+    #   values: ["Active", "Inactive"]                    # equal frequency
+    #   values:
+    #     - value: "Active"
+    #       frequency: 60                                  # 60% of rows
+    #     - value: "Inactive"
+    #       frequency: 10                                  # 10% of rows
+    #     - "Pending"                                      # remaining share
+    values: Optional[list] = None
+
     # Nullability
     nullable: bool = False
     null_ratio: float = 0.0
@@ -143,6 +157,7 @@ def _clean_column(col_dict):
         "null_ratio": 0.0,
         "is_key": False,
         "key_style": None,
+        "values": None,
     }
     for key, default in defaults_to_strip.items():
         if col_dict.get(key) == default:

@@ -8,7 +8,53 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from .pool_generator import generate_value_pool
+from .pool_generator import generate_value_pool, _parse_fixed_values
+
+
+def _compute_weights(values_spec, pool_size):
+    """Build a probability array for weighted value selection.
+
+    Fixed values with explicit frequency get their specified share.
+    All other values (fixed without frequency + generated) split the
+    remaining probability equally.
+
+    Returns None if no explicit frequencies are specified (use normal
+    selection logic instead).
+    """
+    if not values_spec or pool_size <= 0:
+        return None
+
+    fixed_values, freq_list = _parse_fixed_values(values_spec)
+    n_fixed = len(fixed_values)
+
+    # Check if any entry has an explicit frequency
+    has_freq = any(f is not None for f in freq_list)
+    if not has_freq:
+        return None
+
+    # Build weights array for the full pool
+    weights = np.zeros(pool_size, dtype=np.float64)
+
+    # Sum of explicit frequency percentages
+    explicit_total = sum(f for f in freq_list if f is not None)
+    remaining_pct = max(0.0, 100.0 - explicit_total)
+
+    # Count of values without explicit frequency
+    n_unweighted = pool_size - sum(1 for f in freq_list if f is not None)
+    per_value_pct = remaining_pct / n_unweighted if n_unweighted > 0 else 0.0
+
+    for i in range(pool_size):
+        if i < n_fixed and freq_list[i] is not None:
+            weights[i] = freq_list[i] / 100.0
+        else:
+            weights[i] = per_value_pct / 100.0
+
+    # Normalize to sum to 1
+    total = weights.sum()
+    if total > 0:
+        weights /= total
+
+    return weights.tolist()
 
 
 def _spark_type(data_type):
@@ -48,7 +94,7 @@ def _col_to_dict(col):
     return asdict(col)
 
 
-def _make_partition_generator(pools_bc, cols_bc, seed_bc):
+def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
     """Build the partition generator closure for mapInPandas.
 
     Keeping this as a factory avoids serializing the broadcast variables
@@ -62,6 +108,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc):
         local_pools = pools_bc.value
         local_cols = cols_bc.value
         base_seed = seed_bc.value
+        local_weights = weights_bc.value
 
         # Pre-convert pools to numpy arrays once per executor task
         pool_arrays = {}
@@ -113,8 +160,12 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc):
 
                 # --- All other types: pool-based selection ---
                 else:
-                    selection = col.get("selection", "uniform")
-                    if selection == "zipf":
+                    col_weights = local_weights.get(name)
+                    if col_weights is not None:
+                        # Weighted selection (fixed values with explicit frequencies)
+                        w = np.array(col_weights, dtype=np.float64)
+                        indices = rng.choice(cardinality, size=n, p=w)
+                    elif col.get("selection") == "zipf":
                         exponent = max(col.get("zipf_exponent", 1.0), 0.01)
                         uniform = rng.random(n)
                         indices = np.floor(
@@ -177,11 +228,18 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     # Phase 1 — generate value pools on the driver
     pools = {}
+    weights_map = {}
     for col in columns:
         col_name = col.name if hasattr(col, "name") else col["name"]
         pool = generate_value_pool(col, global_seed)
         pools[col_name] = pool
         print(f"  Pool: {col_name} → {len(pool):,} unique values")
+
+        # Compute per-value weights if fixed values have frequencies
+        values_spec = col.values if hasattr(col, "values") else (col.get("values") if isinstance(col, dict) else None)
+        w = _compute_weights(values_spec, len(pool))
+        if w is not None:
+            weights_map[col_name] = w
 
     # Phase 2 — build output schema
     schema = _build_schema(columns)
@@ -201,9 +259,10 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     pools_bc = spark.sparkContext.broadcast(pools)
     cols_bc = spark.sparkContext.broadcast(col_dicts)
     seed_bc = spark.sparkContext.broadcast(global_seed)
+    weights_bc = spark.sparkContext.broadcast(weights_map)
 
     # Phase 4 — generate with mapInPandas (single pass, all columns at once)
-    gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc)
+    gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc)
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
 
@@ -218,6 +277,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     pools_bc.unpersist()
     cols_bc.unpersist()
     seed_bc.unpersist()
+    weights_bc.unpersist()
 
 
 def generate_all_tables(spark, config, output_path=None, output_format="delta"):
