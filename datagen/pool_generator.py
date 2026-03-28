@@ -242,8 +242,37 @@ def generate_string_pool(dist, cardinality, seed=42):
         return generate_names(cardinality, avg_length=avg_length, seed=seed)
 
 
+def _parse_fixed_values(values_spec):
+    """Parse the values list into (fixed_values, weights) tuples.
+
+    Returns:
+        fixed_values: list of raw values
+        weights: list of frequency floats (0-100) or None for each value.
+            None means "equal share with other unweighted values".
+    """
+    if not values_spec:
+        return [], []
+
+    fixed_values = []
+    weights = []
+    for entry in values_spec:
+        if isinstance(entry, dict):
+            fixed_values.append(entry["value"])
+            weights.append(entry.get("frequency"))
+        else:
+            fixed_values.append(entry)
+            weights.append(None)
+
+    return fixed_values, weights
+
+
 def generate_value_pool(col_config, global_seed=42):
     """Generate a pool of unique values for a column.
+
+    If the column has fixed ``values``, those are placed at the start of
+    the pool and the remaining cardinality is filled with generated values.
+    Any frequency information is returned alongside the pool for the Spark
+    generator to use during row-level selection.
 
     Args:
         col_config: ColumnConfig instance (or dict with same fields).
@@ -260,6 +289,7 @@ def generate_value_pool(col_config, global_seed=42):
         dist = col_config.distribution
         is_key = col_config.is_key
         key_style = col_config.key_style
+        values_spec = col_config.values
     else:
         name = col_config["name"]
         data_type = col_config["data_type"]
@@ -269,13 +299,17 @@ def generate_value_pool(col_config, global_seed=42):
         dist = DistributionConfig(**dist_data) if isinstance(dist_data, dict) else dist_data
         is_key = col_config.get("is_key", False)
         key_style = col_config.get("key_style")
+        values_spec = col_config.get("values")
 
     cardinality = max(1, cardinality)
 
     # Per-column seed for deterministic but independent generation
     col_seed = (global_seed + hash(name)) & 0x7FFFFFFF
 
-    # Key columns get specialised pool generators
+    # Parse fixed values
+    fixed_values, _ = _parse_fixed_values(values_spec)
+
+    # Key columns get specialised pool generators (fixed values not applicable)
     if is_key and key_style:
         if key_style == "sequential":
             start = int(dist.min) if dist.min is not None else 1
@@ -286,17 +320,26 @@ def generate_value_pool(col_config, global_seed=42):
         if key_style == "guid":
             return generate_guid_pool(cardinality, seed=col_seed)
 
-    # Regular columns
+    # Generate the pool with fixed values at the front
+    gen_cardinality = max(0, cardinality - len(fixed_values))
+
     if data_type == "int64":
-        return generate_int64_pool(dist, cardinality, col_seed)
+        generated = generate_int64_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     elif data_type == "double":
-        return generate_double_pool(dist, cardinality, col_seed)
+        generated = generate_double_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     elif data_type == "datetime":
-        return generate_datetime_pool(dist, cardinality, col_seed)
+        generated = generate_datetime_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     elif data_type == "boolean":
-        return generate_boolean_pool(dist, cardinality, col_seed)
+        generated = generate_boolean_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     elif data_type == "string":
-        return generate_string_pool(dist, cardinality, col_seed)
+        generated = generate_string_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     else:
-        # Default to string
-        return generate_string_pool(dist, cardinality, col_seed)
+        generated = generate_string_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
+
+    # Remove any generated values that collide with fixed values
+    fixed_set = set(str(v) for v in fixed_values)
+    generated = [v for v in generated if str(v) not in fixed_set]
+
+    # Combine: fixed values first, then generated (truncate to cardinality)
+    pool = list(fixed_values) + generated
+    return pool[:cardinality]
