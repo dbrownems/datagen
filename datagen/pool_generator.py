@@ -215,8 +215,22 @@ def generate_string_pool(dist, cardinality, seed=42):
 
     avg_length = dist.avg_length or 12
     style = dist.style or "docker"
+    geo_type = dist.geo_type if hasattr(dist, "geo_type") else None
 
-    if style == "docker":
+    if style == "geo" and geo_type:
+        from .geo_generator import (
+            generate_country_pool, generate_state_pool,
+            generate_city_pool, generate_postal_pool,
+        )
+        generators = {
+            "country": generate_country_pool,
+            "state": generate_state_pool,
+            "city": generate_city_pool,
+            "postal_code": generate_postal_pool,
+        }
+        gen = generators.get(geo_type, generate_city_pool)
+        return gen(cardinality, seed=seed)
+    elif style == "docker":
         return generate_names(cardinality, avg_length=avg_length, seed=seed)
     elif style == "hex":
         rng = np.random.default_rng(seed)

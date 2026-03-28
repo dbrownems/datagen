@@ -101,6 +101,47 @@ def _detect_key(col_meta, row_count, relationship_columns):
     return True, None
 
 
+# ---------------------------------------------------------------------------
+# Geography column detection
+# ---------------------------------------------------------------------------
+
+_GEO_PATTERNS = {
+    "country": ["country", "countryname", "countryregion", "nation"],
+    "state": ["state", "statename", "province", "provincename",
+              "stateorprovince", "stateprovince", "region"],
+    "city": ["city", "cityname", "town", "municipality"],
+    "postal_code": ["postalcode", "postal", "zipcode", "zip", "postcode"],
+}
+
+
+def _detect_geo_type(col_meta):
+    """Detect if a column is a geography column by name or data category.
+
+    Returns one of "country", "state", "city", "postal_code", or None.
+    """
+    name = col_meta.get("name", "")
+    lower = name.lower().replace("_", "").replace(" ", "").replace("-", "")
+
+    # Check data category first (from VPAX metadata)
+    data_cat = (col_meta.get("data_category") or "").lower().strip()
+    cat_map = {
+        "country": "country", "countryregion": "country",
+        "stateorprovince": "state", "state": "state", "province": "state",
+        "city": "city",
+        "postalcode": "postal_code", "postal code": "postal_code",
+    }
+    if data_cat in cat_map:
+        return cat_map[data_cat]
+
+    # Fall back to name matching
+    for geo_type, patterns in _GEO_PATTERNS.items():
+        for pattern in patterns:
+            if lower == pattern or lower.endswith(pattern):
+                return geo_type
+
+    return None
+
+
 def _parse_numeric(val_str, data_type):
     """Parse a string value into a numeric type."""
     if val_str is None:
@@ -293,6 +334,16 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None):
 
     # Non-key column: infer distribution normally
     selection, zipf_exp = _infer_selection(cardinality, row_count)
+
+    # Detect geography columns by name or data category
+    geo_type = _detect_geo_type(col_meta)
+    if geo_type and data_type == "string":
+        dist = DistributionConfig(style="geo", geo_type=geo_type)
+        return ColumnConfig(
+            name=name, data_type=data_type, cardinality=cardinality,
+            selection=selection, zipf_exponent=round(zipf_exp, 2),
+            distribution=dist,
+        )
 
     # Infer distribution based on data type
     if data_type in ("int64", "double"):
