@@ -74,9 +74,9 @@ def generate(
         include_calculated=include_calculated,
     )
 
-    # Step 2 — generate Delta tables
+    # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     generate_all_tables(spark, config, output_path=output_path,
-                        output_format=output_format)
+                        output_format=output_format, vpax_model=vpax_model)
 
     # Step 3 — deploy semantic model (optional)
     if deploy_model:
