@@ -20,8 +20,9 @@ class DistributionConfig:
 
     # String distributions
     avg_length: Optional[int] = None
-    style: Optional[str] = "docker"  # "docker" | "hex" | "alpha"
+    style: Optional[str] = "docker"  # "docker" | "hex" | "alpha" | "geo"
     prefix: Optional[str] = None  # For prefixed key style
+    geo_type: Optional[str] = None  # "country" | "state" | "city" | "postal_code"
 
     # Date distributions
     start: Optional[str] = None  # ISO date string
@@ -99,7 +100,7 @@ def _clean_dist(dist_dict, data_type):
         "double": {"mean", "std_dev", "skewness", "min", "max"},
         "datetime": {"start", "end"},
         "boolean": {"true_ratio"},
-        "string": {"avg_length", "style", "prefix"},
+        "string": {"avg_length", "style", "prefix", "geo_type"},
     }
 
     keep = relevant.get(data_type, set())
