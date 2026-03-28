@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datagen-fabric"
+version = "0.3.0"
+description = "Generate realistic Delta tables and Direct Lake semantic models from Power BI .vpax files"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+# These are pre-installed in Fabric; only needed for local dev
+spark = ["pyspark>=3.4.0", "delta-spark>=2.4.0", "pandas>=2.0.0"]
+model = ["semantic-link-labs>=0.14.0"]
+
+[project.scripts]
+datagen = "datagen.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["datagen*"]
