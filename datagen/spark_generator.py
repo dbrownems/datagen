@@ -280,7 +280,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     weights_bc.unpersist()
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta"):
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -288,6 +288,9 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta"):
         config: GenerationConfig dataclass, dict, or path to a YAML config file.
         output_path: Override the output_path in the config (optional).
         output_format: "delta" (default) or "parquet".
+        vpax_model: Parsed VPAX model dict (optional). When provided,
+            date dimension tables are auto-detected and generated with
+            derived column values instead of random data.
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -306,6 +309,12 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta"):
         out_path = output_path or config.get("output_path", "Tables/")
         seed = config.get("seed", 42)
 
+    # Build a lookup of VPAX table metadata for date table detection
+    vpax_tables = {}
+    if vpax_model:
+        for t in vpax_model.get("tables", []):
+            vpax_tables[t["name"]] = t
+
     n = len(tables)
     print(f"{'=' * 60}")
     print(f"Datagen: generating {n} table{'s' if n != 1 else ''} for '{model_name}'")
@@ -317,9 +326,55 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta"):
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
         print(f"[{i}/{n}] {tname}")
-        generate_table(spark, table, out_path, seed, output_format)
+
+        # Check if this is a date table (using VPAX metadata for column roles)
+        vpax_table = vpax_tables.get(tname)
+        if vpax_table and _is_date_table(vpax_table):
+            _generate_date_table_spark(spark, vpax_table, out_path, output_format)
+        else:
+            generate_table(spark, table, out_path, seed, output_format)
         print()
 
     print(f"{'=' * 60}")
     print(f"All {n} tables generated successfully.")
     print(f"{'=' * 60}")
+
+
+def _is_date_table(vpax_table):
+    """Check if a VPAX table is a date dimension."""
+    from .date_table import is_date_table
+    return is_date_table(vpax_table)
+
+
+def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
+    """Generate a date table from VPAX metadata and write it."""
+    from .date_table import generate_date_table
+
+    tname = vpax_table["name"]
+    row_count = vpax_table.get("row_count", 365)
+
+    print(f"  Date table detected — generating {row_count:,} days with derived columns")
+
+    rows = generate_date_table(vpax_table)
+
+    pdf = pd.DataFrame(rows)
+
+    # Convert datetime columns
+    for col in vpax_table.get("columns", []):
+        cname = col["name"]
+        if cname not in pdf.columns:
+            continue
+        if col.get("data_type") == "datetime":
+            pdf[cname] = pd.to_datetime(pdf[cname])
+        elif col.get("data_type") == "int64":
+            pdf[cname] = pdf[cname].astype("int64")
+        elif col.get("data_type") == "boolean":
+            pdf[cname] = pdf[cname].astype("bool")
+
+    sdf = spark.createDataFrame(pdf)
+
+    table_path = f"{output_path.rstrip('/')}/{tname}"
+    fmt = output_format.lower()
+    print(f"  Writing {fmt} table → {table_path}")
+    sdf.write.format(fmt).mode("overwrite").save(table_path)
+    print(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
