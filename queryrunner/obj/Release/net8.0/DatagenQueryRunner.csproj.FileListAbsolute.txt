@@ -1,0 +1,13 @@
+C:\Users\david\source\repos\datagen\queryrunner\bin\Release\net8.0\DatagenQueryRunner.deps.json
+C:\Users\david\source\repos\datagen\queryrunner\bin\Release\net8.0\DatagenQueryRunner.dll
+C:\Users\david\source\repos\datagen\queryrunner\bin\Release\net8.0\DatagenQueryRunner.pdb
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.csproj.AssemblyReference.cache
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.AssemblyInfoInputs.cache
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.AssemblyInfo.cs
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.csproj.CoreCompileInputs.cache
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.sourcelink.json
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.dll
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\refint\DatagenQueryRunner.dll
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\DatagenQueryRunner.pdb
+C:\Users\david\source\repos\datagen\queryrunner\obj\Release\net8.0\ref\DatagenQueryRunner.dll
