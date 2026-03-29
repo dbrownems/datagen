@@ -1,15 +1,14 @@
-"""Compare a generated semantic model against the source VPAX statistics.
+"""Compare generated Delta tables against the generation config.
 
-Two modes:
-  - ``compare_vpax()`` — compare two .vpax files (source vs generated)
-  - ``compare_model()`` — compare a live Fabric semantic model against
-    the source .vpax (uses ``sempy_labs.vertipaq_analyzer``)
+Queries the generated Delta tables with Spark to get actual row counts
+and column cardinality, then compares against the expected values from
+the generation config (YAML or in-memory GenerationConfig).
 
-Both produce a pandas DataFrame report with per-column accuracy metrics.
+The config is the source of truth — not the VPAX — so tweaked row counts,
+cardinalities, and distributions are reflected in the report.
 """
 
 import pandas as pd
-from .vpax_parser import parse_vpax
 
 
 def _pct_diff(actual, expected):
@@ -26,16 +25,38 @@ def _accuracy(actual, expected):
     return max(0.0, 100.0 - _pct_diff(actual, expected))
 
 
-def _extract_source_stats(vpax_path):
-    """Parse a VPAX file into a flat list of {table, column, stat} dicts."""
-    model = parse_vpax(vpax_path)
+def _extract_config_stats(config):
+    """Extract expected row counts and cardinality from a GenerationConfig.
+
+    Args:
+        config: GenerationConfig dataclass, dict, or path to a YAML file.
+
+    Returns:
+        (pandas.DataFrame, model_name, tables_list)
+    """
+    from pathlib import Path
+
+    # Load from file if needed
+    if isinstance(config, (str, Path)):
+        from .config import load_config
+        config = load_config(str(config))
+
+    # Normalize access
+    if hasattr(config, "tables"):
+        tables = config.tables
+        model_name = config.model_name
+    else:
+        tables = config.get("tables", [])
+        model_name = config.get("model_name", "Model")
+
     rows = []
+    tables_out = []
 
-    for table in model.get("tables", []):
-        tname = table["name"]
-        row_count = table.get("row_count", 0)
+    for table in tables:
+        tname = table.name if hasattr(table, "name") else table["name"]
+        row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
+        columns = table.columns if hasattr(table, "columns") else table.get("columns", [])
 
-        # Table-level row
         rows.append({
             "table": tname,
             "column": "(table)",
@@ -43,155 +64,78 @@ def _extract_source_stats(vpax_path):
             "expected": row_count,
         })
 
-        for col in table.get("columns", []):
-            cname = col["name"]
+        col_list = []
+        for col in columns:
+            cname = col.name if hasattr(col, "name") else col["name"]
+            card = col.cardinality if hasattr(col, "cardinality") else col.get("cardinality", 0)
             rows.append({
                 "table": tname,
                 "column": cname,
                 "metric": "cardinality",
-                "expected": col.get("cardinality", 0),
+                "expected": card,
             })
-            if col.get("total_size"):
-                rows.append({
-                    "table": tname,
-                    "column": cname,
-                    "metric": "total_size",
-                    "expected": col["total_size"],
-                })
-            if col.get("dictionary_size"):
-                rows.append({
-                    "table": tname,
-                    "column": cname,
-                    "metric": "dictionary_size",
-                    "expected": col["dictionary_size"],
-                })
+            col_list.append({"name": cname})
 
-    return pd.DataFrame(rows), model
+        tables_out.append({"name": tname, "columns": col_list})
+
+    return pd.DataFrame(rows), model_name, tables_out
 
 
-def _extract_vpax_stats(vpax_path):
-    """Extract stats from a second VPAX in the same format."""
-    model = parse_vpax(vpax_path)
+def _extract_spark_stats(spark, source_tables, output_path):
+    """Get row counts and cardinality from Delta tables using Spark.
+
+    Args:
+        spark: Active SparkSession.
+        source_tables: List of table dicts from the parsed VPAX.
+        output_path: Base path where Delta tables were written.
+
+    Returns:
+        pandas.DataFrame with table/column/metric/actual columns.
+    """
     rows = []
+    base = output_path.rstrip("/")
 
-    for table in model.get("tables", []):
+    for table in source_tables:
         tname = table["name"]
+        table_path = f"{base}/{tname}"
+
+        try:
+            df = spark.read.format("delta").load(table_path)
+        except Exception:
+            try:
+                df = spark.read.parquet(table_path)
+            except Exception:
+                print(f"    ⚠ Could not read {table_path}")
+                rows.append({
+                    "table": tname, "column": "(table)",
+                    "metric": "row_count", "actual": 0,
+                })
+                continue
+
+        row_count = df.count()
         rows.append({
-            "table": tname,
-            "column": "(table)",
-            "metric": "row_count",
-            "actual": table.get("row_count", 0),
+            "table": tname, "column": "(table)",
+            "metric": "row_count", "actual": row_count,
         })
-        for col in table.get("columns", []):
-            cname = col["name"]
-            rows.append({
-                "table": tname,
-                "column": cname,
-                "metric": "cardinality",
-                "actual": col.get("cardinality", 0),
-            })
-            if col.get("total_size"):
+
+        # Column cardinality — single pass with countDistinct for all columns
+        col_names = [c["name"] for c in table.get("columns", [])
+                     if c["name"] in df.columns]
+
+        if col_names:
+            from pyspark.sql.functions import countDistinct
+            agg_exprs = [countDistinct(c).alias(c) for c in col_names]
+            card_row = df.agg(*agg_exprs).collect()[0]
+
+            for cname in col_names:
                 rows.append({
-                    "table": tname,
-                    "column": cname,
-                    "metric": "total_size",
-                    "actual": col["total_size"],
+                    "table": tname, "column": cname,
+                    "metric": "cardinality", "actual": int(card_row[cname]),
                 })
-            if col.get("dictionary_size"):
-                rows.append({
-                    "table": tname,
-                    "column": cname,
-                    "metric": "dictionary_size",
-                    "actual": col["dictionary_size"],
-                })
+
+        print(f"    {tname}: {row_count:,} rows, {len(col_names)} columns checked")
 
     return pd.DataFrame(rows)
-
-
-def _extract_live_stats(dataset, workspace=None):
-    """Get stats from a live semantic model via vertipaq_analyzer."""
-    try:
-        import sempy_labs as sl
-    except ImportError:
-        raise ImportError(
-            "semantic-link-labs is required for compare_model().\n"
-            "Install with:  pip install semantic-link-labs"
-        )
-
-    stats = sl.vertipaq_analyzer(
-        dataset=dataset,
-        workspace=workspace,
-        read_stats_from_data=True,
-    )
-
-    # The returned dict has "tables" and "columns" DataFrames
-    tables_df = stats.get("tables", stats.get("Tables", pd.DataFrame()))
-    cols_df = stats.get("columns", stats.get("Columns", pd.DataFrame()))
-
-    rows = []
-
-    # Table rows — look for common column name patterns
-    if not tables_df.empty:
-        tname_col = _find_col(tables_df, "Table Name", "TableName", "table_name", "Table")
-        rowcount_col = _find_col(tables_df, "Rows", "Row Count", "RowCount", "RowsCount", "Rows Count")
-
-        if tname_col and rowcount_col:
-            for _, row in tables_df.iterrows():
-                rows.append({
-                    "table": str(row[tname_col]),
-                    "column": "(table)",
-                    "metric": "row_count",
-                    "actual": int(row[rowcount_col]) if pd.notna(row[rowcount_col]) else 0,
-                })
-
-    # Column rows
-    if not cols_df.empty:
-        tname_col = _find_col(cols_df, "Table Name", "TableName", "table_name", "Table")
-        cname_col = _find_col(cols_df, "Column Name", "ColumnName", "column_name", "Column")
-        card_col = _find_col(cols_df, "Cardinality", "Column Cardinality", "ColumnCardinality",
-                             "Distinct Values", "DistinctValueCount")
-        size_col = _find_col(cols_df, "Total Size", "TotalSize", "Column Size", "ColumnSize", "Size")
-        dict_col = _find_col(cols_df, "Dictionary Size", "DictionarySize", "Dict Size")
-
-        if tname_col and cname_col:
-            for _, row in cols_df.iterrows():
-                tname = str(row[tname_col])
-                cname = str(row[cname_col])
-
-                if card_col and pd.notna(row.get(card_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "cardinality",
-                        "actual": int(row[card_col]),
-                    })
-                if size_col and pd.notna(row.get(size_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "total_size",
-                        "actual": int(row[size_col]),
-                    })
-                if dict_col and pd.notna(row.get(dict_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "dictionary_size",
-                        "actual": int(row[dict_col]),
-                    })
-
-    return pd.DataFrame(rows)
-
-
-def _find_col(df, *candidates):
-    """Find the first matching column name in a DataFrame."""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for name in candidates:
-        if name in df.columns:
-            return name
-        if name.lower() in cols_lower:
-            return cols_lower[name.lower()]
-    return None
 
 
 def _build_report(source_df, actual_df):
@@ -272,51 +216,30 @@ def _print_report(report, model_name=""):
     print(f"{'=' * 80}\n")
 
 
-def compare_vpax(source_vpax_path, generated_vpax_path, print_report=True):
-    """Compare two VPAX files and report accuracy.
+def compare_tables(spark, config, output_path="Tables/", print_report=True):
+    """Compare generated Delta tables against the generation config.
+
+    Reads the Delta tables with Spark to get actual row counts and
+    cardinality, then compares against the expected values from the
+    config (row_count and cardinality per column).
 
     Args:
-        source_vpax_path: Path to the original .vpax file.
-        generated_vpax_path: Path to the generated model's .vpax export.
+        spark: Active SparkSession.
+        config: GenerationConfig dataclass, dict, or path to a YAML file.
+        output_path: Base directory where Delta tables were written.
         print_report: Whether to print the report to stdout.
 
     Returns:
         pandas.DataFrame with the comparison report.
     """
-    source_df, model = _extract_source_stats(source_vpax_path)
-    actual_df = _extract_vpax_stats(generated_vpax_path)
+    source_df, model_name, tables_list = _extract_config_stats(config)
+
+    print(f"  Comparing generated tables against config ({model_name}) ...")
+    actual_df = _extract_spark_stats(spark, tables_list, output_path)
 
     report = _build_report(source_df, actual_df)
 
     if print_report:
-        _print_report(report, model.get("model_name", ""))
-
-    return report
-
-
-def compare_model(source_vpax_path, dataset=None, workspace=None, print_report=True):
-    """Compare a live semantic model against the source VPAX.
-
-    Runs ``sempy_labs.vertipaq_analyzer`` on the deployed model and
-    compares the stats to the source .vpax file.
-
-    Args:
-        source_vpax_path: Path to the original .vpax file.
-        dataset: Semantic model name (defaults to VPAX model name).
-        workspace: Fabric workspace name or ID.
-        print_report: Whether to print the report to stdout.
-
-    Returns:
-        pandas.DataFrame with the comparison report.
-    """
-    source_df, model = _extract_source_stats(source_vpax_path)
-    name = dataset or model.get("model_name", "Model")
-
-    actual_df = _extract_live_stats(name, workspace)
-
-    report = _build_report(source_df, actual_df)
-
-    if print_report:
-        _print_report(report, name)
+        _print_report(report, model_name)
 
     return report
