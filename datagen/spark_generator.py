@@ -136,6 +136,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
 
             # Pre-compute shared geo indices (all geo columns use the same index)
             geo_indices = None
+            email_indices = None
 
             for col in local_cols:
                 name = col["name"]
@@ -168,6 +169,14 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
                         geo_rng = np.random.default_rng(geo_seed)
                         geo_indices = geo_rng.integers(0, cardinality, size=n)
                     values = pool[geo_indices % cardinality]
+
+                # --- Correlated email+name: share indices ---
+                elif col.get("_email_group"):
+                    if email_indices is None:
+                        email_seed = (base_seed + hash("_email_group") + int(ids[0])) & 0x7FFFFFFF
+                        email_rng = np.random.default_rng(email_seed)
+                        email_indices = email_rng.integers(0, cardinality, size=n)
+                    values = pool[email_indices % cardinality]
 
                 # --- All other types: pool-based selection ---
                 else:
@@ -279,9 +288,36 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
             # but keep the full list for index-based correlation
             print(f"  Pool: {col_name} → {len(set(pools[col_name]))} unique values (geo-correlated)")
 
+    # Detect correlated email+name columns
+    from .email_generator import is_email_column, is_name_column, email_to_name
+    email_col_name = None
+    name_col_name = None
+    for col in columns:
+        cn = col.name if hasattr(col, "name") else col["name"]
+        if is_email_column(cn):
+            email_col_name = cn
+        elif is_name_column(cn):
+            name_col_name = cn
+
+    # If both exist, derive name pool from email pool
+    if email_col_name and name_col_name:
+        # Generate email pool first (if not already done)
+        if email_col_name not in pools:
+            email_col = next(c for c in columns
+                             if (c.name if hasattr(c, "name") else c["name"]) == email_col_name)
+            pools[email_col_name] = generate_value_pool(email_col, global_seed, table_name=table_name)
+            print(f"  Pool: {email_col_name} → {len(pools[email_col_name]):,} unique values")
+        # Derive name pool from email pool
+        pools[name_col_name] = [email_to_name(e) for e in pools[email_col_name]]
+        print(f"  Pool: {name_col_name} → {len(pools[name_col_name]):,} unique values (derived from {email_col_name})")
+
     for col in columns:
         col_name = col.name if hasattr(col, "name") else col["name"]
         if col_name in geo_cols and geo_records is not None:
+            continue  # already generated above
+        if col_name == name_col_name and email_col_name:
+            continue  # derived from email above
+        if col_name == email_col_name and name_col_name and email_col_name in pools:
             continue  # already generated above
 
         pool = generate_value_pool(col, global_seed, table_name=table_name)
@@ -314,6 +350,12 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         for cd in col_dicts:
             if cd.get("name") in geo_cols:
                 cd["_geo_group"] = True
+
+    # Mark correlated email+name columns
+    if email_col_name and name_col_name:
+        for cd in col_dicts:
+            if cd.get("name") in (email_col_name, name_col_name):
+                cd["_email_group"] = True
 
     pools_bc = spark.sparkContext.broadcast(pools)
     cols_bc = spark.sparkContext.broadcast(col_dicts)

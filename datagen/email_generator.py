@@ -75,6 +75,48 @@ def is_external_table(table_name):
     return any(p in norm for p in _EXTERNAL_TABLE_PATTERNS)
 
 
+# Name column patterns
+_NAME_PATTERNS = {
+    "name", "fullname", "full_name", "customername", "customer_name",
+    "employeename", "employee_name", "personname", "person_name",
+    "displayname", "display_name", "contactname", "contact_name",
+    "suppliername", "supplier_name", "vendorname", "vendor_name",
+}
+
+
+def is_name_column(col_name):
+    """Check if a column name suggests it contains a person's full name."""
+    return _normalize(col_name) in _NAME_PATTERNS
+
+
+def email_to_name(email):
+    """Derive a display name from an email address.
+
+    Examples:
+        reed.richards@contoso.com     → Reed Richards
+        roy.harper82@adventureworks.com → Roy Harper (82)
+    """
+    import re
+    local = email.split("@")[0]  # reed.richards or roy.harper82
+    parts = local.split(".")
+
+    result_parts = []
+    suffix = ""
+    for part in parts:
+        # Split trailing digits: "harper82" → "harper", "82"
+        match = re.match(r"^([a-zA-Z]+?)(\d+)$", part)
+        if match:
+            result_parts.append(match.group(1).capitalize())
+            suffix = match.group(2)
+        else:
+            result_parts.append(part.capitalize())
+
+    name = " ".join(result_parts)
+    if suffix:
+        name = f"{name} ({suffix})"
+    return name
+
+
 def generate_email_pool(cardinality, table_name="", seed=42):
     """Generate a pool of unique email addresses.
 
