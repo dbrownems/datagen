@@ -284,7 +284,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         if col_name in geo_cols and geo_records is not None:
             continue  # already generated above
 
-        pool = generate_value_pool(col, global_seed)
+        pool = generate_value_pool(col, global_seed, table_name=table_name)
         pools[col_name] = pool
         print(f"  Pool: {col_name} → {len(pool):,} unique values")
 

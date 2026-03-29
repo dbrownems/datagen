@@ -209,7 +209,7 @@ def generate_guid_pool(cardinality, seed=42):
     return guids
 
 
-def generate_string_pool(dist, cardinality, seed=42):
+def generate_string_pool(dist, cardinality, seed=42, table_name=""):
     """Generate a pool of unique human-readable strings."""
     from .name_generator import generate_names
 
@@ -217,7 +217,10 @@ def generate_string_pool(dist, cardinality, seed=42):
     style = dist.style or "docker"
     geo_type = dist.geo_type if hasattr(dist, "geo_type") else None
 
-    if style == "geo" and geo_type:
+    if style == "email":
+        from .email_generator import generate_email_pool
+        return generate_email_pool(cardinality, table_name=table_name, seed=seed)
+    elif style == "geo" and geo_type:
         from .geo_generator import (
             generate_country_pool, generate_state_pool,
             generate_city_pool, generate_postal_pool,
@@ -280,7 +283,7 @@ def _parse_fixed_values(values_spec):
     return fixed_values, weights
 
 
-def generate_value_pool(col_config, global_seed=42):
+def generate_value_pool(col_config, global_seed=42, table_name=""):
     """Generate a pool of unique values for a column.
 
     If the column has fixed ``values``, those are placed at the start of
@@ -346,9 +349,9 @@ def generate_value_pool(col_config, global_seed=42):
     elif data_type == "boolean":
         generated = generate_boolean_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
     elif data_type == "string":
-        generated = generate_string_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
+        generated = generate_string_pool(dist, gen_cardinality, col_seed, table_name=table_name) if gen_cardinality > 0 else []
     else:
-        generated = generate_string_pool(dist, gen_cardinality, col_seed) if gen_cardinality > 0 else []
+        generated = generate_string_pool(dist, gen_cardinality, col_seed, table_name=table_name) if gen_cardinality > 0 else []
 
     # Remove any generated values that collide with fixed values
     fixed_set = set(str(v) for v in fixed_values)

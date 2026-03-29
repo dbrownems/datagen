@@ -281,7 +281,7 @@ def _infer_selection(cardinality, row_count):
     return "zipf", 1.0
 
 
-def _infer_column_config(col_meta, row_count, relationship_columns=None):
+def _infer_column_config(col_meta, row_count, relationship_columns=None, table_name=""):
     """Infer a ColumnConfig from VPAX column metadata."""
     name = col_meta["name"]
     data_type = col_meta["data_type"]
@@ -339,6 +339,16 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None):
     geo_type = _detect_geo_type(col_meta)
     if geo_type and data_type == "string":
         dist = DistributionConfig(style="geo", geo_type=geo_type)
+        return ColumnConfig(
+            name=name, data_type=data_type, cardinality=cardinality,
+            selection=selection, zipf_exponent=round(zipf_exp, 2),
+            distribution=dist,
+        )
+
+    # Detect email/username columns
+    from .email_generator import is_email_column
+    if is_email_column(name) and data_type == "string":
+        dist = DistributionConfig(style="email")
         return ColumnConfig(
             name=name, data_type=data_type, cardinality=cardinality,
             selection=selection, zipf_exponent=round(zipf_exp, 2),
@@ -413,7 +423,7 @@ def generate_config(
             if col_meta.get("is_calculated", False) and not include_calculated:
                 continue
 
-            col_config = _infer_column_config(col_meta, row_count, relationship_columns)
+            col_config = _infer_column_config(col_meta, row_count, relationship_columns, table_name)
             columns.append(col_config)
 
         if columns:
