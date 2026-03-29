@@ -20,7 +20,7 @@ class DistributionConfig:
 
     # String distributions
     avg_length: Optional[int] = None
-    style: Optional[str] = "docker"  # "docker" | "hex" | "alpha" | "geo"
+    style: Optional[str] = "docker"  # "docker" | "hex" | "alpha" | "geo" | "email"
     prefix: Optional[str] = None  # For prefixed key style
     geo_type: Optional[str] = None  # "country" | "state" | "city" | "postal_code"
 
