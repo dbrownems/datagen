@@ -270,7 +270,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     table_path = f"{output_path.rstrip('/')}/{table_name}"
     fmt = output_format.lower()
     print(f"  Writing {fmt} table → {table_path}")
-    result_df.write.format(fmt).mode("overwrite").save(table_path)
+    result_df.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
     print(f"  ✓ {table_name} complete")
 
     # Cleanup
@@ -376,5 +376,5 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     table_path = f"{output_path.rstrip('/')}/{tname}"
     fmt = output_format.lower()
     print(f"  Writing {fmt} table → {table_path}")
-    sdf.write.format(fmt).mode("overwrite").save(table_path)
+    sdf.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
     print(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
