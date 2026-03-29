@@ -108,90 +108,63 @@ def _extract_vpax_stats(vpax_path):
     return pd.DataFrame(rows)
 
 
-def _extract_live_stats(dataset, workspace=None):
-    """Get stats from a live semantic model via vertipaq_analyzer."""
+def _extract_live_stats_dax(dataset, source_tables, workspace=None):
+    """Get row counts and cardinality from a live model using DAX.
+
+    Args:
+        dataset: Semantic model name.
+        source_tables: List of table dicts from the parsed VPAX (with columns).
+        workspace: Fabric workspace.
+
+    Returns:
+        pandas.DataFrame with table/column/metric/actual columns.
+    """
     try:
-        import sempy_labs as sl
+        import sempy.fabric as fabric
     except ImportError:
         raise ImportError(
-            "semantic-link-labs is required for compare_model().\n"
-            "Install with:  pip install semantic-link-labs"
+            "sempy (semantic-link) is required for compare_model()."
         )
 
-    # Refresh the model first so Direct Lake stats are populated
-    print("  Refreshing model for comparison ...")
-    try:
-        sl.refresh_semantic_model(dataset=dataset, workspace=workspace)
-    except Exception as e:
-        print(f"    ⚠ Refresh before compare: {e}")
-
-    stats = sl.vertipaq_analyzer(
-        dataset=dataset,
-        workspace=workspace,
-        read_stats_from_data=True,
-    )
-
-    # Debug: show what keys and columns we got
-    print(f"  vertipaq_analyzer returned keys: {list(stats.keys())}")
-    for key, df in stats.items():
-        if hasattr(df, "columns"):
-            print(f"    {key}: columns={list(df.columns)}, rows={len(df)}")
-
-    # The returned dict has "tables" and "columns" DataFrames
-    tables_df = stats.get("tables", stats.get("Tables", pd.DataFrame()))
-    cols_df = stats.get("columns", stats.get("Columns", pd.DataFrame()))
-
     rows = []
+    print("  Querying model for row counts and cardinality ...")
 
-    # Table rows — look for common column name patterns
-    if not tables_df.empty:
-        tname_col = _find_col(tables_df, "Table Name", "TableName", "table_name", "Table")
-        rowcount_col = _find_col(tables_df, "Rows", "Row Count", "RowCount", "RowsCount", "Rows Count")
+    for table in source_tables:
+        tname = table["name"]
 
-        if tname_col and rowcount_col:
-            for _, row in tables_df.iterrows():
-                rows.append({
-                    "table": str(row[tname_col]),
-                    "column": "(table)",
-                    "metric": "row_count",
-                    "actual": int(row[rowcount_col]) if pd.notna(row[rowcount_col]) else 0,
-                })
+        # Row count
+        try:
+            dax = f'EVALUATE ROW("v", COUNTROWS(\'{tname}\'))'
+            result = fabric.evaluate_dax(
+                dataset=dataset, dax_string=dax, workspace=workspace,
+            )
+            row_count = int(result.iloc[0, 0]) if not result.empty else 0
+        except Exception:
+            row_count = 0
 
-    # Column rows
-    if not cols_df.empty:
-        tname_col = _find_col(cols_df, "Table Name", "TableName", "table_name", "Table")
-        cname_col = _find_col(cols_df, "Column Name", "ColumnName", "column_name", "Column")
-        card_col = _find_col(cols_df, "Cardinality", "Column Cardinality", "ColumnCardinality",
-                             "Distinct Values", "DistinctValueCount")
-        size_col = _find_col(cols_df, "Total Size", "TotalSize", "Column Size", "ColumnSize", "Size")
-        dict_col = _find_col(cols_df, "Dictionary Size", "DictionarySize", "Dict Size")
+        rows.append({
+            "table": tname, "column": "(table)",
+            "metric": "row_count", "actual": row_count,
+        })
 
-        if tname_col and cname_col:
-            for _, row in cols_df.iterrows():
-                tname = str(row[tname_col])
-                cname = str(row[cname_col])
+        # Column cardinality
+        for col in table.get("columns", []):
+            cname = col["name"]
+            try:
+                dax = f'EVALUATE ROW("v", DISTINCTCOUNT(\'{tname}\'[{cname}]))'
+                result = fabric.evaluate_dax(
+                    dataset=dataset, dax_string=dax, workspace=workspace,
+                )
+                card = int(result.iloc[0, 0]) if not result.empty else 0
+            except Exception:
+                card = 0
 
-                if card_col and pd.notna(row.get(card_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "cardinality",
-                        "actual": int(row[card_col]),
-                    })
-                if size_col and pd.notna(row.get(size_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "total_size",
-                        "actual": int(row[size_col]),
-                    })
-                if dict_col and pd.notna(row.get(dict_col)):
-                    rows.append({
-                        "table": tname,
-                        "column": cname,
-                        "metric": "dictionary_size",
-                        "actual": int(row[dict_col]),
-                    })
+            rows.append({
+                "table": tname, "column": cname,
+                "metric": "cardinality", "actual": card,
+            })
+
+        print(f"    {tname}: {row_count:,} rows")
 
     return pd.DataFrame(rows)
 
@@ -310,8 +283,9 @@ def compare_vpax(source_vpax_path, generated_vpax_path, print_report=True):
 def compare_model(source_vpax_path, dataset=None, workspace=None, print_report=True):
     """Compare a live semantic model against the source VPAX.
 
-    Runs ``sempy_labs.vertipaq_analyzer`` on the deployed model and
-    compares the stats to the source .vpax file.
+    Queries the deployed model with DAX (COUNTROWS / DISTINCTCOUNT) to
+    get actual row counts and cardinality, then compares against the
+    source .vpax statistics.
 
     Args:
         source_vpax_path: Path to the original .vpax file.
@@ -325,7 +299,9 @@ def compare_model(source_vpax_path, dataset=None, workspace=None, print_report=T
     source_df, model = _extract_source_stats(source_vpax_path)
     name = dataset or model.get("model_name", "Model")
 
-    actual_df = _extract_live_stats(name, workspace)
+    # Use DAX queries — works reliably on Direct Lake without refresh
+    source_tables = model.get("tables", [])
+    actual_df = _extract_live_stats_dax(name, source_tables, workspace)
 
     report = _build_report(source_df, actual_df)
 
