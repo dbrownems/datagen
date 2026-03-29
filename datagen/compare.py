@@ -131,6 +131,12 @@ def _extract_live_stats(dataset, workspace=None):
         read_stats_from_data=True,
     )
 
+    # Debug: show what keys and columns we got
+    print(f"  vertipaq_analyzer returned keys: {list(stats.keys())}")
+    for key, df in stats.items():
+        if hasattr(df, "columns"):
+            print(f"    {key}: columns={list(df.columns)}, rows={len(df)}")
+
     # The returned dict has "tables" and "columns" DataFrames
     tables_df = stats.get("tables", stats.get("Tables", pd.DataFrame()))
     cols_df = stats.get("columns", stats.get("Columns", pd.DataFrame()))
