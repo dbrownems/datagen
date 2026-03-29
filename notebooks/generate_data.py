@@ -7,11 +7,11 @@
 #   - model.vpax              (from DAX Studio / VertiPaq Analyzer)
 
 # %% Cell 1 — Setup
-import glob
+import glob, subprocess, sys
 
 whl = sorted(glob.glob("/lakehouse/default/Files/datagen_fabric-*.whl"))[-1]
 print(f"Installing {whl}")
-%pip install {whl} semantic-link-labs -q
+subprocess.check_call([sys.executable, "-m", "pip", "install", whl, "semantic-link-labs", "-q"])
 
 # %% Cell 2 — Generate everything and compare
 from datagen import generate
