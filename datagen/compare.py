@@ -118,6 +118,13 @@ def _extract_live_stats(dataset, workspace=None):
             "Install with:  pip install semantic-link-labs"
         )
 
+    # Refresh the model first so Direct Lake stats are populated
+    print("  Refreshing model for comparison ...")
+    try:
+        sl.refresh_semantic_model(dataset=dataset, workspace=workspace)
+    except Exception as e:
+        print(f"    ⚠ Refresh before compare: {e}")
+
     stats = sl.vertipaq_analyzer(
         dataset=dataset,
         workspace=workspace,
