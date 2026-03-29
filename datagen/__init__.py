@@ -92,9 +92,9 @@ def generate(
             overwrite=overwrite,
         )
 
-    # Step 4 — compare generated tables against source VPAX (optional)
+    # Step 4 — compare generated tables against config (optional)
     if compare:
         from .compare import compare_tables
-        return compare_tables(spark, vpax_path, output_path=output_path)
+        return compare_tables(spark, config, output_path=output_path)
 
     return None

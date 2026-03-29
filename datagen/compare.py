@@ -1,12 +1,14 @@
-"""Compare generated Delta tables against the source VPAX statistics.
+"""Compare generated Delta tables against the generation config.
 
-Queries the generated Delta tables directly with Spark to get row counts
-and column cardinality, then compares against the source .vpax file.
-No semantic model or DAX queries required.
+Queries the generated Delta tables with Spark to get actual row counts
+and column cardinality, then compares against the expected values from
+the generation config (YAML or in-memory GenerationConfig).
+
+The config is the source of truth — not the VPAX — so tweaked row counts,
+cardinalities, and distributions are reflected in the report.
 """
 
 import pandas as pd
-from .vpax_parser import parse_vpax
 
 
 def _pct_diff(actual, expected):
@@ -23,14 +25,37 @@ def _accuracy(actual, expected):
     return max(0.0, 100.0 - _pct_diff(actual, expected))
 
 
-def _extract_source_stats(vpax_path):
-    """Parse a VPAX file into a flat list of {table, column, stat} dicts."""
-    model = parse_vpax(vpax_path)
-    rows = []
+def _extract_config_stats(config):
+    """Extract expected row counts and cardinality from a GenerationConfig.
 
-    for table in model.get("tables", []):
-        tname = table["name"]
-        row_count = table.get("row_count", 0)
+    Args:
+        config: GenerationConfig dataclass, dict, or path to a YAML file.
+
+    Returns:
+        (pandas.DataFrame, model_name, tables_list)
+    """
+    from pathlib import Path
+
+    # Load from file if needed
+    if isinstance(config, (str, Path)):
+        from .config import load_config
+        config = load_config(str(config))
+
+    # Normalize access
+    if hasattr(config, "tables"):
+        tables = config.tables
+        model_name = config.model_name
+    else:
+        tables = config.get("tables", [])
+        model_name = config.get("model_name", "Model")
+
+    rows = []
+    tables_out = []
+
+    for table in tables:
+        tname = table.name if hasattr(table, "name") else table["name"]
+        row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
+        columns = table.columns if hasattr(table, "columns") else table.get("columns", [])
 
         rows.append({
             "table": tname,
@@ -39,16 +64,21 @@ def _extract_source_stats(vpax_path):
             "expected": row_count,
         })
 
-        for col in table.get("columns", []):
-            cname = col["name"]
+        col_list = []
+        for col in columns:
+            cname = col.name if hasattr(col, "name") else col["name"]
+            card = col.cardinality if hasattr(col, "cardinality") else col.get("cardinality", 0)
             rows.append({
                 "table": tname,
                 "column": cname,
                 "metric": "cardinality",
-                "expected": col.get("cardinality", 0),
+                "expected": card,
             })
+            col_list.append({"name": cname})
 
-    return pd.DataFrame(rows), model
+        tables_out.append({"name": tname, "columns": col_list})
+
+    return pd.DataFrame(rows), model_name, tables_out
 
 
 def _extract_spark_stats(spark, source_tables, output_path):
@@ -186,67 +216,30 @@ def _print_report(report, model_name=""):
     print(f"{'=' * 80}\n")
 
 
-def compare_tables(spark, vpax_path, output_path="Tables/", print_report=True):
-    """Compare generated Delta tables against the source VPAX.
+def compare_tables(spark, config, output_path="Tables/", print_report=True):
+    """Compare generated Delta tables against the generation config.
 
-    Reads the Delta tables directly with Spark to get actual row counts
-    and cardinality, then compares against the .vpax statistics.
+    Reads the Delta tables with Spark to get actual row counts and
+    cardinality, then compares against the expected values from the
+    config (row_count and cardinality per column).
 
     Args:
         spark: Active SparkSession.
-        vpax_path: Path to the original .vpax file.
+        config: GenerationConfig dataclass, dict, or path to a YAML file.
         output_path: Base directory where Delta tables were written.
         print_report: Whether to print the report to stdout.
 
     Returns:
         pandas.DataFrame with the comparison report.
     """
-    source_df, model = _extract_source_stats(vpax_path)
-    source_tables = model.get("tables", [])
-    name = model.get("model_name", "Model")
+    source_df, model_name, tables_list = _extract_config_stats(config)
 
-    print(f"  Comparing generated tables against {name} ...")
-    actual_df = _extract_spark_stats(spark, source_tables, output_path)
+    print(f"  Comparing generated tables against config ({model_name}) ...")
+    actual_df = _extract_spark_stats(spark, tables_list, output_path)
 
     report = _build_report(source_df, actual_df)
 
     if print_report:
-        _print_report(report, name)
-
-    return report
-
-
-def compare_vpax(source_vpax_path, generated_vpax_path, print_report=True):
-    """Compare two VPAX files and report accuracy.
-
-    Args:
-        source_vpax_path: Path to the original .vpax file.
-        generated_vpax_path: Path to the generated model's .vpax export.
-        print_report: Whether to print the report to stdout.
-
-    Returns:
-        pandas.DataFrame with the comparison report.
-    """
-    source_df, model = _extract_source_stats(source_vpax_path)
-
-    gen_model = parse_vpax(generated_vpax_path)
-    gen_rows = []
-    for table in gen_model.get("tables", []):
-        tname = table["name"]
-        gen_rows.append({
-            "table": tname, "column": "(table)",
-            "metric": "row_count", "actual": table.get("row_count", 0),
-        })
-        for col in table.get("columns", []):
-            gen_rows.append({
-                "table": tname, "column": col["name"],
-                "metric": "cardinality", "actual": col.get("cardinality", 0),
-            })
-    actual_df = pd.DataFrame(gen_rows)
-
-    report = _build_report(source_df, actual_df)
-
-    if print_report:
-        _print_report(report, model.get("model_name", ""))
+        _print_report(report, model_name)
 
     return report
