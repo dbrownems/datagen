@@ -341,7 +341,7 @@ def build_tmdl(
     lakehouse_name=None,
     lakehouse_sql_endpoint=None,
     model_name=None,
-    expression_name="DatabaseSource",
+    expression_name="DatabaseQuery",
     compat_level=1604,
     mode="direct_lake",
     include_hidden=True,
@@ -487,7 +487,7 @@ def deploy_semantic_model(
     with connect_semantic_model(
         dataset=name, workspace=workspace, readonly=False
     ) as tom:
-        tom.add_expression(name="DatabaseSource", expression=shared_expr)
+        tom.add_expression(name="DatabaseQuery", expression=shared_expr)
 
     # ------------------------------------------------------------------
     # 2. Add tables — method depends on mode
@@ -625,7 +625,7 @@ def _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspac
             # Add M partition that reads from the lakehouse
             m_expr = (
                 f'let\n'
-                f'    Source = #"DatabaseSource",\n'
+                f'    Source = #"DatabaseQuery",\n'
                 f'    dbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
                 f'in\n'
                 f'    dbo_{tname}'
