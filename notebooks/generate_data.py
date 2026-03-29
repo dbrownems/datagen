@@ -11,7 +11,7 @@ import glob, subprocess, sys
 
 whl = sorted(glob.glob("/lakehouse/default/Files/datagen_fabric-*.whl"))[-1]
 print(f"Installing {whl}")
-subprocess.check_call([sys.executable, "-m", "pip", "install", whl, "semantic-link-labs", "-q"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", whl, "semantic-link-labs", "-q", "--no-warn-conflicts", "--disable-pip-version-check"])
 
 # %% Cell 2 — Generate everything and compare
 from datagen import generate
