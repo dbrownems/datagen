@@ -245,3 +245,117 @@ def get_city_record(city_name):
             if city == city_name:
                 return {"state": state, "country": country, "postal_code": postal}
     return None
+
+
+# Country weights for distributing generated cities across countries
+_COUNTRY_WEIGHTS = {
+    "United States": 0.45,
+    "Canada": 0.15,
+    "Mexico": 0.10,
+    "United Kingdom": 0.12,
+    "France": 0.10,
+    "Germany": 0.08,
+}
+
+
+def generate_geo_records(city_cardinality, seed=42):
+    """Generate a list of correlated geo records (city, state, country, postal_code).
+
+    Real cities come first with correct state/country/postal mappings.
+    Generated cities are assigned to real states in real countries,
+    maintaining valid hierarchies.
+
+    Args:
+        city_cardinality: Number of unique city records to generate.
+        seed: Random seed.
+
+    Returns:
+        List of dicts with keys: city, state, country, postal_code.
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+
+    records = []
+    seen_cities = set()
+
+    # Phase 1 — add real cities (already have valid state/country/postal)
+    for country in COUNTRIES:
+        for city, state, postal in CITIES.get(country, []):
+            if len(records) >= city_cardinality:
+                break
+            if city not in seen_cities:
+                records.append({
+                    "city": city, "state": state,
+                    "country": country, "postal_code": postal,
+                })
+                seen_cities.add(city)
+        if len(records) >= city_cardinality:
+            break
+
+    if len(records) >= city_cardinality:
+        return records[:city_cardinality]
+
+    # Phase 2 — generate cities assigned to real states in real countries
+    countries = list(_COUNTRY_WEIGHTS.keys())
+    weights = [_COUNTRY_WEIGHTS[c] for c in countries]
+    weights = [w / sum(weights) for w in weights]  # normalize
+
+    idx = 0
+    while len(records) < city_cardinality:
+        # Pick a country weighted by population
+        country = rng.choice(countries, p=weights)
+        states = STATES.get(country, ["Unknown"])
+        state = states[rng.integers(0, len(states))]
+
+        city_name = _make_city_name(idx, COUNTRIES.index(country))
+        idx += 1
+
+        if city_name in seen_cities:
+            continue
+        seen_cities.add(city_name)
+
+        # Generate a plausible postal code for the country
+        postal = _generate_postal_for_country(country, rng)
+
+        records.append({
+            "city": city_name, "state": state,
+            "country": country, "postal_code": postal,
+        })
+
+    return records[:city_cardinality]
+
+
+def _generate_postal_for_country(country, rng):
+    """Generate a plausible postal code format for a country."""
+    if country == "United States":
+        return str(rng.integers(10000, 99999))
+    elif country == "Canada":
+        letters = "ABCEGHJKLMNPRSTVXY"
+        return (
+            rng.choice(list(letters))
+            + str(rng.integers(0, 9))
+            + rng.choice(list(letters))
+            + " "
+            + str(rng.integers(0, 9))
+            + rng.choice(list(letters))
+            + str(rng.integers(0, 9))
+        )
+    elif country == "Mexico":
+        return str(rng.integers(10000, 99999))
+    elif country == "United Kingdom":
+        letters = "ABCDEFGHIJKLMNOPRSTUWYZ"
+        return (
+            rng.choice(list(letters))
+            + rng.choice(list(letters))
+            + str(rng.integers(1, 9))
+            + " "
+            + str(rng.integers(1, 9))
+            + rng.choice(list(letters))
+            + rng.choice(list(letters))
+        )
+    elif country == "France":
+        return str(rng.integers(10000, 99999))
+    elif country == "Germany":
+        return str(rng.integers(10000, 99999))
+    else:
+        return str(rng.integers(10000, 99999))
