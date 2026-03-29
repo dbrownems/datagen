@@ -134,6 +134,9 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
             ids = pdf["id"].values
             result = {}
 
+            # Pre-compute shared geo indices (all geo columns use the same index)
+            geo_indices = None
+
             for col in local_cols:
                 name = col["name"]
                 data_type = col["data_type"]
@@ -157,6 +160,14 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
                 elif col.get("_primary_key_mode"):
                     indices = (ids % cardinality).astype(np.int64)
                     values = pool[indices]
+
+                # --- Correlated geo column: share indices with other geo cols ---
+                elif col.get("_geo_group"):
+                    if geo_indices is None:
+                        geo_seed = (base_seed + hash("_geo_group") + int(ids[0])) & 0x7FFFFFFF
+                        geo_rng = np.random.default_rng(geo_seed)
+                        geo_indices = geo_rng.integers(0, cardinality, size=n)
+                    values = pool[geo_indices % cardinality]
 
                 # --- All other types: pool-based selection ---
                 else:
@@ -229,8 +240,50 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     # Phase 1 — generate value pools on the driver
     pools = {}
     weights_map = {}
+
+    # Detect correlated geo columns (city/state/country/postal in same table)
+    geo_cols = {}  # col_name → geo_type
     for col in columns:
         col_name = col.name if hasattr(col, "name") else col["name"]
+        dist = col.distribution if hasattr(col, "distribution") else (col.get("distribution") or {})
+        style = dist.style if hasattr(dist, "style") else (dist.get("style") if isinstance(dist, dict) else None)
+        geo_type = dist.geo_type if hasattr(dist, "geo_type") else (dist.get("geo_type") if isinstance(dist, dict) else None)
+        if style == "geo" and geo_type:
+            geo_cols[col_name] = geo_type
+
+    # If we have 2+ geo columns, generate correlated records
+    geo_records = None
+    if len(geo_cols) >= 2:
+        from .geo_generator import generate_geo_records
+        # Use the city cardinality (or largest geo column) to size the record pool
+        city_col = next((cn for cn, gt in geo_cols.items() if gt == "city"), None)
+        if city_col:
+            city_card = next(
+                (col.cardinality if hasattr(col, "cardinality") else col.get("cardinality", 100))
+                for col in columns
+                if (col.name if hasattr(col, "name") else col["name"]) == city_col
+            )
+        else:
+            city_card = max(
+                (col.cardinality if hasattr(col, "cardinality") else col.get("cardinality", 100))
+                for col in columns
+                if (col.name if hasattr(col, "name") else col["name"]) in geo_cols
+            )
+        geo_records = generate_geo_records(city_card, seed=global_seed)
+        # Build per-column pools from the correlated records
+        geo_field_map = {"city": "city", "state": "state", "country": "country", "postal_code": "postal_code"}
+        for col_name, geo_type in geo_cols.items():
+            field = geo_field_map.get(geo_type, geo_type)
+            pools[col_name] = [r[field] for r in geo_records]
+            # Deduplicate for columns with lower cardinality (state, country)
+            # but keep the full list for index-based correlation
+            print(f"  Pool: {col_name} → {len(set(pools[col_name]))} unique values (geo-correlated)")
+
+    for col in columns:
+        col_name = col.name if hasattr(col, "name") else col["name"]
+        if col_name in geo_cols and geo_records is not None:
+            continue  # already generated above
+
         pool = generate_value_pool(col, global_seed)
         pools[col_name] = pool
         print(f"  Pool: {col_name} → {len(pool):,} unique values")
@@ -255,6 +308,12 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         card = cd.get("cardinality", 0)
         if is_key and key_style and card >= row_count:
             cd["_primary_key_mode"] = True
+
+    # Mark correlated geo columns so they share the same selection index
+    if geo_records is not None:
+        for cd in col_dicts:
+            if cd.get("name") in geo_cols:
+                cd["_geo_group"] = True
 
     pools_bc = spark.sparkContext.broadcast(pools)
     cols_bc = spark.sparkContext.broadcast(col_dicts)
