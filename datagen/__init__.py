@@ -92,14 +92,9 @@ def generate(
             overwrite=overwrite,
         )
 
-    # Step 4 — compare generated model against source VPAX (optional)
-    if compare and deploy_model:
-        from .compare import compare_model
-        model_name = dataset or vpax_model.get("model_name", "Model")
-        return compare_model(
-            source_vpax_path=vpax_path,
-            dataset=model_name,
-            workspace=workspace,
-        )
+    # Step 4 — compare generated tables against source VPAX (optional)
+    if compare:
+        from .compare import compare_tables
+        return compare_tables(spark, vpax_path, output_path=output_path)
 
     return None
