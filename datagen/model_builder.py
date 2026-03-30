@@ -495,6 +495,7 @@ def deploy_semantic_model(
         item_name=lakehouse,
         item_type="Lakehouse",
         workspace=lakehouse_workspace or workspace,
+        use_sql_endpoint=False,
     )
 
     n_tables = 0
@@ -539,10 +540,11 @@ def deploy_semantic_model(
                         mode="Import",
                     )
                 else:
-                    # entity_name = Delta table folder name (sanitized)
+                    # entity_name = Delta table folder name (sanitized for filesystem)
                     tom.add_entity_partition(
                         table_name=tname,
                         entity_name=safe_name,
+                        schema_name="dbo",
                     )
 
                 n_tables += 1
@@ -628,8 +630,13 @@ def deploy_semantic_model(
     print("  Refreshing model ...", flush=True)
     try:
         sl.refresh_semantic_model(dataset=name, workspace=workspace)
+        print("  Refresh complete.", flush=True)
     except Exception as e:
-        print(f"    ⚠ Refresh: {e}", flush=True)
+        err_msg = str(e)
+        if len(err_msg) > 200:
+            err_msg = err_msg[:200] + "..."
+        print(f"    ⚠ Refresh failed: {err_msg}", flush=True)
+        print("    Try refreshing manually from the Fabric UI.", flush=True)
 
     print(flush=True)
     print(f"✓ Semantic model '{name}' deployed ({mode_label})")
