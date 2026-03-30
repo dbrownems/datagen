@@ -372,12 +372,14 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     table_path = f"{output_path.rstrip('/')}/{table_name}"
     fmt = output_format.lower()
+    spark.sparkContext.setJobDescription(f"datagen: {table_name} ({row_count:,} rows)")
     result_df.write.format(fmt).mode("overwrite") \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \
         .option("delta.minWriterVersion", "5") \
         .save(table_path)
+    spark.sparkContext.setJobDescription(None)
     _t3 = _time.time()
 
     # Cleanup
@@ -545,11 +547,11 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
 
     table_path = f"{output_path.rstrip('/')}/{tname}"
     fmt = output_format.lower()
-    _log(f"  Writing {fmt} table → {table_path}")
+    spark.sparkContext.setJobDescription(f"datagen: {tname} (date table, {row_count:,} rows)")
     sdf.write.format(fmt).mode("overwrite") \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \
         .option("delta.minWriterVersion", "5") \
         .save(table_path)
-    _log(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
+    spark.sparkContext.setJobDescription(None)
