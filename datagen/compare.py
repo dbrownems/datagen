@@ -123,8 +123,9 @@ def _extract_spark_stats(spark, source_tables, output_path):
                      if c["name"] in df.columns]
 
         if col_names:
-            from pyspark.sql.functions import countDistinct
-            agg_exprs = [countDistinct(c).alias(c) for c in col_names]
+            from pyspark.sql import functions as F
+            # Use col() with backtick quoting for names with dots/special chars
+            agg_exprs = [F.countDistinct(F.col(f"`{c}`")).alias(c) for c in col_names]
             card_row = df.agg(*agg_exprs).collect()[0]
 
             for cname in col_names:
