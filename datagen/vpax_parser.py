@@ -324,7 +324,9 @@ def _parse_relationships(model_json):
             "CrossFilterDirection",
             default="OneDirection",
         )
-        is_active = _get(rel, "IsActive", "isActive", default=True)
+        is_active_raw = _get(rel, "IsActive", "isActive", default=None)
+        # In VPAX JSON: True = active, None/null/absent = inactive
+        is_active = (is_active_raw is True)
         sec = _get(
             rel,
             "SecurityFilteringBehavior", "securityFilteringBehavior",
