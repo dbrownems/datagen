@@ -485,16 +485,36 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     existing_tables = set()
     if not overwrite:
         tables_dir = out_path.rstrip("/")
-        for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
-            if os.path.isdir(check_dir):
-                existing_tables = {
-                    name for name in os.listdir(check_dir)
-                    if os.path.isdir(os.path.join(check_dir, name))
-                    and not name.startswith(".")
-                }
-                print(f"  Found {len(existing_tables)} existing tables in {check_dir}", flush=True)
-                break
+
+        # Try using notebookutils for reliable OneLake listing
+        try:
+            import notebookutils
+            lh_name = notebookutils.runtime.context.get("defaultLakehouseName", "")
+            if lh_name:
+                lh_info = notebookutils.lakehouse.get(lh_name)
+                tables_url = lh_info.get("properties", {}).get("oneLakeTablesPath", "")
+                if tables_url:
+                    # List via mssparkutils/notebookutils
+                    fs_path = f"/lakehouse/default/{tables_dir}"
+                    items = notebookutils.fs.ls(fs_path)
+                    existing_tables = {item.name for item in items if item.isDir}
+        except Exception:
+            pass
+
+        # Fallback to os.listdir
         if not existing_tables:
+            for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
+                if os.path.isdir(check_dir):
+                    existing_tables = {
+                        name for name in os.listdir(check_dir)
+                        if os.path.isdir(os.path.join(check_dir, name))
+                        and not name.startswith(".")
+                    }
+                    break
+
+        if existing_tables:
+            print(f"  Found {len(existing_tables)} existing tables", flush=True)
+        else:
             print(f"  No existing tables found (checked {tables_dir})", flush=True)
 
     # Try to use tqdm for progress bar (available in Fabric)
