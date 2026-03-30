@@ -495,7 +495,6 @@ def deploy_semantic_model(
         item_name=lakehouse,
         item_type="Lakehouse",
         workspace=lakehouse_workspace or workspace,
-        use_sql_endpoint=False,
     )
 
     n_tables = 0
