@@ -602,53 +602,82 @@ def deploy_semantic_model(
 
         _apply_column_metadata(tom, [t for t in tables if t["name"] in model_table_names])
 
-    # --- Session 2: Relationships (separate to handle ambiguous path errors) ---
-    try:
-        with connect_semantic_model(
-            dataset=name, workspace=workspace, readonly=False
-        ) as tom:
-            model_table_names = {t.Name for t in tom.model.Tables}
-            model_col_names = {}
-            for t in tom.model.Tables:
-                model_col_names[t.Name] = {c.Name for c in t.Columns}
+    # --- Session 2: Add all relationships as INACTIVE (always succeeds) ---
+    print("  Adding relationships ...", flush=True)
+    valid_rels = []
+    with connect_semantic_model(
+        dataset=name, workspace=workspace, readonly=False
+    ) as tom:
+        model_table_names = {t.Name for t in tom.model.Tables}
+        model_col_names = {}
+        for t in tom.model.Tables:
+            model_col_names[t.Name] = {c.Name for c in t.Columns}
 
-            for rel in relationships:
-                ft, fc = rel["from_table"], rel["from_column"]
-                tt, tc = rel["to_table"], rel["to_column"]
-                if ft not in model_table_names or tt not in model_table_names:
-                    continue
-                if fc not in model_col_names.get(ft, set()):
-                    continue
-                if tc not in model_col_names.get(tt, set()):
-                    continue
-                try:
-                    tom.add_relationship(
-                        from_table=ft,
-                        from_column=fc,
-                        to_table=tt,
-                        to_column=tc,
-                        from_cardinality=rel.get("from_cardinality", "Many"),
-                        to_cardinality=rel.get("to_cardinality", "One"),
-                        cross_filtering_behavior=rel.get("cross_filtering"),
-                        is_active=rel.get("is_active", True),
-                        security_filtering_behavior=rel.get("security_filtering"),
-                    )
-                    n_rels += 1
-                except Exception:
-                    pass
-    except Exception as e:
-        # Ambiguous paths — retry with all relationships set to inactive,
-        # then selectively activate non-conflicting ones
-        print(f"    ⚠ Relationship save failed (ambiguous paths), retrying with inactive relationships...", flush=True)
+        for rel in relationships:
+            ft, fc = rel["from_table"], rel["from_column"]
+            tt, tc = rel["to_table"], rel["to_column"]
+            if ft not in model_table_names or tt not in model_table_names:
+                continue
+            if fc not in model_col_names.get(ft, set()):
+                continue
+            if tc not in model_col_names.get(tt, set()):
+                continue
+            try:
+                tom.add_relationship(
+                    from_table=ft, from_column=fc,
+                    to_table=tt, to_column=tc,
+                    from_cardinality=rel.get("from_cardinality", "Many"),
+                    to_cardinality=rel.get("to_cardinality", "One"),
+                    cross_filtering_behavior=rel.get("cross_filtering"),
+                    is_active=False,  # always add as inactive first
+                    security_filtering_behavior=rel.get("security_filtering"),
+                )
+                valid_rels.append(rel)
+                n_rels += 1
+            except Exception:
+                pass
+
+    # --- Session 3: Activate relationships that should be active ---
+    n_activated = 0
+    rels_to_activate = [r for r in valid_rels if r.get("is_active", True)]
+    if rels_to_activate:
+        print(f"  Activating {len(rels_to_activate)} relationships ...", flush=True)
         try:
             with connect_semantic_model(
                 dataset=name, workspace=workspace, readonly=False
             ) as tom:
-                # Deactivate all existing relationships
-                for r in tom.model.Relationships:
-                    r.IsActive = False
-        except Exception:
-            print(f"    ⚠ Could not fix relationships automatically", flush=True)
+                for rel in rels_to_activate:
+                    ft, fc = rel["from_table"], rel["from_column"]
+                    tt, tc = rel["to_table"], rel["to_column"]
+                    # Find the TOM relationship object
+                    for r in tom.model.Relationships:
+                        if (r.FromTable.Name == ft and r.FromColumn.Name == fc
+                                and r.ToTable.Name == tt and r.ToColumn.Name == tc):
+                            r.IsActive = True
+                            n_activated += 1
+                            break
+        except Exception as e:
+            # Save failed — some activations caused ambiguity.
+            # Retry one at a time.
+            print(f"    ⚠ Bulk activation failed, activating one at a time ...", flush=True)
+            n_activated = 0
+            for rel in rels_to_activate:
+                try:
+                    with connect_semantic_model(
+                        dataset=name, workspace=workspace, readonly=False
+                    ) as tom:
+                        ft, fc = rel["from_table"], rel["from_column"]
+                        tt, tc = rel["to_table"], rel["to_column"]
+                        for r in tom.model.Relationships:
+                            if (r.FromTable.Name == ft and r.FromColumn.Name == fc
+                                    and r.ToTable.Name == tt and r.ToColumn.Name == tc):
+                                r.IsActive = True
+                                break
+                    n_activated += 1
+                except Exception:
+                    pass  # this one causes ambiguity — leave inactive
+
+        print(f"  Relationships: {n_rels} total, {n_activated} active", flush=True)
 
     # ------------------------------------------------------------------
     # 3. Refresh the model
