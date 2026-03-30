@@ -99,15 +99,37 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
         }
     ]
 
-    # Filter tables if specified
+    # Filter tables if specified — but keep measure-only tables (no data columns)
     if table_filter is not None:
         filter_set = set(table_filter)
-        model["tables"] = [t for t in model.get("tables", []) if t["name"] in filter_set]
+        kept_tables = []
+        for t in model.get("tables", []):
+            if t["name"] in filter_set:
+                kept_tables.append(t)
+            else:
+                # Keep tables that only have measures (no data columns needing a Delta table)
+                has_data_cols = any(
+                    c.get("type", "data") != "calculated"
+                    for c in t.get("columns", [])
+                    if c.get("name", "").lower() != "rownumber-2662979b-1795-4f74-8f37-6a1ba8059b61"
+                )
+                has_measures = bool(t.get("measures"))
+                if has_measures and not has_data_cols:
+                    kept_tables.append(t)
+        model["tables"] = kept_tables
 
     # Modify each table's partition to Direct Lake entity
+    # Skip measure-only tables (they don't need partitions)
     for table in model.get("tables", []):
         tname = table["name"]
         safe_name = _safe_folder_name(tname)
+
+        # Check if this table has a corresponding Delta table
+        has_delta = table_filter is None or tname in (table_filter or [])
+        if not has_delta:
+            # Measure-only table — remove partitions entirely
+            table["partitions"] = []
+            continue
 
         # Replace partitions with a single Direct Lake entity partition
         table["partitions"] = [
