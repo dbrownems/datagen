@@ -14,6 +14,13 @@ from pathlib import Path
 from .vpax_parser import parse_vpax
 
 
+def _safe_folder_name(name):
+    """Sanitize a table name for use as a Delta table folder name."""
+    for ch in "/\\:*?\"<>|":
+        name = name.replace(ch, "_")
+    return name
+
+
 # ---------------------------------------------------------------------------
 # TMDL helpers
 # ---------------------------------------------------------------------------
@@ -502,6 +509,7 @@ def deploy_semantic_model(
 
         for table in tables:
             tname = table["name"]
+            safe_name = _safe_folder_name(tname)
             try:
                 tom.add_table(name=tname)
 
@@ -520,9 +528,9 @@ def deploy_semantic_model(
                     m_expr = (
                         f'let\n'
                         f'    Source = #"DatabaseQuery",\n'
-                        f'    dbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
+                        f'    dbo_{safe_name} = Source{{[Schema="dbo",Item="{safe_name}"]}}[Data]\n'
                         f'in\n'
-                        f'    dbo_{tname}'
+                        f'    dbo_{safe_name}'
                     )
                     tom.add_m_partition(
                         table_name=tname,
@@ -531,9 +539,10 @@ def deploy_semantic_model(
                         mode="Import",
                     )
                 else:
+                    # entity_name = Delta table folder name (sanitized)
                     tom.add_entity_partition(
                         table_name=tname,
-                        entity_name=tname,
+                        entity_name=safe_name,
                     )
 
                 n_tables += 1
@@ -614,14 +623,13 @@ def deploy_semantic_model(
             print(f"    ⚠ Could not fix relationships automatically", flush=True)
 
     # ------------------------------------------------------------------
-    # 3. For import mode, refresh to pull data in
+    # 3. Refresh the model
     # ------------------------------------------------------------------
-    if mode == "import":
-        print("  Refreshing model (importing data) ...", flush=True)
-        try:
-            sl.refresh_semantic_model(dataset=name, workspace=workspace)
-        except Exception as e:
-            print(f"    ⚠ Refresh: {e}", flush=True)
+    print("  Refreshing model ...", flush=True)
+    try:
+        sl.refresh_semantic_model(dataset=name, workspace=workspace)
+    except Exception as e:
+        print(f"    ⚠ Refresh: {e}", flush=True)
 
     print(flush=True)
     print(f"✓ Semantic model '{name}' deployed ({mode_label})")
