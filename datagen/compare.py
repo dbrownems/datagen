@@ -97,7 +97,10 @@ def _extract_spark_stats(spark, source_tables, output_path):
 
     for table in source_tables:
         tname = table["name"]
-        table_path = f"{base}/{tname}"
+        safe_name = tname
+        for ch in "/\\:*?\"<>|":
+            safe_name = safe_name.replace(ch, "_")
+        table_path = f"{base}/{safe_name}"
 
         try:
             df = spark.read.format("delta").load(table_path)

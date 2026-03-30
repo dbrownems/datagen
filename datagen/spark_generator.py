@@ -28,6 +28,14 @@ def _log(msg=""):
     _logger.info(msg)
 
 
+def _safe_table_name(name):
+    """Sanitize a table name for use as a file/folder name."""
+    # Replace path separators and other filesystem-unsafe characters
+    for ch in "/\\:*?\"<>|":
+        name = name.replace(ch, "_")
+    return name
+
+
 def _compute_weights(values_spec, pool_size):
     """Build a probability array for weighted value selection.
 
@@ -370,7 +378,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
 
-    table_path = f"{output_path.rstrip('/')}/{table_name}"
+    table_path = f"{output_path.rstrip('/')}/{_safe_table_name(table_name)}"
     fmt = output_format.lower()
     job_desc = f"datagen: {table_name} ({row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{table_name}", job_desc)
@@ -473,7 +481,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
 
     # Check which tables already exist (for overwrite=False)
     def _table_exists(tname):
-        table_path = f"{out_path.rstrip('/')}/{tname}"
+        table_path = f"{out_path.rstrip('/')}/{_safe_table_name(tname)}"
         try:
             # Try to read as Delta — works for both relative and absolute paths
             df = spark.read.format("delta").load(table_path)
@@ -590,7 +598,7 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
 
     sdf = spark.createDataFrame(pdf)
 
-    table_path = f"{output_path.rstrip('/')}/{tname}"
+    table_path = f"{output_path.rstrip('/')}/{_safe_table_name(tname)}"
     fmt = output_format.lower()
     job_desc = f"datagen: {tname} (date table, {row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{tname}", job_desc)
