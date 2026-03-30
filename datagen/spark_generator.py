@@ -466,6 +466,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
 
     rows_generated = 0
     errors = []
+    succeeded_tables = []
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
@@ -485,6 +486,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
 
             total_time = timing.get("total_time", 0)
             rows_generated += row_count
+            succeeded_tables.append(tname)
 
             if progress:
                 progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)")
@@ -514,6 +516,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         for tname, err in errors:
             print(f"  ✗ {tname}: {err}")
     print(flush=True)
+
+    return succeeded_tables
 
 
 def _is_date_table(vpax_table):
