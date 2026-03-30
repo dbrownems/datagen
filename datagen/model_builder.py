@@ -182,7 +182,16 @@ def deploy_semantic_model(
     print("  Extracting Model.bim from VPAX ...", flush=True)
     bim = _extract_bim(vpax_path)
 
-    name = dataset or bim.get("name", "Model")
+    name = dataset
+    if not name:
+        # Try to get a friendly name from the VPAX filename
+        import os
+        vpax_basename = os.path.splitext(os.path.basename(vpax_path))[0]
+        # Strip common suffixes like " VPAX", ".vpax"
+        for suffix in [" VPAX", " vpax", "_VPAX", "_vpax"]:
+            if vpax_basename.endswith(suffix):
+                vpax_basename = vpax_basename[:-len(suffix)]
+        name = vpax_basename.strip() or "Model"
 
     # Get lakehouse details
     print("  Resolving lakehouse connection ...", flush=True)
