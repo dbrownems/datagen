@@ -430,6 +430,13 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         for t in vpax_model.get("tables", []):
             vpax_tables[t["name"]] = t
 
+    # Detect schema-enabled lakehouse (Tables/dbo/ exists)
+    import os
+    if out_path.rstrip("/") == "Tables" and os.path.isdir("Tables/dbo"):
+        out_path = "Tables/dbo/"
+    elif out_path.rstrip("/") == "Tables" and os.path.isdir("/lakehouse/default/Tables/dbo"):
+        out_path = "Tables/dbo/"
+
     n = len(tables)
     total_rows = sum(
         (t.row_count if hasattr(t, "row_count") else t.get("row_count", 0))
