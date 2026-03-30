@@ -479,16 +479,22 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     succeeded_tables = []
     skipped_tables = []
 
-    # Check which tables already exist (for overwrite=False)
-    def _table_exists(tname):
-        table_path = f"{out_path.rstrip('/')}/{_safe_table_name(tname)}"
-        try:
-            # Try to read as Delta — works for both relative and absolute paths
-            df = spark.read.format("delta").load(table_path)
-            df.limit(0).collect()  # force evaluation
-            return True
-        except Exception:
-            return False
+    # Build set of existing table folder names (for overwrite=False)
+    existing_tables = set()
+    if not overwrite:
+        import os
+        tables_dir = out_path.rstrip("/")
+        # Try filesystem listing first (fast)
+        for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
+            if os.path.isdir(check_dir):
+                existing_tables = {
+                    name for name in os.listdir(check_dir)
+                    if os.path.isdir(os.path.join(check_dir, name))
+                    and not name.startswith(".")
+                }
+                break
+        if existing_tables:
+            print(f"  Found {len(existing_tables)} existing tables", flush=True)
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
@@ -499,7 +505,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
 
         # Skip existing tables when not overwriting
-        if not overwrite and _table_exists(tname):
+        if not overwrite and _safe_table_name(tname) in existing_tables:
             succeeded_tables.append(tname)
             skipped_tables.append(tname)
             if progress:
