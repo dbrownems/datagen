@@ -76,7 +76,8 @@ def generate(
 
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     succeeded_tables = generate_all_tables(spark, config, output_path=output_path,
-                        output_format=output_format, vpax_model=vpax_model)
+                        output_format=output_format, vpax_model=vpax_model,
+                        overwrite=overwrite)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:
