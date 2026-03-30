@@ -401,7 +401,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     }
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None):
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -412,6 +412,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         vpax_model: Parsed VPAX model dict (optional). When provided,
             date dimension tables are auto-detected and generated with
             derived column values instead of random data.
+        overwrite: If True, regenerate all tables. If False, skip tables
+            that already exist as Delta/parquet and only generate missing ones.
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -467,11 +469,36 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     rows_generated = 0
     errors = []
     succeeded_tables = []
+    skipped_tables = []
+
+    # Check which tables already exist (for overwrite=False)
+    def _table_exists(tname):
+        import os
+        table_path = f"{out_path.rstrip('/')}/{tname}"
+        if os.path.isdir(table_path):
+            # Check for _delta_log or parquet files
+            return os.path.isdir(f"{table_path}/_delta_log") or \
+                   any(f.endswith(".parquet") for f in os.listdir(table_path))
+        return False
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
         row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
         n_cols = len(table.columns if hasattr(table, "columns") else table.get("columns", []))
+
+        if progress:
+            progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
+
+        # Skip existing tables when not overwriting
+        if not overwrite and _table_exists(tname):
+            succeeded_tables.append(tname)
+            skipped_tables.append(tname)
+            if progress:
+                progress.write(f"  ⊘ {tname} — exists, skipped")
+                progress.update(1)
+            else:
+                print(f"  [{i}/{n}] ⊘ {tname} — exists, skipped", flush=True)
+            continue
 
         if progress:
             progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
@@ -510,9 +537,18 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     rows_per_sec = int(rows_generated / _overall_elapsed) if _overall_elapsed > 0 else 0
 
     print(flush=True)
-    print(f"Done: {n - len(errors)}/{n} tables  |  {rows_generated:,} rows  |  {_overall_elapsed:.0f}s  |  {rows_per_sec:,} rows/s")
+    generated = n - len(errors) - len(skipped_tables)
+    parts = [f"Generated: {generated}/{n} tables"]
+    if skipped_tables:
+        parts.append(f"Skipped: {len(skipped_tables)}")
     if errors:
-        print(f"Errors ({len(errors)}):")
+        parts.append(f"Errors: {len(errors)}")
+    parts.append(f"{rows_generated:,} rows")
+    parts.append(f"{_overall_elapsed:.0f}s")
+    if rows_generated > 0:
+        parts.append(f"{rows_per_sec:,} rows/s")
+    print("  |  ".join(parts))
+    if errors:
         for tname, err in errors:
             print(f"  ✗ {tname}: {err}")
     print(flush=True)
