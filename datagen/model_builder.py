@@ -489,14 +489,33 @@ def deploy_semantic_model(
     # ------------------------------------------------------------------
     # 2. Build the entire model in a single TOM session
     # ------------------------------------------------------------------
-    # Build the OneLake Direct Lake expression using the correct public endpoint
-    from sempy_labs._helper_functions import resolve_workspace_name_and_id, resolve_lakehouse_name_and_id
+    # Get lakehouse details from notebookutils for correct OneLake endpoint
+    try:
+        import notebookutils
+        if lakehouse:
+            lh_info = notebookutils.lakehouse.get(lakehouse)
+        else:
+            lh_info = notebookutils.lakehouse.getDefault()
+        lh_props = lh_info.get("properties", {})
+        ws_id = lh_info["workspaceId"]
+        lh_id = lh_info["id"]
+        lh_name = lh_info.get("displayName", lakehouse or "lakehouse")
+        # Extract OneLake host from the tables path
+        tables_url = lh_props.get("oneLakeTablesPath", "")
+        if tables_url:
+            from urllib.parse import urlparse
+            onelake_host = urlparse(tables_url).hostname
+        else:
+            onelake_host = "onelake.dfs.fabric.microsoft.com"
+    except Exception:
+        # Fallback: use sempy to resolve IDs
+        from sempy_labs._helper_functions import resolve_workspace_name_and_id, resolve_lakehouse_name_and_id
+        lh_workspace = lakehouse_workspace or workspace
+        (ws_name, ws_id) = resolve_workspace_name_and_id(lh_workspace)
+        (lh_name, lh_id) = resolve_lakehouse_name_and_id(lakehouse, ws_id)
+        onelake_host = "onelake.dfs.fabric.microsoft.com"
 
-    lh_workspace = lakehouse_workspace or workspace
-    (ws_name, ws_id) = resolve_workspace_name_and_id(lh_workspace)
-    (lh_name, lh_id) = resolve_lakehouse_name_and_id(lakehouse, ws_id)
-
-    onelake_url = f"https://onelake.dfs.fabric.microsoft.com/{ws_id}/{lh_id}"
+    onelake_url = f"https://{onelake_host}/{ws_id}/{lh_id}"
     shared_expr = (
         'let\n'
         f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])\n'
