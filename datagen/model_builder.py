@@ -296,6 +296,25 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         )
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:300]}")
+
+        # Wait for async update to complete
+        if resp.status_code == 202:
+            import time
+            location = resp.headers.get("Location", "")
+            retry_after = int(resp.headers.get("Retry-After", "5"))
+            if location:
+                for _ in range(60):
+                    time.sleep(retry_after)
+                    poll = client.get(location)
+                    if poll.status_code == 200:
+                        break
+                    if poll.status_code == 202:
+                        retry_after = int(poll.headers.get("Retry-After", "5"))
+                        continue
+                    break
+            else:
+                time.sleep(10)
+
         return existing["displayName"]
     elif existing and not overwrite:
         raise RuntimeError(
@@ -312,11 +331,38 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         resp = client.post(f"/v1/workspaces/{ws_id}/items", json=body)
         if resp.status_code not in (200, 201, 202):
             raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:300]}")
-        # Return the actual display name from the response
-        try:
-            return resp.json().get("displayName", name)
-        except Exception:
-            return name
+
+        # Handle async creation (202) — poll until complete
+        if resp.status_code == 202:
+            import time
+            location = resp.headers.get("Location", "")
+            retry_after = int(resp.headers.get("Retry-After", "5"))
+            if location:
+                for _ in range(60):  # max 5 minutes
+                    time.sleep(retry_after)
+                    poll = client.get(location)
+                    if poll.status_code == 200:
+                        break
+                    if poll.status_code == 202:
+                        retry_after = int(poll.headers.get("Retry-After", "5"))
+                        continue
+                    break
+            else:
+                time.sleep(10)  # fallback wait
+
+        # Find the actual item to get the display name
+        items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
+        created = next((i for i in items if i["displayName"] == name), None)
+        if created:
+            return created["displayName"]
+
+        # Fallback: find by bim name in case Fabric used that
+        bim_name = bim.get("name", "")
+        created = next((i for i in items if i["displayName"] == bim_name), None)
+        if created:
+            return created["displayName"]
+
+        return name
 
 
 # ---------------------------------------------------------------------------
