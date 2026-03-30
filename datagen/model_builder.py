@@ -21,9 +21,25 @@ def _safe_folder_name(name):
 
 def _extract_bim(vpax_path):
     """Extract Model.bim JSON from a VPAX file."""
-    with zipfile.ZipFile(vpax_path, "r") as zf:
+    import io
+
+    try:
+        vpax_bytes = open(vpax_path, "rb").read()
+    except OSError:
+        # FUSE mount may be disconnected — try notebookutils
+        try:
+            import notebookutils
+            vpax_bytes = notebookutils.fs.read(vpax_path)
+            if isinstance(vpax_bytes, str):
+                vpax_bytes = vpax_bytes.encode("latin-1")
+        except Exception:
+            raise OSError(
+                f"Cannot read {vpax_path}. The lakehouse FUSE mount may be disconnected. "
+                f"Try restarting the notebook session."
+            )
+
+    with zipfile.ZipFile(io.BytesIO(vpax_bytes), "r") as zf:
         names = zf.namelist()
-        # Look for Model.bim (case-insensitive)
         bim_name = next((n for n in names if n.lower() == "model.bim"), None)
         if bim_name:
             return json.loads(zf.read(bim_name))
