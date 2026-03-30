@@ -12,9 +12,9 @@ from pathlib import Path
 from .pool_generator import generate_value_pool, _parse_fixed_values
 
 
-def _log(msg):
+def _log(msg=""):
     """Print with immediate flush so Fabric notebooks show progress."""
-    _log(msg)
+    print(msg)
     sys.stdout.flush()
 
 
