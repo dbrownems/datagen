@@ -223,8 +223,10 @@ def deploy_semantic_model(
     print("  Converting model to Direct Lake on OneLake ...", flush=True)
     bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
 
-    # Update model name
+    # Update model name in the bim (strip .pbix and use our clean name)
     bim["name"] = name
+    if "model" in bim and isinstance(bim["model"], dict):
+        bim["model"]["name"] = name
     model = bim.get("model", bim)
 
     n_tables = len(model.get("tables", []))
@@ -237,19 +239,19 @@ def deploy_semantic_model(
     # Deploy via Fabric REST API
     print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
 
-    _deploy_bim(bim, name, workspace, overwrite)
+    actual_name = _deploy_bim(bim, name, workspace, overwrite)
 
-    # Refresh
+    # Refresh using the actual display name from the API
     print("  Refreshing model ...", flush=True)
     try:
-        sl.refresh_semantic_model(dataset=name, workspace=workspace)
+        sl.refresh_semantic_model(dataset=actual_name, workspace=workspace)
         print("  Refresh complete.", flush=True)
     except Exception as e:
         err_msg = str(e)[:200]
         print(f"    ⚠ Refresh: {err_msg}", flush=True)
 
     print(flush=True)
-    print(f"✓ Semantic model '{name}' deployed (Direct Lake on OneLake)")
+    print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
     print(f"  Tables:        {n_tables}")
     print(f"  Relationships: {n_rels}")
     print(f"  Measures:      {n_measures}", flush=True)
@@ -294,6 +296,7 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         )
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:300]}")
+        return existing["displayName"]
     elif existing and not overwrite:
         raise RuntimeError(
             f"Semantic model '{name}' already exists in '{ws_name}'. "
@@ -309,6 +312,11 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         resp = client.post(f"/v1/workspaces/{ws_id}/items", json=body)
         if resp.status_code not in (200, 201, 202):
             raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:300]}")
+        # Return the actual display name from the response
+        try:
+            return resp.json().get("displayName", name)
+        except Exception:
+            return name
 
 
 # ---------------------------------------------------------------------------
