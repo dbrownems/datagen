@@ -66,7 +66,17 @@ def generate(
     from .spark_generator import generate_all_tables
 
     # Step 1 — infer generation config directly from VPAX
+    import os, time as _time
+    _t0 = _time.time()
+    vpax_name = os.path.basename(vpax_path)
+    print(f"Parsing {vpax_name} ...", flush=True)
     vpax_model = parse_vpax(vpax_path)
+    print(f"  {len(vpax_model.get('tables', []))} tables, "
+          f"{len(vpax_model.get('relationships', []))} relationships "
+          f"({_time.time() - _t0:.1f}s)", flush=True)
+
+    _t1 = _time.time()
+    print("Inferring generation config ...", flush=True)
     config = generate_config(
         vpax_model,
         output_path=output_path,
@@ -74,6 +84,7 @@ def generate(
         include_hidden=include_hidden,
         include_calculated=include_calculated,
     )
+    print(f"  Config ready ({_time.time() - _t1:.1f}s)", flush=True)
 
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     succeeded_tables, actual_output_path = generate_all_tables(
