@@ -473,13 +473,14 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
 
     # Check which tables already exist (for overwrite=False)
     def _table_exists(tname):
-        import os
         table_path = f"{out_path.rstrip('/')}/{tname}"
-        if os.path.isdir(table_path):
-            # Check for _delta_log or parquet files
-            return os.path.isdir(f"{table_path}/_delta_log") or \
-                   any(f.endswith(".parquet") for f in os.listdir(table_path))
-        return False
+        try:
+            # Try to read as Delta — works for both relative and absolute paths
+            df = spark.read.format("delta").load(table_path)
+            df.limit(0).collect()  # force evaluation
+            return True
+        except Exception:
+            return False
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
