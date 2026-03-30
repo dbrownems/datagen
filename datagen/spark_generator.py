@@ -554,7 +554,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             print(f"  ✗ {tname}: {err}")
     print(flush=True)
 
-    return succeeded_tables
+    return succeeded_tables, out_path
 
 
 def _is_date_table(vpax_table):
