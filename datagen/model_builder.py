@@ -419,6 +419,7 @@ def deploy_semantic_model(
     include_hidden=True,
     include_calculated=False,
     overwrite=False,
+    table_filter=None,
 ):
     """Create a semantic model from a .vpax file.
 
@@ -459,6 +460,12 @@ def deploy_semantic_model(
     name = dataset or vpax_model.get("model_name", "Model")
     tables = _filter_tables(vpax_model, include_hidden, include_calculated)
     relationships = vpax_model.get("relationships", [])
+
+    # Only include tables that were actually generated
+    if table_filter is not None:
+        filter_set = set(table_filter)
+        tables = [t for t in tables if t["name"] in filter_set]
+
     table_names = [t["name"] for t in tables]
     mode_label = "Import" if mode == "import" else "Direct Lake"
 
