@@ -480,8 +480,7 @@ def deploy_semantic_model(
     )
 
     # ------------------------------------------------------------------
-    # 1b. Set up the lakehouse connection (shared expression)
-    #     Required before adding Direct Lake tables and for Import M partitions.
+    # 2. Build the entire model in a single TOM session
     # ------------------------------------------------------------------
     from sempy_labs.directlake import generate_shared_expression
 
@@ -491,36 +490,67 @@ def deploy_semantic_model(
         workspace=lakehouse_workspace or workspace,
     )
 
+    n_tables = 0
+    n_rels = 0
+    n_measures = 0
+
     with connect_semantic_model(
         dataset=name, workspace=workspace, readonly=False
     ) as tom:
+        # --- Shared expression (lakehouse connection) ---
         tom.add_expression(name="DatabaseQuery", expression=shared_expr)
 
-    # ------------------------------------------------------------------
-    # 2. Add tables — method depends on mode
-    # ------------------------------------------------------------------
-    if mode == "import":
-        _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspace)
-    else:
-        _deploy_direct_lake_tables(name, table_names, workspace)
+        # --- Tables + columns + partitions ---
+        for table in tables:
+            tname = table["name"]
+            try:
+                tom.add_table(name=tname)
 
-    # ------------------------------------------------------------------
-    # 3. Apply the semantic layer from the VPAX: relationships, measures,
-    #    column metadata (format strings, folders, descriptions, etc.)
-    # ------------------------------------------------------------------
-    print("  Applying semantic layer from VPAX ...")
-    n_measures = 0
-    valid_rels = []
+                # Add columns
+                for col in table.get("columns", []):
+                    if col.get("is_calculated"):
+                        continue
+                    dt = _SLL_DATA_TYPE.get(col["data_type"], "String")
+                    tom.add_data_column(
+                        table_name=tname,
+                        column_name=col["name"],
+                        source_column=col["name"],
+                        data_type=dt,
+                    )
 
-    with connect_semantic_model(
-        dataset=name, workspace=workspace, readonly=False
-    ) as tom:
+                # Add partition based on mode
+                if mode == "import":
+                    m_expr = (
+                        f'let\n'
+                        f'    Source = #"DatabaseQuery",\n'
+                        f'    dbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
+                        f'in\n'
+                        f'    dbo_{tname}'
+                    )
+                    tom.add_m_partition(
+                        table_name=tname,
+                        partition_name=tname,
+                        expression=m_expr,
+                        mode="Import",
+                    )
+                else:
+                    tom.add_entity_partition(
+                        table_name=tname,
+                        entity_name=tname,
+                    )
+
+                n_tables += 1
+            except Exception as e:
+                err = str(e)[:120]
+                print(f"    ⚠ Table '{tname}': {err}", flush=True)
+
         # --- Relationships ---
-        valid_rels = [
-            r for r in relationships
-            if r["from_table"] in table_names and r["to_table"] in table_names
-        ]
-        for rel in valid_rels:
+        model_table_names = {t.Name for t in tom.model.Tables}
+        for rel in relationships:
+            if rel["from_table"] not in model_table_names:
+                continue
+            if rel["to_table"] not in model_table_names:
+                continue
             try:
                 tom.add_relationship(
                     from_table=rel["from_table"],
@@ -533,12 +563,14 @@ def deploy_semantic_model(
                     is_active=rel.get("is_active", True),
                     security_filtering_behavior=rel.get("security_filtering"),
                 )
-            except Exception as e:
-                print(f"    ⚠ Relationship {rel['from_table']}.{rel['from_column']}"
-                      f" → {rel['to_table']}.{rel['to_column']}: {e}")
+                n_rels += 1
+            except Exception:
+                pass
 
         # --- Measures ---
         for table in tables:
+            if table["name"] not in model_table_names:
+                continue
             for m in table.get("measures", []):
                 if not m.get("expression"):
                     continue
@@ -553,43 +585,27 @@ def deploy_semantic_model(
                         display_folder=m.get("display_folder"),
                     )
                     n_measures += 1
-                except Exception as e:
-                    print(f"    ⚠ Measure '{m['name']}': {e}")
+                except Exception:
+                    pass
 
-        # --- Column metadata overlay (from VPAX onto lakehouse schema) ---
-        _apply_column_metadata(tom, tables)
+        # --- Column metadata ---
+        _apply_column_metadata(tom, [t for t in tables if t["name"] in model_table_names])
 
     # ------------------------------------------------------------------
-    # 4. For import mode, refresh to pull data in
+    # 3. For import mode, refresh to pull data in
     # ------------------------------------------------------------------
     if mode == "import":
-        print("  Refreshing model (importing data) ...")
+        print("  Refreshing model (importing data) ...", flush=True)
         try:
             sl.refresh_semantic_model(dataset=name, workspace=workspace)
         except Exception as e:
-            print(f"    ⚠ Refresh: {e}")
-            print("    You may need to refresh manually from the Fabric UI.")
+            print(f"    ⚠ Refresh: {e}", flush=True)
 
-    print()
+    print(flush=True)
     print(f"✓ Semantic model '{name}' deployed ({mode_label})")
-    print(f"  Tables:        {len(table_names)}")
-    print(f"  Relationships: {len(valid_rels)}")
-    print(f"  Measures:      {n_measures}")
-
-
-def _deploy_direct_lake_tables(name, table_names, workspace):
-    """Add tables in Direct Lake mode (entity partitions from lakehouse)."""
-    from sempy_labs.directlake import add_table_to_direct_lake_semantic_model
-
-    for tname in table_names:
-        print(f"  Adding table (Direct Lake): {tname}")
-        add_table_to_direct_lake_semantic_model(
-            dataset=name,
-            table_name=tname,
-            lakehouse_table_name=tname,
-            workspace=workspace,
-            refresh=False,
-        )
+    print(f"  Tables:        {n_tables}/{len(table_names)}")
+    print(f"  Relationships: {n_rels}")
+    print(f"  Measures:      {n_measures}", flush=True)
 
 
 _SLL_DATA_TYPE = {
@@ -600,49 +616,6 @@ _SLL_DATA_TYPE = {
     "boolean": "Boolean",
     "binary": "Binary",
 }
-
-
-def _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspace):
-    """Add tables in Import mode with M partitions reading from lakehouse."""
-    from sempy_labs.tom import connect_semantic_model
-
-    # Shared expression is already set up by deploy_semantic_model
-    with connect_semantic_model(
-        dataset=name, workspace=workspace, readonly=False
-    ) as tom:
-        for table in tables:
-            tname = table["name"]
-            print(f"  Adding table (Import): {tname}")
-
-            # Create the table object
-            tom.add_table(name=tname)
-
-            # Add columns
-            for col in table.get("columns", []):
-                if col.get("is_calculated"):
-                    continue
-                dt = _SLL_DATA_TYPE.get(col["data_type"], "String")
-                tom.add_data_column(
-                    table_name=tname,
-                    column_name=col["name"],
-                    source_column=col["name"],
-                    data_type=dt,
-                )
-
-            # Add M partition that reads from the lakehouse
-            m_expr = (
-                f'let\n'
-                f'    Source = #"DatabaseQuery",\n'
-                f'    dbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
-                f'in\n'
-                f'    dbo_{tname}'
-            )
-            tom.add_m_partition(
-                table_name=tname,
-                partition_name=tname,
-                expression=m_expr,
-                mode="Import",
-            )
 
 
 def _apply_column_metadata(tom, tables):
