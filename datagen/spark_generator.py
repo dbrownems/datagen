@@ -245,7 +245,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
     return partition_generator
 
 
-def generate_table(spark, table_config, output_path, global_seed=42, output_format="delta"):
+def generate_table(spark, table_config, output_path, global_seed=42, output_format="delta", allow_overwrite=True):
     """Generate a single table and write it as a Delta (or parquet) table.
 
     Args:
@@ -254,6 +254,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         output_path: Base directory for output.
         global_seed: Seed for reproducible generation.
         output_format: "delta" (default) or "parquet".
+        allow_overwrite: If False, raise an error if the table already exists.
     """
     # Normalize access (support both dataclass and dict)
     if hasattr(table_config, "name"):
@@ -380,6 +381,20 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(table_name)}"
     fmt = output_format.lower()
+
+    # Safety check: refuse to overwrite existing table when not allowed
+    if not allow_overwrite:
+        import os
+        for check in [table_path, f"/lakehouse/default/{table_path}"]:
+            if os.path.isdir(check) and any(
+                f.endswith(".parquet") or f == "_delta_log"
+                for f in os.listdir(check)
+            ):
+                raise FileExistsError(
+                    f"Table '{table_name}' already exists at '{check}' and overwrite_tables=False. "
+                    f"Set overwrite_tables=True to regenerate, or delete the table manually."
+                )
+
     job_desc = f"datagen: {table_name} ({row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{table_name}", job_desc)
     spark.sparkContext.setJobDescription(job_desc)
@@ -523,7 +538,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
                 _generate_date_table_spark(spark, vpax_table, out_path, output_format)
                 timing = {"total_time": 0}
             else:
-                timing = generate_table(spark, table, out_path, seed, output_format) or {}
+                timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
 
             total_time = timing.get("total_time", 0)
             rows_generated += row_count
