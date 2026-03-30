@@ -244,6 +244,9 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         print(f"  Skipping table '{table_name}': no columns defined")
         return
 
+    import time as _time
+    _t0 = _time.time()
+
     print(f"Generating table '{table_name}' ({row_count:,} rows, {len(columns)} columns)")
 
     # Phase 1 — generate value pools on the driver
@@ -331,9 +334,12 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
             weights_map[col_name] = w
 
     # Phase 2 — build output schema
+    _t1 = _time.time()
+    print(f"  Pools generated in {_t1 - _t0:.1f}s")
     schema = _build_schema(columns)
 
     # Phase 3 — broadcast pools and column metadata
+    print(f"  Broadcasting pools to executors ...")
     col_dicts = [_col_to_dict(c) for c in columns]
 
     # Mark primary-key columns so the partition generator can use direct
@@ -363,6 +369,9 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     weights_bc = spark.sparkContext.broadcast(weights_map)
 
     # Phase 4 — generate with mapInPandas (single pass, all columns at once)
+    _t2 = _time.time()
+    print(f"  Broadcast complete in {_t2 - _t1:.1f}s")
+    print(f"  Writing {output_format.lower()} table ({row_count:,} rows) ...")
     gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc)
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
@@ -370,9 +379,9 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     # Phase 5 — write output
     table_path = f"{output_path.rstrip('/')}/{table_name}"
     fmt = output_format.lower()
-    print(f"  Writing {fmt} table → {table_path}")
     result_df.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
-    print(f"  ✓ {table_name} complete")
+    _t3 = _time.time()
+    print(f"  ✓ {table_name} complete ({_t3 - _t0:.1f}s)")
 
     # Cleanup
     pools_bc.unpersist()
@@ -424,9 +433,15 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     print(f"{'=' * 60}")
     print()
 
+    import time as _time
+
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
-        print(f"[{i}/{n}] {tname}")
+        row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
+        n_cols = len(table.columns if hasattr(table, "columns") else table.get("columns", []))
+        print(f"[{i}/{n}] {tname} ({row_count:,} rows, {n_cols} cols)")
+
+        _table_t0 = _time.time()
 
         # Check if this is a date table (using VPAX metadata for column roles)
         vpax_table = vpax_tables.get(tname)
@@ -434,6 +449,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             _generate_date_table_spark(spark, vpax_table, out_path, output_format)
         else:
             generate_table(spark, table, out_path, seed, output_format)
+
+        print(f"  Total: {_time.time() - _table_t0:.1f}s")
         print()
 
     print(f"{'=' * 60}")
