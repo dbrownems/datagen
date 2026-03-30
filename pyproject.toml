@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datagen-fabric"
-version = "0.5.11"
+version = "0.5.12"
 description = "Generate realistic Delta tables and Direct Lake semantic models from Power BI .vpax files"
 readme = "README.md"
 requires-python = ">=3.9"
