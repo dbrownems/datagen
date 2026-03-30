@@ -12,10 +12,20 @@ from pathlib import Path
 from .pool_generator import generate_value_pool, _parse_fixed_values
 
 
+import logging as _logging
+
+_logger = _logging.getLogger("datagen")
+if not _logger.handlers:
+    _handler = _logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(_logging.Formatter("%(message)s"))
+    _logger.addHandler(_handler)
+    _logger.setLevel(_logging.INFO)
+
+
 def _log(msg=""):
-    """Print with immediate flush so Fabric notebooks show progress."""
-    print(msg)
-    sys.stdout.flush()
+    """Log progress — uses stderr + print + flush for Fabric notebook visibility."""
+    print(msg, flush=True)
+    _logger.info(msg)
 
 
 def _compute_weights(values_spec, pool_size):
