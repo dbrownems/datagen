@@ -489,13 +489,21 @@ def deploy_semantic_model(
     # ------------------------------------------------------------------
     # 2. Build the entire model in a single TOM session
     # ------------------------------------------------------------------
-    from sempy_labs.directlake import generate_shared_expression
+    # Build the OneLake Direct Lake expression using the correct public endpoint
+    from sempy_labs._helper_functions import resolve_workspace_name_and_id, resolve_lakehouse_name_and_id
 
-    shared_expr = generate_shared_expression(
-        item_name=lakehouse,
-        item_type="Lakehouse",
-        workspace=lakehouse_workspace or workspace,
+    lh_workspace = lakehouse_workspace or workspace
+    (ws_name, ws_id) = resolve_workspace_name_and_id(lh_workspace)
+    (lh_name, lh_id) = resolve_lakehouse_name_and_id(lakehouse, ws_id)
+
+    onelake_url = f"https://onelake.dfs.fabric.microsoft.com/{ws_id}/{lh_id}"
+    shared_expr = (
+        'let\n'
+        f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])\n'
+        'in\n'
+        '    Source'
     )
+    expr_name = f"DirectLake - {lh_name}"
 
     n_tables = 0
     n_rels = 0
@@ -505,7 +513,7 @@ def deploy_semantic_model(
     with connect_semantic_model(
         dataset=name, workspace=workspace, readonly=False
     ) as tom:
-        tom.add_expression(name="DatabaseQuery", expression=shared_expr)
+        tom.add_expression(name=expr_name, expression=shared_expr)
 
         for table in tables:
             tname = table["name"]
@@ -527,7 +535,7 @@ def deploy_semantic_model(
                 if mode == "import":
                     m_expr = (
                         f'let\n'
-                        f'    Source = #"DatabaseQuery",\n'
+                        f'    Source = #"{expr_name}",\n'
                         f'    dbo_{safe_name} = Source{{[Schema="dbo",Item="{safe_name}"]}}[Data]\n'
                         f'in\n'
                         f'    dbo_{safe_name}'
@@ -539,11 +547,11 @@ def deploy_semantic_model(
                         mode="Import",
                     )
                 else:
-                    # entity_name = Delta table folder name (sanitized for filesystem)
                     tom.add_entity_partition(
                         table_name=tname,
                         entity_name=safe_name,
                         schema_name="dbo",
+                        expression=expr_name,
                     )
 
                 n_tables += 1
