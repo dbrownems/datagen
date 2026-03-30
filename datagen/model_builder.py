@@ -34,10 +34,15 @@ def _get_lakehouse_info(lakehouse=None, workspace=None):
     """Get lakehouse details (IDs, OneLake host) from notebookutils."""
     import notebookutils
 
-    if lakehouse:
-        info = notebookutils.lakehouse.get(lakehouse)
-    else:
-        info = notebookutils.lakehouse.getDefault()
+    if not lakehouse:
+        lakehouse = notebookutils.runtime.context.get("defaultLakehouseName")
+        if not lakehouse:
+            raise RuntimeError(
+                "No lakehouse specified and no default lakehouse attached. "
+                "Attach a lakehouse to the notebook or pass lakehouse='name'."
+            )
+
+    info = notebookutils.lakehouse.get(lakehouse)
 
     props = info.get("properties", {})
     ws_id = info["workspaceId"]
