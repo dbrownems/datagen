@@ -480,12 +480,16 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             total_time = timing.get("total_time", 0)
             rows_generated += row_count
 
-            if not progress:
+            if progress:
+                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)")
+            else:
                 print(f"  [{i}/{n}] ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)", flush=True)
 
         except Exception as e:
             errors.append((tname, str(e)))
-            if not progress:
+            if progress:
+                progress.write(f"  ✗ {tname} — {e}")
+            else:
                 print(f"  [{i}/{n}] ✗ {tname} — {e}", flush=True)
 
         if progress:
