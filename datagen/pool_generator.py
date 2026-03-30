@@ -55,100 +55,94 @@ def _generate_skewed_values(mean, std_dev, skewness, n, rng, min_val=None, max_v
 
 
 def generate_int64_pool(dist, cardinality, seed=42):
-    """Generate a pool of unique integer values."""
-    rng = np.random.default_rng(seed)
-
+    """Generate a pool of unique integer values using inverse CDF."""
     mean = dist.mean if dist.mean is not None else 0
     std_dev = dist.std_dev if dist.std_dev is not None else max(cardinality / 3, 1)
     skewness = dist.skewness if dist.skewness is not None else 0.0
     min_val = dist.min
     max_val = dist.max
 
-    # Generate more than needed to ensure uniqueness after rounding
-    oversample = min(cardinality * 3, cardinality + 1_000_000)
-    raw = _generate_skewed_values(mean, std_dev, skewness, oversample, rng, min_val, max_val)
+    # Use inverse CDF for evenly spaced quantiles → unique integers
+    quantiles = np.linspace(0.001, 0.999, cardinality * 2)  # oversample for rounding
+
+    if HAS_SCIPY and abs(skewness) > 0.1:
+        from scipy.stats import skewnorm as sn
+        raw = sn.ppf(quantiles, skewness, loc=mean, scale=max(std_dev, 1e-10))
+    elif HAS_SCIPY:
+        from scipy.stats import norm
+        raw = norm.ppf(quantiles, loc=mean, scale=max(std_dev, 1e-10))
+    else:
+        raw = _generate_skewed_values(mean, std_dev, skewness, len(quantiles),
+                                       np.random.default_rng(seed), min_val, max_val)
+
     raw = np.round(raw).astype(np.int64)
 
-    # Ensure uniqueness
+    if min_val is not None:
+        raw = raw[raw >= int(min_val)]
+    if max_val is not None:
+        raw = raw[raw <= int(max_val)]
+
     unique = np.unique(raw)
 
     if len(unique) >= cardinality:
-        # Sub-sample to exact cardinality
-        chosen = rng.choice(unique, size=cardinality, replace=False)
+        # Subsample evenly to keep distribution shape
+        indices = np.linspace(0, len(unique) - 1, cardinality, dtype=int)
+        chosen = unique[indices]
     else:
-        # Not enough unique values from distribution; fill with sequential values
-        chosen = list(unique)
-        if min_val is not None and max_val is not None:
-            fill_range = np.arange(int(min_val), int(max_val) + 1)
-        else:
-            center = int(mean)
-            half = cardinality
-            fill_range = np.arange(center - half, center + half + 1)
+        # Fill with sequential integers
+        lo = int(min_val) if min_val is not None else int(mean) - cardinality
+        chosen = np.arange(lo, lo + cardinality, dtype=np.int64)
 
-        existing = set(chosen)
-        for v in fill_range:
-            if len(chosen) >= cardinality:
-                break
-            if v not in existing:
-                chosen.append(v)
-                existing.add(v)
-
-        # Last resort: extend beyond range
-        counter = (int(max_val) + 1) if max_val is not None else (int(mean) + cardinality)
-        while len(chosen) < cardinality:
-            if counter not in existing:
-                chosen.append(counter)
-                existing.add(counter)
-            counter += 1
-
-        chosen = np.array(chosen[:cardinality], dtype=np.int64)
-
-    chosen.sort()
+    chosen = np.sort(chosen)
     return chosen.tolist()
 
 
 def generate_double_pool(dist, cardinality, seed=42):
-    """Generate a pool of unique float values."""
-    rng = np.random.default_rng(seed)
-
+    """Generate a pool of unique float values using inverse CDF sampling."""
     mean = dist.mean if dist.mean is not None else 0.0
     std_dev = dist.std_dev if dist.std_dev is not None else 1.0
     skewness = dist.skewness if dist.skewness is not None else 0.0
     min_val = dist.min
     max_val = dist.max
 
-    # Generate more than needed then take unique values
-    oversample = min(cardinality * 2, cardinality + 500_000)
-    values = _generate_skewed_values(mean, std_dev, skewness, oversample, rng, min_val, max_val)
+    # Generate evenly spaced quantiles (0.001 to 0.999) through the CDF
+    # This produces unique, distribution-shaped values in O(n)
+    quantiles = np.linspace(0.001, 0.999, cardinality)
 
-    # Round to 2 decimal places for realism
-    values = np.round(values, 2)
-
-    # Fast uniqueness via numpy
-    unique = np.unique(values)
-
-    if len(unique) >= cardinality:
-        # Subsample to exact cardinality (keep distribution shape by taking evenly spaced)
-        indices = np.linspace(0, len(unique) - 1, cardinality, dtype=int)
-        result = unique[indices]
+    if HAS_SCIPY and abs(skewness) > 0.1:
+        from scipy.stats import skewnorm as sn
+        result = sn.ppf(quantiles, skewness, loc=mean, scale=max(std_dev, 1e-10))
     else:
-        # Not enough unique values after rounding — add fractional noise
-        result = list(unique)
-        extra_needed = cardinality - len(result)
-        noise = rng.uniform(-0.005, 0.005, size=extra_needed)
-        base = rng.choice(unique, size=extra_needed)
-        extras = np.round(base + noise, 4)
-        # Ensure uniqueness with the existing set
-        existing = set(result)
-        for v in extras:
-            v = float(v)
-            while v in existing:
-                v = round(v + 0.0001, 4)
-            result.append(v)
-            existing.add(v)
-        result = np.array(result[:cardinality])
+        from scipy.stats import norm
+        result = norm.ppf(quantiles, loc=mean, scale=max(std_dev, 1e-10))
+    if not HAS_SCIPY:
+        # Numpy fallback — approximate with normal
+        result = mean + std_dev * np.sqrt(2) * np.array(
+            [float('nan') if q <= 0 or q >= 1 else
+             np.sign(q - 0.5) * np.sqrt(-2 * np.log(1 - 2 * abs(q - 0.5)))
+             for q in quantiles]
+        )
 
-    result = np.sort(result)
+    # Round — but use more decimal places if the range is narrow
+    value_range = result[-1] - result[0] if len(result) > 1 else 1.0
+    if value_range < cardinality * 0.01:
+        # Narrow range: keep more precision to maintain uniqueness
+        decimals = max(2, int(np.ceil(np.log10(cardinality / max(value_range, 1e-10)))) + 1)
+    else:
+        decimals = 2
+    result = np.round(result, decimals)
+
+    if min_val is not None:
+        result = np.clip(result, min_val, None)
+    if max_val is not None:
+        result = np.clip(result, None, max_val)
+
+    # Deduplicate (rounding may create some)
+    result = np.unique(result)
+    if len(result) > cardinality:
+        indices = np.linspace(0, len(result) - 1, cardinality, dtype=int)
+        result = result[indices]
+
     return result.tolist()
 
 
