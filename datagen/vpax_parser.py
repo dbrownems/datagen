@@ -361,12 +361,22 @@ def parse_vpax(vpax_path):
     """
     vpax_path = Path(vpax_path)
 
-    if not vpax_path.exists():
-        raise FileNotFoundError(f"VPAX file not found: {vpax_path}")
+    # Read the file — with fallback for FUSE mount issues
+    import io
+    try:
+        vpax_bytes = vpax_path.read_bytes()
+    except OSError:
+        try:
+            import notebookutils
+            vpax_bytes = notebookutils.fs.read(str(vpax_path))
+            if isinstance(vpax_bytes, str):
+                vpax_bytes = vpax_bytes.encode("latin-1")
+        except Exception:
+            raise FileNotFoundError(f"VPAX file not found or unreadable: {vpax_path}")
 
     model_json = None
 
-    with zipfile.ZipFile(vpax_path, "r") as zf:
+    with zipfile.ZipFile(io.BytesIO(vpax_bytes), "r") as zf:
         # Look for the model JSON file
         json_files = [
             n for n in zf.namelist()
