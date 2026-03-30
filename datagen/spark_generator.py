@@ -477,9 +477,10 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
                     if os.path.isdir(os.path.join(check_dir, name))
                     and not name.startswith(".")
                 }
+                print(f"  Found {len(existing_tables)} existing tables in {check_dir}", flush=True)
                 break
-        if existing_tables:
-            print(f"  Found {len(existing_tables)} existing tables", flush=True)
+        if not existing_tables:
+            print(f"  No existing tables found (checked {tables_dir})", flush=True)
 
     # Try to use tqdm for progress bar (available in Fabric)
     try:
@@ -502,7 +503,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
 
         # Skip existing tables when not overwriting
-        if not overwrite and _safe_table_name(tname) in existing_tables:
+        safe_name = _safe_table_name(tname)
+        if not overwrite and (safe_name in existing_tables or tname in existing_tables):
             succeeded_tables.append(tname)
             skipped_tables.append(tname)
             if progress:
