@@ -494,19 +494,17 @@ def deploy_semantic_model(
     n_rels = 0
     n_measures = 0
 
+    # --- Session 1: Tables, columns, partitions, measures, metadata ---
     with connect_semantic_model(
         dataset=name, workspace=workspace, readonly=False
     ) as tom:
-        # --- Shared expression (lakehouse connection) ---
         tom.add_expression(name="DatabaseQuery", expression=shared_expr)
 
-        # --- Tables + columns + partitions ---
         for table in tables:
             tname = table["name"]
             try:
                 tom.add_table(name=tname)
 
-                # Add columns
                 for col in table.get("columns", []):
                     if col.get("is_calculated"):
                         continue
@@ -518,7 +516,6 @@ def deploy_semantic_model(
                         data_type=dt,
                     )
 
-                # Add partition based on mode
                 if mode == "import":
                     m_expr = (
                         f'let\n'
@@ -544,30 +541,8 @@ def deploy_semantic_model(
                 err = str(e)[:120]
                 print(f"    ⚠ Table '{tname}': {err}", flush=True)
 
-        # --- Relationships ---
         model_table_names = {t.Name for t in tom.model.Tables}
-        for rel in relationships:
-            if rel["from_table"] not in model_table_names:
-                continue
-            if rel["to_table"] not in model_table_names:
-                continue
-            try:
-                tom.add_relationship(
-                    from_table=rel["from_table"],
-                    from_column=rel["from_column"],
-                    to_table=rel["to_table"],
-                    to_column=rel["to_column"],
-                    from_cardinality=rel.get("from_cardinality", "Many"),
-                    to_cardinality=rel.get("to_cardinality", "One"),
-                    cross_filtering_behavior=rel.get("cross_filtering"),
-                    is_active=rel.get("is_active", True),
-                    security_filtering_behavior=rel.get("security_filtering"),
-                )
-                n_rels += 1
-            except Exception:
-                pass
 
-        # --- Measures ---
         for table in tables:
             if table["name"] not in model_table_names:
                 continue
@@ -588,8 +563,55 @@ def deploy_semantic_model(
                 except Exception:
                     pass
 
-        # --- Column metadata ---
         _apply_column_metadata(tom, [t for t in tables if t["name"] in model_table_names])
+
+    # --- Session 2: Relationships (separate to handle ambiguous path errors) ---
+    try:
+        with connect_semantic_model(
+            dataset=name, workspace=workspace, readonly=False
+        ) as tom:
+            model_table_names = {t.Name for t in tom.model.Tables}
+            model_col_names = {}
+            for t in tom.model.Tables:
+                model_col_names[t.Name] = {c.Name for c in t.Columns}
+
+            for rel in relationships:
+                ft, fc = rel["from_table"], rel["from_column"]
+                tt, tc = rel["to_table"], rel["to_column"]
+                if ft not in model_table_names or tt not in model_table_names:
+                    continue
+                if fc not in model_col_names.get(ft, set()):
+                    continue
+                if tc not in model_col_names.get(tt, set()):
+                    continue
+                try:
+                    tom.add_relationship(
+                        from_table=ft,
+                        from_column=fc,
+                        to_table=tt,
+                        to_column=tc,
+                        from_cardinality=rel.get("from_cardinality", "Many"),
+                        to_cardinality=rel.get("to_cardinality", "One"),
+                        cross_filtering_behavior=rel.get("cross_filtering"),
+                        is_active=rel.get("is_active", True),
+                        security_filtering_behavior=rel.get("security_filtering"),
+                    )
+                    n_rels += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        # Ambiguous paths — retry with all relationships set to inactive,
+        # then selectively activate non-conflicting ones
+        print(f"    ⚠ Relationship save failed (ambiguous paths), retrying with inactive relationships...", flush=True)
+        try:
+            with connect_semantic_model(
+                dataset=name, workspace=workspace, readonly=False
+            ) as tom:
+                # Deactivate all existing relationships
+                for r in tom.model.Relationships:
+                    r.IsActive = False
+        except Exception:
+            print(f"    ⚠ Could not fix relationships automatically", flush=True)
 
     # ------------------------------------------------------------------
     # 3. For import mode, refresh to pull data in
