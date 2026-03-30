@@ -4,11 +4,18 @@ Uses mapInPandas for single-pass, multi-column generation with broadcast
 value pools. Designed for Fabric Spark at scale.
 """
 
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 from .pool_generator import generate_value_pool, _parse_fixed_values
+
+
+def _log(msg):
+    """Print with immediate flush so Fabric notebooks show progress."""
+    _log(msg)
+    sys.stdout.flush()
 
 
 def _compute_weights(values_spec, pool_size):
@@ -241,13 +248,13 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         columns = table_config["columns"]
 
     if not columns:
-        print(f"  Skipping table '{table_name}': no columns defined")
+        _log(f"  Skipping table '{table_name}': no columns defined")
         return
 
     import time as _time
     _t0 = _time.time()
 
-    print(f"Generating table '{table_name}' ({row_count:,} rows, {len(columns)} columns)")
+    _log(f"Generating table '{table_name}' ({row_count:,} rows, {len(columns)} columns)")
 
     # Phase 1 — generate value pools on the driver
     pools = {}
@@ -289,7 +296,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
             pools[col_name] = [r[field] for r in geo_records]
             # Deduplicate for columns with lower cardinality (state, country)
             # but keep the full list for index-based correlation
-            print(f"  Pool: {col_name} → {len(set(pools[col_name]))} unique values (geo-correlated)")
+            _log(f"  Pool: {col_name} → {len(set(pools[col_name]))} unique values (geo-correlated)")
 
     # Detect correlated email+name columns
     from .email_generator import is_email_column, is_name_column, email_to_name
@@ -309,10 +316,10 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
             email_col = next(c for c in columns
                              if (c.name if hasattr(c, "name") else c["name"]) == email_col_name)
             pools[email_col_name] = generate_value_pool(email_col, global_seed, table_name=table_name)
-            print(f"  Pool: {email_col_name} → {len(pools[email_col_name]):,} unique values")
+            _log(f"  Pool: {email_col_name} → {len(pools[email_col_name]):,} unique values")
         # Derive name pool from email pool
         pools[name_col_name] = [email_to_name(e) for e in pools[email_col_name]]
-        print(f"  Pool: {name_col_name} → {len(pools[name_col_name]):,} unique values (derived from {email_col_name})")
+        _log(f"  Pool: {name_col_name} → {len(pools[name_col_name]):,} unique values (derived from {email_col_name})")
 
     for col in columns:
         col_name = col.name if hasattr(col, "name") else col["name"]
@@ -325,7 +332,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
         pool = generate_value_pool(col, global_seed, table_name=table_name)
         pools[col_name] = pool
-        print(f"  Pool: {col_name} → {len(pool):,} unique values")
+        _log(f"  Pool: {col_name} → {len(pool):,} unique values")
 
         # Compute per-value weights if fixed values have frequencies
         values_spec = col.values if hasattr(col, "values") else (col.get("values") if isinstance(col, dict) else None)
@@ -335,11 +342,11 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     # Phase 2 — build output schema
     _t1 = _time.time()
-    print(f"  Pools generated in {_t1 - _t0:.1f}s")
+    _log(f"  Pools generated in {_t1 - _t0:.1f}s")
     schema = _build_schema(columns)
 
     # Phase 3 — broadcast pools and column metadata
-    print(f"  Broadcasting pools to executors ...")
+    _log(f"  Broadcasting pools to executors ...")
     col_dicts = [_col_to_dict(c) for c in columns]
 
     # Mark primary-key columns so the partition generator can use direct
@@ -370,8 +377,8 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     # Phase 4 — generate with mapInPandas (single pass, all columns at once)
     _t2 = _time.time()
-    print(f"  Broadcast complete in {_t2 - _t1:.1f}s")
-    print(f"  Writing {output_format.lower()} table ({row_count:,} rows) ...")
+    _log(f"  Broadcast complete in {_t2 - _t1:.1f}s")
+    _log(f"  Writing {output_format.lower()} table ({row_count:,} rows) ...")
     gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc)
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
@@ -381,7 +388,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     fmt = output_format.lower()
     result_df.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
     _t3 = _time.time()
-    print(f"  ✓ {table_name} complete ({_t3 - _t0:.1f}s)")
+    _log(f"  ✓ {table_name} complete ({_t3 - _t0:.1f}s)")
 
     # Cleanup
     pools_bc.unpersist()
@@ -426,12 +433,12 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             vpax_tables[t["name"]] = t
 
     n = len(tables)
-    print(f"{'=' * 60}")
-    print(f"Datagen: generating {n} table{'s' if n != 1 else ''} for '{model_name}'")
-    print(f"Output : {out_path}")
-    print(f"Seed   : {seed}")
-    print(f"{'=' * 60}")
-    print()
+    _log(f"{'=' * 60}")
+    _log(f"Datagen: generating {n} table{'s' if n != 1 else ''} for '{model_name}'")
+    _log(f"Output : {out_path}")
+    _log(f"Seed   : {seed}")
+    _log(f"{'=' * 60}")
+    _log()
 
     import time as _time
 
@@ -439,7 +446,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         tname = table.name if hasattr(table, "name") else table["name"]
         row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
         n_cols = len(table.columns if hasattr(table, "columns") else table.get("columns", []))
-        print(f"[{i}/{n}] {tname} ({row_count:,} rows, {n_cols} cols)")
+        _log(f"[{i}/{n}] {tname} ({row_count:,} rows, {n_cols} cols)")
 
         _table_t0 = _time.time()
 
@@ -450,12 +457,12 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         else:
             generate_table(spark, table, out_path, seed, output_format)
 
-        print(f"  Total: {_time.time() - _table_t0:.1f}s")
-        print()
+        _log(f"  Total: {_time.time() - _table_t0:.1f}s")
+        _log()
 
-    print(f"{'=' * 60}")
-    print(f"All {n} tables generated successfully.")
-    print(f"{'=' * 60}")
+    _log(f"{'=' * 60}")
+    _log(f"All {n} tables generated successfully.")
+    _log(f"{'=' * 60}")
 
 
 def _is_date_table(vpax_table):
@@ -471,7 +478,7 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     tname = vpax_table["name"]
     row_count = vpax_table.get("row_count", 365)
 
-    print(f"  Date table detected — generating {row_count:,} days with derived columns")
+    _log(f"  Date table detected — generating {row_count:,} days with derived columns")
 
     rows = generate_date_table(vpax_table)
 
@@ -493,6 +500,6 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
 
     table_path = f"{output_path.rstrip('/')}/{tname}"
     fmt = output_format.lower()
-    print(f"  Writing {fmt} table → {table_path}")
+    _log(f"  Writing {fmt} table → {table_path}")
     sdf.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
-    print(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
+    _log(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
