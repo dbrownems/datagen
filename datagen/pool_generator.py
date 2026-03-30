@@ -117,23 +117,39 @@ def generate_double_pool(dist, cardinality, seed=42):
     min_val = dist.min
     max_val = dist.max
 
-    values = _generate_skewed_values(mean, std_dev, skewness, cardinality, rng, min_val, max_val)
+    # Generate more than needed then take unique values
+    oversample = min(cardinality * 2, cardinality + 500_000)
+    values = _generate_skewed_values(mean, std_dev, skewness, oversample, rng, min_val, max_val)
 
-    # Floats are almost always unique; round to 2 decimal places for realism
+    # Round to 2 decimal places for realism
     values = np.round(values, 2)
 
-    # Ensure uniqueness by adding tiny noise to duplicates
-    seen = set()
-    result = []
-    for v in values:
-        v = float(v)
-        while v in seen:
-            v += 0.01
-        seen.add(v)
-        result.append(v)
+    # Fast uniqueness via numpy
+    unique = np.unique(values)
 
-    result.sort()
-    return result
+    if len(unique) >= cardinality:
+        # Subsample to exact cardinality (keep distribution shape by taking evenly spaced)
+        indices = np.linspace(0, len(unique) - 1, cardinality, dtype=int)
+        result = unique[indices]
+    else:
+        # Not enough unique values after rounding — add fractional noise
+        result = list(unique)
+        extra_needed = cardinality - len(result)
+        noise = rng.uniform(-0.005, 0.005, size=extra_needed)
+        base = rng.choice(unique, size=extra_needed)
+        extras = np.round(base + noise, 4)
+        # Ensure uniqueness with the existing set
+        existing = set(result)
+        for v in extras:
+            v = float(v)
+            while v in existing:
+                v = round(v + 0.0001, 4)
+            result.append(v)
+            existing.add(v)
+        result = np.array(result[:cardinality])
+
+    result = np.sort(result)
+    return result.tolist()
 
 
 def generate_datetime_pool(dist, cardinality, seed=42):
