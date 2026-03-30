@@ -13,7 +13,8 @@ def generate(
     dataset=None,
     workspace=None,
     lakehouse=None,
-    overwrite=False,
+    overwrite_tables=True,
+    overwrite_model=True,
     mode="direct_lake",
     output_format="delta",
     include_hidden=False,
@@ -24,8 +25,7 @@ def generate(
     Infers data distributions directly from the .vpax file, generates
     Delta tables in the lakehouse, then (optionally) deploys a semantic
     model with all measures, relationships, and column metadata from the
-    .vpax.  Finally, runs ``vertipaq_analyzer`` on the deployed model and
-    prints a comparison report.
+    .vpax.
 
     Args:
         spark: Active SparkSession.
@@ -34,15 +34,16 @@ def generate(
         seed: Random seed for reproducible generation.
         deploy_model: If True, deploy a semantic model after generating
             the tables (requires ``semantic-link-labs``).
-        compare: If True (and deploy_model is True), run vertipaq_analyzer
-            on the deployed model and print a comparison report.
+        compare: If True, compare generated tables against the config
+            and print an accuracy report.
         dataset: Semantic model name (defaults to the VPAX model name).
         workspace: Target Fabric workspace (default: current).
         lakehouse: Lakehouse name (default: attached lakehouse).
-        overwrite: Overwrite an existing semantic model.
+        overwrite_tables: If True, regenerate all Delta tables. If False,
+            skip tables that already exist and only generate missing ones.
+        overwrite_model: If True, overwrite an existing semantic model.
+            If False, fail if the model already exists.
         mode: ``"direct_lake"`` (default) or ``"import"``.
-            Import mode creates Power Query partitions that read from
-            the lakehouse SQL endpoint and imports data into the model.
         output_format: ``"delta"`` (default) or ``"parquet"``.
         include_hidden: Include hidden columns/tables from the VPAX.
         include_calculated: Include calculated columns.
@@ -77,7 +78,7 @@ def generate(
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     succeeded_tables = generate_all_tables(spark, config, output_path=output_path,
                         output_format=output_format, vpax_model=vpax_model,
-                        overwrite=overwrite)
+                        overwrite=overwrite_tables)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:
@@ -90,7 +91,7 @@ def generate(
             mode=mode,
             include_hidden=include_hidden,
             include_calculated=include_calculated,
-            overwrite=overwrite,
+            overwrite=overwrite_model,
             table_filter=succeeded_tables,
         )
 
