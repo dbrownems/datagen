@@ -460,12 +460,26 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     )
 
     from . import __version__
-    print(f"Datagen v{__version__} — {model_name}")
-    print(f"  Tables: {n}  |  Total rows: {total_rows:,}  |  Output: {out_path}  |  Seed: {seed}")
-    print(flush=True)
-
     import time as _time
     _overall_t0 = _time.time()
+
+    print(f"Datagen v{__version__} — {model_name}")
+    print(f"  Tables: {n}  |  Total rows: {total_rows:,}  |  Output: {out_path}  |  Seed: {seed}", flush=True)
+
+    # Build set of existing table folder names (for overwrite=False)
+    existing_tables = set()
+    if not overwrite:
+        tables_dir = out_path.rstrip("/")
+        for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
+            if os.path.isdir(check_dir):
+                existing_tables = {
+                    name for name in os.listdir(check_dir)
+                    if os.path.isdir(os.path.join(check_dir, name))
+                    and not name.startswith(".")
+                }
+                break
+        if existing_tables:
+            print(f"  Found {len(existing_tables)} existing tables", flush=True)
 
     # Try to use tqdm for progress bar (available in Fabric)
     try:
@@ -478,23 +492,6 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     errors = []
     succeeded_tables = []
     skipped_tables = []
-
-    # Build set of existing table folder names (for overwrite=False)
-    existing_tables = set()
-    if not overwrite:
-        import os
-        tables_dir = out_path.rstrip("/")
-        # Try filesystem listing first (fast)
-        for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
-            if os.path.isdir(check_dir):
-                existing_tables = {
-                    name for name in os.listdir(check_dir)
-                    if os.path.isdir(os.path.join(check_dir, name))
-                    and not name.startswith(".")
-                }
-                break
-        if existing_tables:
-            print(f"  Found {len(existing_tables)} existing tables", flush=True)
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
