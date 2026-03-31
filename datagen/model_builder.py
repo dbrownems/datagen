@@ -135,7 +135,8 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
         model["tables"] = kept_tables
 
     # Modify each table's partition to Direct Lake entity
-    # Skip measure-only tables (they don't need partitions)
+    # Convert all calculated columns to data columns (we generate values for
+    # them in the Delta tables, Direct Lake doesn't support calculated columns)
     for table in model.get("tables", []):
         tname = table["name"]
         safe_name = _safe_folder_name(tname)
@@ -161,20 +162,16 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
             }
         ]
 
-        # Remove import-mode column source properties that conflict
-        # Convert calculated columns to regular data columns (we generated
-        # the values in the Delta table, so they're no longer calculated)
+        # Process columns: convert calculated → data, fix sourceColumn
         n_converted = 0
         for col in table.get("columns", []):
-            if "sourceColumn" in col:
-                col["sourceColumn"] = col["name"]
             col.pop("sourceProviderType", None)
-
             if col.get("type") == "calculated":
-                col.pop("type", None)         # default type = "data"
-                col.pop("expression", None)    # DAX expression no longer needed
-                col["sourceColumn"] = col["name"]
+                col.pop("type", None)
+                col.pop("expression", None)
                 n_converted += 1
+            if "sourceColumn" in col or col.get("type", "data") == "data":
+                col["sourceColumn"] = col["name"]
 
         if n_converted:
             print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
