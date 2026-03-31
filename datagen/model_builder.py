@@ -220,19 +220,11 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     return db, expr_name
 
 
-def _convert_calc_columns_in_tmdl(content):
+def _convert_calc_columns_in_tmdl(content, filename=""):
     """Convert calculated columns to data columns in TMDL text.
 
-    In TMDL, a calculated column looks like:
-        calculatedColumn 'Name'
-            expression = ...
-            columnOrigin = ...
-
-    A data column looks like:
-        column 'Name'
-            sourceColumn: Name
-
-    We replace the keyword, remove calc-only properties, and add sourceColumn.
+    Replaces 'calculatedColumn' and 'calculatedTableColumn' keywords with
+    'column', removes calc-only properties, and adds sourceColumn.
     """
     import re
 
@@ -243,52 +235,64 @@ def _convert_calc_columns_in_tmdl(content):
 
     while i < len(lines):
         line = lines[i]
-        stripped = line.lstrip()
 
-        # Detect calculatedColumn or calculatedTableColumn
-        match = re.match(r'^(\t+)(calculatedColumn|calculatedTableColumn)\s+(.*)', line)
+        # Detect calculatedColumn or calculatedTableColumn (tabs or spaces)
+        match = re.match(r'^(\s+)(calculatedColumn|calculatedTableColumn)\s+(.*)', line)
         if match:
             indent = match.group(1)
-            col_ref = match.group(3)  # e.g. "'GPS Flag'" or "Name"
+            col_ref = match.group(3).rstrip()
             n_converted += 1
 
-            # Extract the column name from the reference for sourceColumn
-            col_name = col_ref.strip().strip("'")
+            # Handle inline expression: calculatedColumn 'X' = <expr>
+            if " = " in col_ref:
+                col_ref = col_ref.split(" = ")[0].strip()
 
-            # Write as regular column
+            col_name = col_ref.strip("'")
+
             result.append(f"{indent}column {col_ref}")
-
-            # Process the column's body — skip calc-only properties, add sourceColumn
             i += 1
-            body_indent = indent + "\t"
+
+            # Determine body indent (one level deeper than the keyword)
+            body_indent_len = len(indent) + 1  # at least one char deeper
             added_source = False
+            in_expression_block = False
 
             while i < len(lines):
                 bline = lines[i]
                 bstripped = bline.lstrip()
+                bindent_len = len(bline) - len(bstripped)
+
+                # Handle multi-line expression blocks (``` delimited)
+                if in_expression_block:
+                    if bstripped.startswith("```"):
+                        in_expression_block = False
+                    i += 1
+                    continue
+
+                # Empty lines within the block — keep them
+                if not bstripped:
+                    result.append(bline)
+                    i += 1
+                    continue
 
                 # Check if we've exited the column block (same or less indent)
-                if bline.strip() and not bline.startswith(body_indent):
+                if bindent_len <= len(indent):
                     break
 
                 # Skip calc-only properties
-                prop_name = bstripped.split(":")[0].split(" ")[0].split("=")[0].strip()
-                if prop_name in ("expression", "columnOrigin", "isNameInferred",
-                                 "isDataTypeInferred"):
-                    # Skip multi-line expressions (```...```)
+                prop = bstripped.split(":")[0].split("=")[0].split(" ")[0].strip()
+                if prop in ("expression", "columnOrigin", "isNameInferred",
+                            "isDataTypeInferred"):
                     if "```" in bstripped:
-                        i += 1
-                        while i < len(lines) and "```" not in lines[i]:
-                            i += 1
-                        i += 1  # skip closing ```
-                    else:
-                        i += 1
+                        in_expression_block = True
+                    i += 1
                     continue
 
-                # Add sourceColumn before the first property if not yet added
-                if not added_source and bstripped.startswith("dataType"):
+                # Insert sourceColumn after dataType if not yet added
+                if not added_source and prop == "dataType":
                     result.append(bline)
                     i += 1
+                    body_indent = bline[:bindent_len]
                     result.append(f"{body_indent}sourceColumn: {col_name}")
                     added_source = True
                     continue
@@ -297,12 +301,16 @@ def _convert_calc_columns_in_tmdl(content):
                 i += 1
 
             if not added_source:
+                body_indent = indent + "\t"
                 result.append(f"{body_indent}sourceColumn: {col_name}")
 
             continue
 
         result.append(line)
         i += 1
+
+    if n_converted and filename:
+        print(f"      {filename}: {n_converted} calculated column(s) → data", flush=True)
 
     return "\n".join(result), n_converted
 
@@ -338,7 +346,7 @@ def _serialize_to_tmdl_parts(db):
 
                 # Convert calculated columns to data columns in table TMDL files
                 if rel_path.startswith("tables/") and fname.endswith(".tmdl"):
-                    content, n = _convert_calc_columns_in_tmdl(content)
+                    content, n = _convert_calc_columns_in_tmdl(content, fname)
                     total_converted += n
 
                 parts.append({
