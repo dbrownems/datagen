@@ -37,25 +37,21 @@ def _safe_table_name(name):
 
 
 # ---------------------------------------------------------------------------
-# OneLake filesystem helpers (notebookutils.fs preferred, os.path fallback)
+# OneLake filesystem helpers (notebookutils.fs — talks directly to OneLake)
 # ---------------------------------------------------------------------------
 
 def _fs_exists(path):
-    """Check if a path exists in the lakehouse. Uses notebookutils.fs first."""
+    """Check if a path exists in the lakehouse via notebookutils.fs."""
+    import notebookutils
     try:
-        import notebookutils
-        # notebookutils.fs.ls throws if path doesn't exist
         notebookutils.fs.ls(path)
         return True
     except Exception:
-        pass
-    # Fallback to FUSE
-    import os
-    return os.path.exists(path)
+        return False
 
 
 def _fs_list_dirs(path):
-    """Return a set of directory names under *path*. Uses notebookutils.fs."""
+    """Return a set of directory names under *path* via notebookutils.fs."""
     import notebookutils
     items = notebookutils.fs.ls(path)
     return {item.name for item in items if item.isDir}
@@ -483,7 +479,6 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             vpax_tables[t["name"]] = t
 
     # Detect schema-enabled lakehouse (Tables/dbo/ exists)
-    import os
     if out_path.rstrip("/") == "Tables":
         if _fs_exists("/lakehouse/default/Tables/dbo"):
             out_path = "Tables/dbo/"
@@ -507,22 +502,10 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         tables_dir = out_path.rstrip("/")
         fs_path = f"/lakehouse/default/{tables_dir}"
 
-        # Primary: notebookutils.fs.ls (talks directly to OneLake)
         try:
             existing_tables = _fs_list_dirs(fs_path)
         except Exception:
             pass
-
-        # Fallback: os.listdir (FUSE mount — less reliable)
-        if not existing_tables:
-            for check_dir in [tables_dir, fs_path]:
-                if os.path.isdir(check_dir):
-                    existing_tables = {
-                        name for name in os.listdir(check_dir)
-                        if os.path.isdir(os.path.join(check_dir, name))
-                        and not name.startswith(".")
-                    }
-                    break
 
         if existing_tables:
             print(f"  Found {len(existing_tables)} existing tables", flush=True)
