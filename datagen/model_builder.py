@@ -116,7 +116,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, ColumnType,
+        JsonSerializer, ColumnType, Partition,
         EntityPartitionSource, NamedExpression,
         ExpressionKind, PowerBIDataSourceVersion,
     )
@@ -181,12 +181,14 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
 
         # Replace partitions with Direct Lake entity partition
         table.Partitions.Clear()
-        part = table.Partitions.Add(tname)
+        part = Partition()
+        part.Name = tname
         source = EntityPartitionSource()
         source.EntityName = safe_name
         source.SchemaName = schema
         source.ExpressionSource = model.Expressions[expr_name]
         part.Source = source
+        table.Partitions.Add(part)
 
         # Convert calculated columns to data columns
         n_converted = 0
