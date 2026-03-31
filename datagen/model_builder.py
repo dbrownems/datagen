@@ -118,6 +118,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     from Microsoft.AnalysisServices.Tabular import (
         JsonSerializer, ColumnType,
         EntityPartitionSource, NamedExpression,
+        ExpressionKind, PowerBIDataSourceVersion,
     )
 
     _strip_unknown_bim_properties(bim)
@@ -134,7 +135,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     model.Expressions.Clear()
     expr = NamedExpression()
     expr.Name = expr_name
-    expr.Kind = "m"
+    expr.Kind = ExpressionKind.M
     expr.Expression = (
         "let\n"
         f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])\n'
@@ -211,7 +212,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         model.QueryGroups.Clear()
 
     # Set Direct Lake compatible options
-    model.DefaultPowerBIDataSourceVersion = "powerBI_V3"
+    model.DefaultPowerBIDataSourceVersion = PowerBIDataSourceVersion.PowerBI_V3
 
     # Update compatibility level
     db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
