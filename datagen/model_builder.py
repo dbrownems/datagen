@@ -200,23 +200,19 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     # Build filter set
     filter_set = set(table_filter) if table_filter is not None else None
 
-    # Remove tables not in filter (keep measure-only tables)
+    # Remove tables not in filter (only keep measure-only tables without data)
     if filter_set is not None:
         tables_to_remove = []
         for table in model.Tables:
             if table.Name in filter_set:
                 continue
-            has_data_cols = any(
-                col.Type != ColumnType.RowNumber
-                for col in table.Columns
-                if col.Type not in (ColumnType.Calculated, ColumnType.CalculatedTableColumn)
-            )
+            # Keep tables that exist only for measures (no Delta table needed)
             has_measures = table.Measures.Count > 0
-            if has_measures and not has_data_cols:
-                continue
-            if not has_measures and not has_data_cols:
+            if has_measures:
                 continue
             tables_to_remove.append(table.Name)
+        if tables_to_remove:
+            print(f"    Removing {len(tables_to_remove)} table(s) not in generated set", flush=True)
         for tname in tables_to_remove:
             model.Tables.Remove(tname)
 
