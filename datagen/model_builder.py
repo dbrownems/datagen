@@ -240,6 +240,19 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     # Set Direct Lake compatible options
     model.DefaultPowerBIDataSourceVersion = PowerBIDataSourceVersion.PowerBI_V3
 
+    # Remove relationships with incompatible data types (Direct Lake is strict)
+    incompatible_rels = []
+    for rel in model.Relationships:
+        try:
+            if rel.FromColumn.DataType != rel.ToColumn.DataType:
+                incompatible_rels.append(rel.Name)
+        except Exception:
+            pass
+    if incompatible_rels:
+        print(f"    Removing {len(incompatible_rels)} relationship(s) with incompatible data types", flush=True)
+        for rname in incompatible_rels:
+            model.Relationships.Remove(rname)
+
     n_tables = model.Tables.Count
     n_rels = model.Relationships.Count
     n_measures = sum(t.Measures.Count for t in model.Tables)
