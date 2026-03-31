@@ -123,7 +123,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, ColumnType, Partition,
+        JsonSerializer, ColumnType, Partition, ModeType,
         EntityPartitionSource, NamedExpression,
         ExpressionKind, PowerBIDataSourceVersion,
     )
@@ -188,6 +188,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         table.Partitions.Clear()
         part = Partition()
         part.Name = tname
+        part.Mode = ModeType.DirectLake
         source = EntityPartitionSource()
         source.EntityName = safe_name
         source.SchemaName = schema
