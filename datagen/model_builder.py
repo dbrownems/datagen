@@ -390,18 +390,36 @@ def _poll_async(client, resp):
     for attempt in range(60):
         time.sleep(retry_after)
         poll = client.get(location)
-        status = poll.json().get("status", "") if poll.status_code == 200 else ""
+
+        # Parse response body
+        body = {}
+        try:
+            body = poll.json()
+        except Exception:
+            pass
+
+        status = body.get("status", "")
+        pct = body.get("percentComplete", "")
+        error = body.get("error", {})
+
         if poll.status_code == 200:
-            print(f"    Poll #{attempt+1}: completed (200)", flush=True)
+            if status.lower() == "failed" or error:
+                err_msg = error.get("message", "") or body.get("failureReason", "") or str(body)[:500]
+                raise RuntimeError(f"Async operation failed: {err_msg}")
+            print(f"    Poll #{attempt+1}: completed (status={status or 'ok'})", flush=True)
             return
+
         if poll.status_code == 202:
             retry_after = int(poll.headers.get("Retry-After", "5"))
-            pct = poll.json().get("percentComplete", "?") if poll.headers.get("Content-Type", "").startswith("application/json") else "?"
-            print(f"    Poll #{attempt+1}: in progress ({pct}%)", flush=True)
+            detail = f"{pct}%" if pct != "" else status or "in progress"
+            print(f"    Poll #{attempt+1}: {detail}", flush=True)
             continue
-        print(f"    Poll #{attempt+1}: unexpected {poll.status_code}", flush=True)
-        break
-    print(f"    ⚠ Async polling timed out", flush=True)
+
+        # Unexpected status
+        err_detail = body.get("error", {}).get("message", poll.text[:300])
+        raise RuntimeError(f"Async poll returned {poll.status_code}: {err_detail}")
+
+    raise RuntimeError("Async operation timed out after 60 poll attempts")
 
 
 # ---------------------------------------------------------------------------
