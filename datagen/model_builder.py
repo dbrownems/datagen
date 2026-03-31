@@ -85,6 +85,114 @@ def _get_lakehouse_info(lakehouse=None, workspace=None):
 
 
 def _add_missing_bim_columns(config, bim):
+    """Add columns from Model.bim that are missing from the generation config."""
+    from .config import ColumnConfig, DistributionConfig
+
+    _SKIP_TYPES = {"rowNumber"}
+    _BIM_TO_CONFIG_TYPE = {
+        "string": "string", "int64": "int64", "double": "double",
+        "boolean": "boolean", "dateTime": "datetime", "decimal": "double",
+    }
+
+    bim_model = bim.get("model", bim)
+
+    tables_list = config.tables if hasattr(config, "tables") else config.get("tables", [])
+    config_cols = {}
+    for tc in tables_list:
+        tname = tc.name if hasattr(tc, "name") else tc["name"]
+        cols = tc.columns if hasattr(tc, "columns") else tc.get("columns", [])
+        config_cols[tname] = {
+            (c.name if hasattr(c, "name") else c["name"]) for c in cols
+        }
+
+    n_added = 0
+    for bim_table in bim_model.get("tables", []):
+        tname = bim_table["name"]
+        if tname not in config_cols:
+            continue
+
+        existing = config_cols[tname]
+        config_table = next(
+            (tc for tc in tables_list
+             if (tc.name if hasattr(tc, "name") else tc["name"]) == tname),
+            None,
+        )
+        if config_table is None:
+            continue
+
+        for bim_col in bim_table.get("columns", []):
+            if bim_col.get("type") in _SKIP_TYPES:
+                continue
+            col_name = bim_col["name"]
+            if col_name in existing:
+                continue
+
+            data_type = _BIM_TO_CONFIG_TYPE.get(
+                bim_col.get("dataType", "string"), "string"
+            )
+            row_count = config_table.row_count if hasattr(config_table, "row_count") else config_table.get("row_count", 100)
+            new_col = ColumnConfig(
+                name=col_name,
+                data_type=data_type,
+                cardinality=min(10, row_count),
+                distribution=DistributionConfig(
+                    avg_length=12 if data_type == "string" else None,
+                    style="docker" if data_type == "string" else None,
+                ),
+            )
+            if hasattr(config_table, "columns"):
+                config_table.columns.append(new_col)
+            else:
+                config_table["columns"].append(new_col)
+            existing.add(col_name)
+            n_added += 1
+
+    return n_added
+
+
+def _is_enter_data_table(bim_table):
+    """Check if a BIM table is an 'enter data' table (pasted/inline data)."""
+    for part in bim_table.get("partitions", []):
+        source = part.get("source", {})
+        expr = source.get("expression", "")
+        if isinstance(expr, list):
+            expr = "\n".join(expr)
+        if "Table.FromRows" in expr and "Json.Document" in expr:
+            return True
+    return False
+
+
+def _is_measure_only_table(bim_table):
+    """Check if a BIM table has measures but no data columns."""
+    has_measures = bool(bim_table.get("measures"))
+    has_data_cols = any(
+        c.get("type", "data") not in ("calculated", "calculatedTableColumn", "rowNumber")
+        for c in bim_table.get("columns", [])
+    )
+    return has_measures and not has_data_cols
+
+
+def get_tables_to_skip(vpax_path, mode="direct_lake"):
+    """Return set of table names that should NOT get Delta tables generated.
+
+    For import mode: skip measure-only tables and enter-data tables.
+    For direct_lake mode: returns empty set (generate everything).
+    """
+    if mode == "direct_lake":
+        return set()
+
+    bim = _extract_bim(vpax_path)
+    model = bim.get("model", bim)
+    skip = set()
+    for table in model.get("tables", []):
+        tname = table["name"]
+        if _is_enter_data_table(table):
+            skip.add(tname)
+        elif _is_measure_only_table(table):
+            skip.add(tname)
+    return skip
+
+
     """Add columns from Model.bim that are missing from the generation config.
 
     The VPAX DaxModel.json stats may not include all columns (e.g. some
@@ -168,6 +276,61 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     modify, and reserialize the BIM.
     """
     return _modify_bim_via_tom(bim, lh_info, table_filter)
+
+
+def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=False):
+    """Modify a model.bim for Import mode reading from OneLake Delta tables.
+
+    Keeps the original model structure (calculated columns, etc.) but rewrites
+    partition M queries to read from OneLake instead of the original source.
+
+    Args:
+        bim: The model.bim dict.
+        lh_info: Lakehouse connection info.
+        table_filter: Tables that have Delta backing (from generation).
+        use_sql_endpoint: If True, use SQL Analytics Endpoint instead of OneLake direct.
+    """
+    model = bim.get("model", bim)
+    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    filter_set = set(table_filter) if table_filter is not None else None
+
+    n_rewritten = 0
+    for table in model.get("tables", []):
+        tname = table["name"]
+        has_delta = filter_set is None or tname in filter_set
+
+        if not has_delta:
+            # Keep original partitions (enter-data, measure-only, etc.)
+            continue
+
+        safe_name = _safe_folder_name(tname)
+        table_url = f"{onelake_url}/Tables/{safe_name}/"
+
+        # Rewrite partition to read from OneLake Delta
+        m_expr = (
+            "let\n"
+            f'    Source = AzureStorage.DataLake("{table_url}", [HierarchicalNavigation=true]),\n'
+            "    ToDelta = DeltaLake.Table(Source)\n"
+            "in\n"
+            "    ToDelta"
+        )
+
+        table["partitions"] = [
+            {
+                "name": tname,
+                "source": {
+                    "type": "m",
+                    "expression": m_expr.split("\n"),
+                },
+            }
+        ]
+        n_rewritten += 1
+
+    # Remove query groups (they reference old M query organization)
+    model.pop("queryGroups", None)
+
+    print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
+    return bim
 
 
 def _strip_unknown_bim_properties(bim):
@@ -390,9 +553,14 @@ def deploy_semantic_model(
     print("  Resolving lakehouse connection ...", flush=True)
     lh_info = _get_lakehouse_info(lakehouse, lakehouse_workspace or workspace)
 
-    # Modify the BIM for Direct Lake (TOM for structure, JSON for columns)
-    print("  Converting model to Direct Lake on OneLake ...", flush=True)
-    bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+    # Modify the BIM based on mode
+    if mode == "import":
+        print("  Converting model to Import from OneLake ...", flush=True)
+        _strip_unknown_bim_properties(bim)
+        bim = _modify_bim_for_import(bim, lh_info, table_filter)
+    else:
+        print("  Converting model to Direct Lake on OneLake ...", flush=True)
+        bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
 
     # Update model name
     bim["name"] = name
@@ -438,11 +606,13 @@ def deploy_semantic_model(
         except Exception as re:
             print(f"    ⚠ Could not fetch refresh details: {re}", flush=True)
 
+    mode_label = "Direct Lake" if mode == "direct_lake" else "Import"
     print(flush=True)
     if refresh_ok:
-        print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
+        print(f"✓ Semantic model '{actual_name}' deployed ({mode_label} on OneLake)")
     else:
         print(f"⚠ Semantic model '{actual_name}' deployed but refresh failed")
+    print(f"  Mode:          {mode_label}")
     print(f"  Tables:        {n_tables}")
     print(f"  Relationships: {n_rels}")
     print(f"  Measures:      {n_measures}", flush=True)
