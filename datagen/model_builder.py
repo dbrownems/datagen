@@ -278,7 +278,24 @@ def deploy_semantic_model(
     print(f"  Measures:      {n_measures}", flush=True)
 
 
-def _deploy_bim(bim, name, workspace=None, overwrite=False):
+def _log_headers(headers):
+    """Format headers for logging, redacting authorization tokens."""
+    safe = {}
+    for k, v in headers.items():
+        if k.lower() in ("authorization", "x-ms-authorization"):
+            safe[k] = "Bearer ***"
+        else:
+            safe[k] = v
+    return safe
+
+
+def _log_request(method, url, resp):
+    """Log API request URI and response details."""
+    print(f"    {method} {url}", flush=True)
+    print(f"    → Request headers: {_log_headers(dict(resp.request.headers))}", flush=True)
+    print(f"    ← {resp.status_code} | Response headers: {dict(resp.headers)}", flush=True)
+
+
     """Deploy a model.bim via the Fabric REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
@@ -317,12 +334,10 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
 
     if existing and overwrite:
         model_id = existing["id"]
+        url = f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition"
         print(f"    Updating definition (overwrite=True) ...", flush=True)
-        resp = client.post(
-            f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition",
-            json={"definition": definition},
-        )
-        print(f"    Update response: {resp.status_code}", flush=True)
+        resp = client.post(url, json={"definition": definition})
+        _log_request("POST", url, resp)
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
 
@@ -344,9 +359,10 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
             "type": "SemanticModel",
             "definition": definition,
         }
+        url = f"/v1/workspaces/{ws_id}/items"
         print(f"    Creating new semantic model ...", flush=True)
-        resp = client.post(f"/v1/workspaces/{ws_id}/items", json=body)
-        print(f"    Create response: {resp.status_code}", flush=True)
+        resp = client.post(url, json=body)
+        _log_request("POST", url, resp)
         if resp.status_code not in (200, 201, 202):
             raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:500]}")
 
@@ -386,10 +402,14 @@ def _poll_async(client, resp):
         time.sleep(10)
         return
 
-    print(f"    Async operation — polling ...", flush=True)
+    print(f"    Async operation — polling {location}", flush=True)
     for attempt in range(60):
         time.sleep(retry_after)
         poll = client.get(location)
+
+        if attempt == 0:
+            # Log first poll request/response in detail
+            _log_request("GET", location, poll)
 
         # Parse response body
         body = {}
@@ -404,6 +424,7 @@ def _poll_async(client, resp):
 
         if poll.status_code == 200:
             if status.lower() == "failed" or error:
+                print(f"    Poll #{attempt+1}: FAILED — response headers: {dict(poll.headers)}", flush=True)
                 err_msg = error.get("message", "") or body.get("failureReason", "") or str(body)[:500]
                 raise RuntimeError(f"Async operation failed: {err_msg}")
             print(f"    Poll #{attempt+1}: completed (status={status or 'ok'})", flush=True)
