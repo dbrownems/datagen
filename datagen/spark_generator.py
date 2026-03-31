@@ -544,10 +544,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             succeeded_tables.append(tname)
             skipped_tables.append(tname)
             if progress:
-                progress.write(f"  ⊘ {tname} — exists, skipped")
                 progress.update(1)
-            else:
-                print(f"  [{i}/{n}] ⊘ {tname} — exists, skipped", flush=True)
             continue
 
         if progress:
