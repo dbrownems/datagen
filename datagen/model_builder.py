@@ -195,81 +195,87 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         part.Source = source
         table.Partitions.Add(part)
 
-        # Replace calculated columns with proper DataColumn objects.
-        # Mutating col.Type doesn't change the CLR object — a CalculatedTableColumn
-        # still serializes its own properties (columnOrigin, etc.).
-        calc_cols = []
+        # Fix sourceColumn on data columns
         for col in table.Columns:
-            if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
-                calc_cols.append(col)
-            elif col.Type == ColumnType.Data:
+            if col.Type == ColumnType.Data:
                 col.SourceColumn = col.Name
                 col.SourceProviderType = None
 
-        if calc_cols:
-            # Save relationships that reference these columns (Remove cascades)
-            calc_col_names = {(tname, c.Name) for c in calc_cols}
-            saved_rels = []
-            for rel in list(model.Relationships):
-                from_key = (rel.FromTable.Name, rel.FromColumn.Name)
-                to_key = (rel.ToTable.Name, rel.ToColumn.Name)
-                if from_key in calc_col_names or to_key in calc_col_names:
-                    saved_rels.append({
-                        "name": rel.Name,
-                        "fromTable": rel.FromTable.Name,
-                        "fromColumn": rel.FromColumn.Name,
-                        "toTable": rel.ToTable.Name,
-                        "toColumn": rel.ToColumn.Name,
-                        "isActive": rel.IsActive,
-                        "crossFilteringBehavior": rel.CrossFilteringBehavior,
-                        "fromCardinality": rel.FromCardinality,
-                        "toCardinality": rel.ToCardinality,
-                    })
+    # Replace calculated columns globally (two-pass to handle cross-table relationships).
+    # Pass 1: collect ALL calc columns and ALL affected relationships
+    from Microsoft.AnalysisServices.Tabular import SingleColumnRelationship
 
-            # Remove old columns (may cascade-delete relationships)
-            for old_col in calc_cols:
-                new_col = DataColumn()
-                new_col.Name = old_col.Name
-                new_col.DataType = old_col.DataType
-                new_col.SourceColumn = old_col.Name
-                new_col.IsHidden = old_col.IsHidden
-                if old_col.Description:
-                    new_col.Description = old_col.Description
-                if old_col.DisplayFolder:
-                    new_col.DisplayFolder = old_col.DisplayFolder
-                if old_col.FormatString:
-                    new_col.FormatString = old_col.FormatString
-                if old_col.DataCategory:
-                    new_col.DataCategory = old_col.DataCategory
+    all_calc_cols = []  # (table, old_col) pairs
+    for table in model.Tables:
+        for col in table.Columns:
+            if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
+                all_calc_cols.append((table, col))
 
-                for ann in old_col.Annotations:
-                    new_col.Annotations.Add(ann.Clone())
+    if all_calc_cols:
+        calc_col_keys = {(t.Name, c.Name) for t, c in all_calc_cols}
 
-                table.Columns.Remove(old_col.Name)
-                table.Columns.Add(new_col)
+        # Save all relationships touching calc columns
+        saved_rels = []
+        for rel in model.Relationships:
+            from_key = (rel.FromTable.Name, rel.FromColumn.Name)
+            to_key = (rel.ToTable.Name, rel.ToColumn.Name)
+            if from_key in calc_col_keys or to_key in calc_col_keys:
+                saved_rels.append({
+                    "name": rel.Name,
+                    "fromTable": rel.FromTable.Name,
+                    "fromColumn": rel.FromColumn.Name,
+                    "toTable": rel.ToTable.Name,
+                    "toColumn": rel.ToColumn.Name,
+                    "isActive": rel.IsActive,
+                    "crossFilteringBehavior": rel.CrossFilteringBehavior,
+                    "fromCardinality": rel.FromCardinality,
+                    "toCardinality": rel.ToCardinality,
+                })
 
-            # Re-create relationships that were cascade-deleted
-            from Microsoft.AnalysisServices.Tabular import (
-                SingleColumnRelationship,
-            )
-            for rinfo in saved_rels:
-                if rinfo["name"] not in [r.Name for r in model.Relationships]:
-                    try:
-                        rel = SingleColumnRelationship()
-                        rel.Name = rinfo["name"]
-                        rel.FromColumn = model.Tables[rinfo["fromTable"]].Columns[rinfo["fromColumn"]]
-                        rel.ToColumn = model.Tables[rinfo["toTable"]].Columns[rinfo["toColumn"]]
-                        rel.IsActive = rinfo["isActive"]
-                        rel.CrossFilteringBehavior = rinfo["crossFilteringBehavior"]
-                        rel.FromCardinality = rinfo["fromCardinality"]
-                        rel.ToCardinality = rinfo["toCardinality"]
-                        model.Relationships.Add(rel)
-                    except Exception as e:
-                        print(f"    ⚠ Could not restore relationship {rinfo['name']}: {e}", flush=True)
+        # Pass 2: replace all calc columns with DataColumns
+        for table, old_col in all_calc_cols:
+            new_col = DataColumn()
+            new_col.Name = old_col.Name
+            new_col.DataType = old_col.DataType
+            new_col.SourceColumn = old_col.Name
+            new_col.IsHidden = old_col.IsHidden
+            if old_col.Description:
+                new_col.Description = old_col.Description
+            if old_col.DisplayFolder:
+                new_col.DisplayFolder = old_col.DisplayFolder
+            if old_col.FormatString:
+                new_col.FormatString = old_col.FormatString
+            if old_col.DataCategory:
+                new_col.DataCategory = old_col.DataCategory
+            for ann in old_col.Annotations:
+                new_col.Annotations.Add(ann.Clone())
 
-            print(f"    {tname}: replaced {len(calc_cols)} calculated column(s) with DataColumn", flush=True)
-            if saved_rels:
-                print(f"    {tname}: restored {len(saved_rels)} relationship(s)", flush=True)
+            table.Columns.Remove(old_col.Name)
+            table.Columns.Add(new_col)
+
+        # Pass 3: restore cascade-deleted relationships
+        existing_rel_names = {r.Name for r in model.Relationships}
+        n_restored = 0
+        for rinfo in saved_rels:
+            if rinfo["name"] in existing_rel_names:
+                continue
+            try:
+                rel = SingleColumnRelationship()
+                rel.Name = rinfo["name"]
+                rel.FromColumn = model.Tables[rinfo["fromTable"]].Columns[rinfo["fromColumn"]]
+                rel.ToColumn = model.Tables[rinfo["toTable"]].Columns[rinfo["toColumn"]]
+                rel.IsActive = rinfo["isActive"]
+                rel.CrossFilteringBehavior = rinfo["crossFilteringBehavior"]
+                rel.FromCardinality = rinfo["fromCardinality"]
+                rel.ToCardinality = rinfo["toCardinality"]
+                model.Relationships.Add(rel)
+                n_restored += 1
+            except Exception as e:
+                print(f"    ⚠ Could not restore relationship {rinfo['name']}: {e}", flush=True)
+
+        print(f"    Replaced {len(all_calc_cols)} calculated column(s) across {len({t.Name for t, _ in all_calc_cols})} table(s)", flush=True)
+        if saved_rels:
+            print(f"    Restored {n_restored}/{len(saved_rels)} relationship(s)", flush=True)
 
     # Remove query groups
     if hasattr(model, "QueryGroups") and model.QueryGroups is not None:
