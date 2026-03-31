@@ -93,6 +93,20 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     return _modify_bim_via_tom(bim, lh_info, table_filter)
 
 
+def _strip_unknown_bim_properties(bim):
+    """Remove properties from the BIM that older TOM versions don't recognize."""
+    # Properties introduced in newer compatibility levels that may not be
+    # supported by the TOM assembly in the current Fabric runtime
+    _UNKNOWN_COL_PROPS = {"relatedColumnDetails"}
+
+    model = bim.get("model", bim)
+    for table in model.get("tables", []):
+        for col in table.get("columns", []):
+            for prop in _UNKNOWN_COL_PROPS:
+                col.pop(prop, None)
+    return bim
+
+
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     """Modify model.bim using .NET TOM (Tabular Object Model)."""
     # Bootstrap .NET runtime via sempy (handles Fabric CLR setup)
@@ -102,14 +116,13 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, DeserializeOptions, ColumnType,
+        JsonSerializer, ColumnType,
         EntityPartitionSource, NamedExpression,
     )
 
+    _strip_unknown_bim_properties(bim)
     bim_json = json.dumps(bim, indent=2)
-    options = DeserializeOptions()
-    options.SkipUnknownProperties = True
-    db = JsonSerializer.DeserializeDatabase(bim_json, options)
+    db = JsonSerializer.DeserializeDatabase(bim_json)
     model = db.Model
 
     # Build the OneLake expression
