@@ -95,11 +95,15 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     """Modify model.bim using .NET TOM (Tabular Object Model)."""
+    # Bootstrap .NET runtime via sempy (handles Fabric CLR setup)
+    import sempy.fabric as fabric
+    fabric.create_tom_server()
+
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, Database, ColumnType, EntityPartitionSource,
-        MPartitionSource, NamedExpression,
+        JsonSerializer, ColumnType, EntityPartitionSource,
+        NamedExpression,
     )
 
     bim_json = json.dumps(bim, indent=2)
