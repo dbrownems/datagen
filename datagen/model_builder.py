@@ -296,6 +296,7 @@ def _log_request(method, url, resp):
     print(f"    ← {resp.status_code} | Response headers: {dict(resp.headers)}", flush=True)
 
 
+def _deploy_bim(bim, name, workspace=None, overwrite=False):
     """Deploy a model.bim via the Fabric REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
