@@ -358,6 +358,11 @@ def deploy_semantic_model(
     except Exception as e:
         err_msg = str(e)[:300]
         print(f"    ✗ Refresh failed: {err_msg}", flush=True)
+        # Get detailed error from refresh history
+        try:
+            _print_refresh_errors(actual_name, workspace)
+        except Exception:
+            pass
 
     print(flush=True)
     if refresh_ok:
@@ -367,6 +372,67 @@ def deploy_semantic_model(
     print(f"  Tables:        {n_tables}")
     print(f"  Relationships: {n_rels}")
     print(f"  Measures:      {n_measures}", flush=True)
+
+
+def _print_refresh_errors(dataset, workspace=None):
+    """Fetch and display detailed refresh errors from the REST API."""
+    import sempy.fabric as fabric
+    from sempy_labs._helper_functions import resolve_workspace_name_and_id
+
+    (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
+    client = fabric.FabricRestClient()
+
+    # Find the semantic model ID
+    items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
+    model = next((i for i in items if i["displayName"] == dataset), None)
+    if not model:
+        return
+
+    # Get refresh history via XMLA-compatible endpoint
+    model_id = model["id"]
+    resp = client.get(f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
+    if resp.status_code != 200:
+        return
+
+    refreshes = resp.json().get("value", [])
+    if not refreshes:
+        return
+
+    # Show errors from the most recent refresh
+    latest = refreshes[0]
+    status = latest.get("status", "")
+    if status.lower() != "failed":
+        return
+
+    print(f"    Refresh details (status={status}):", flush=True)
+
+    # Check for top-level error
+    for key in ("serviceExceptionJson", "error", "messages"):
+        val = latest.get(key)
+        if val:
+            if isinstance(val, str):
+                print(f"      {val[:500]}", flush=True)
+            elif isinstance(val, list):
+                for msg in val[:5]:
+                    if isinstance(msg, dict):
+                        print(f"      {msg.get('message', msg)}", flush=True)
+                    else:
+                        print(f"      {msg}", flush=True)
+            elif isinstance(val, dict):
+                print(f"      {json.dumps(val, indent=2)[:500]}", flush=True)
+
+    # Check per-object errors
+    for obj in latest.get("objects", []):
+        obj_status = obj.get("status", "")
+        if obj_status.lower() in ("failed", "error"):
+            table = obj.get("table", "?")
+            partition = obj.get("partition", "?")
+            msgs = obj.get("messages", [])
+            for msg in msgs[:3]:
+                if isinstance(msg, dict):
+                    print(f"      {table}/{partition}: {msg.get('message', msg)}", flush=True)
+                else:
+                    print(f"      {table}/{partition}: {msg}", flush=True)
 
 
 def _deploy_bim(bim, name, workspace=None, overwrite=False):
