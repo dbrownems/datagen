@@ -54,7 +54,18 @@ def _fs_list_dirs(path):
     """Return a set of directory names under *path* via notebookutils.fs."""
     import notebookutils
     items = notebookutils.fs.ls(path)
-    return {item.name for item in items if item.isDir}
+    # FileInfo may use isDir or isDirectory — handle both
+    dirs = set()
+    for item in items:
+        is_dir = getattr(item, "isDir", None)
+        if is_dir is None:
+            is_dir = getattr(item, "isDirectory", None)
+        if is_dir is None:
+            # Infer from path (directories typically end with /)
+            is_dir = getattr(item, "path", "").endswith("/") or getattr(item, "size", 1) == 0
+        if is_dir:
+            dirs.add(item.name)
+    return dirs
 
 
 def _compute_weights(values_spec, pool_size):
@@ -481,11 +492,11 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     # Detect schema-enabled lakehouse (Tables/dbo/ exists)
     if out_path.rstrip("/") == "Tables":
         try:
-            top_dirs = _fs_list_dirs("/lakehouse/default/Tables")
+            top_dirs = _fs_list_dirs("Tables")
             if "dbo" in top_dirs:
                 out_path = "Tables/dbo/"
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠ Schema detection failed: {e}", flush=True)
 
     n = len(tables)
     total_rows = sum(
@@ -504,17 +515,16 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     existing_tables = set()
     if not overwrite:
         tables_dir = out_path.rstrip("/")
-        fs_path = f"/lakehouse/default/{tables_dir}"
 
         try:
-            existing_tables = _fs_list_dirs(fs_path)
-        except Exception:
-            pass
+            existing_tables = _fs_list_dirs(tables_dir)
+        except Exception as e:
+            print(f"  ⚠ Table listing failed ({tables_dir}): {e}", flush=True)
 
         if existing_tables:
             print(f"  Found {len(existing_tables)} existing tables", flush=True)
         else:
-            print(f"  ⚠ No existing tables found (checked {fs_path})", flush=True)
+            print(f"  ⚠ No existing tables found (checked {tables_dir})", flush=True)
 
     # Try to use tqdm for progress bar (available in Fabric)
     try:
