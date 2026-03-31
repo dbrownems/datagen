@@ -326,9 +326,6 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         ]
         n_rewritten += 1
 
-    # Remove query groups (they reference old M query organization)
-    model.pop("queryGroups", None)
-
     print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
     return bim
 
