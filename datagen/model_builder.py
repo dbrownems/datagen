@@ -200,45 +200,22 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     # Build filter set
     filter_set = set(table_filter) if table_filter is not None else None
 
-    # Remove tables not in filter (only keep measure-only tables without data)
-    if filter_set is not None:
-        tables_to_remove = []
-        for table in model.Tables:
-            if table.Name in filter_set:
-                continue
-            has_measures = table.Measures.Count > 0
-            if has_measures:
-                continue
-            tables_to_remove.append(table.Name)
-        if tables_to_remove:
-            print(f"    Removing {len(tables_to_remove)} table(s) not in generated set", flush=True)
-        for tname in tables_to_remove:
-            model.Tables.Remove(tname)
-
-        # Remove orphaned relationships (TOM doesn't always cascade)
-        remaining_tables = {t.Name for t in model.Tables}
-        orphaned_rels = [
-            rel.Name for rel in model.Relationships
-            if rel.FromTable.Name not in remaining_tables
-            or rel.ToTable.Name not in remaining_tables
-        ]
-        if orphaned_rels:
-            print(f"    Removing {len(orphaned_rels)} orphaned relationship(s)", flush=True)
-            for rname in orphaned_rels:
-                model.Relationships.Remove(rname)
-
     # Modify each table for Direct Lake
+    # Tables with Delta backing get entity partitions; others keep empty partitions
+    n_with_delta = 0
+    n_without = 0
     for table in model.Tables:
         tname = table.Name
         safe_name = _safe_folder_name(tname)
         has_delta = filter_set is None or tname in filter_set
 
+        table.Partitions.Clear()
+
         if not has_delta:
-            table.Partitions.Clear()
+            n_without += 1
             continue
 
-        # Replace partitions with Direct Lake entity partition
-        table.Partitions.Clear()
+        # Add Direct Lake entity partition
         part = Partition()
         part.Name = tname
         part.Mode = ModeType.DirectLake
@@ -248,6 +225,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         source.ExpressionSource = model.Expressions[expr_name]
         part.Source = source
         table.Partitions.Add(part)
+        n_with_delta += 1
 
         # Fix sourceColumn on data columns
         for col in table.Columns:
@@ -265,7 +243,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     n_tables = model.Tables.Count
     n_rels = model.Relationships.Count
     n_measures = sum(t.Measures.Count for t in model.Tables)
-    print(f"    TOM: {n_tables} tables, {n_rels} relationships, {n_measures} measures", flush=True)
+    print(f"    TOM: {n_with_delta} tables with Delta, {n_without} without, {n_rels} relationships, {n_measures} measures", flush=True)
 
     # Serialize back to JSON and post-process
     result_json = JsonSerializer.SerializeDatabase(db)
