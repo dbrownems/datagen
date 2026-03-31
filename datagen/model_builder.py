@@ -98,19 +98,21 @@ def _strip_unknown_bim_properties(bim):
 
     Converts calculated columns to data columns (Direct Lake doesn't
     support them — we generated the values in the Delta tables).
-    Uses an allowlist of valid data column properties to strip anything
-    TOM or Fabric won't recognize.
+    Strips any column properties not recognized by the Fabric runtime's
+    TOM version.
     """
-    # Properties valid on a data column in model.bim
-    _DATA_COL_PROPS = {
-        "name", "dataType", "sourceColumn", "description", "isHidden",
+    # Properties recognized by TOM on data columns
+    _KNOWN_COL_PROPS = {
+        "name", "type", "dataType", "sourceColumn", "description", "isHidden",
         "displayFolder", "formatString", "dataCategory", "sortByColumn",
         "summarizeBy", "annotations", "extendedProperties", "lineageTag",
         "sourceLineageTag", "isKey", "isNullable", "isUnique", "isDefaultLabel",
         "isDefaultImage", "alignment", "tableDetailPosition",
-        "isAvailableInMDX", "isNameInferred", "isDataTypeInferred",
-        "groupByColumns", "alternateOf", "encodingHint",
+        "isAvailableInMDX", "groupByColumns", "alternateOf", "encodingHint",
     }
+    # RowNumber columns have a minimal set
+    _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
+                     "isUnique", "isNullable", "lineageTag"}
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
 
     model = bim.get("model", bim)
@@ -118,22 +120,29 @@ def _strip_unknown_bim_properties(bim):
     for table in model.get("tables", []):
         for col in table.get("columns", []):
             col_type = col.get("type")
+
             if col_type in _CALC_TYPES:
-                # Rebuild as a clean data column — keep only valid properties
-                clean = {k: v for k, v in col.items() if k in _DATA_COL_PROPS}
+                # Convert to data column — keep only valid data column props
+                clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
+                clean.pop("type", None)
                 clean["sourceColumn"] = col["name"]
-                clean.pop("type", None)  # default is "data"
                 col.clear()
                 col.update(clean)
                 n_converted += 1
+
+            elif col_type == "rowNumber":
+                # Strip anything invalid on rowNumber columns
+                unknown = [k for k in col if k not in _ROWNUM_PROPS]
+                for k in unknown:
+                    col.pop(k)
+
             else:
-                # Regular data columns — clean up, ensure sourceColumn
-                col.pop("sourceProviderType", None)
-                col.pop("relatedColumnDetails", None)
-                # Only add sourceColumn for actual data columns (not rowNumber etc.)
-                if col_type is None or col_type == "data":
-                    if "sourceColumn" not in col and col.get("name"):
-                        col["sourceColumn"] = col["name"]
+                # Data column — strip unknown props, ensure sourceColumn
+                unknown = [k for k in col if k not in _KNOWN_COL_PROPS]
+                for k in unknown:
+                    col.pop(k)
+                if "sourceColumn" not in col and col.get("name"):
+                    col["sourceColumn"] = col["name"]
 
     if n_converted:
         print(f"    Converted {n_converted} calculated column(s) to data", flush=True)
