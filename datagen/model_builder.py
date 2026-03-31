@@ -94,15 +94,22 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 
 
 def _strip_unknown_bim_properties(bim):
-    """Remove/fix properties in the BIM JSON that Fabric's import API rejects.
+    """Clean BIM JSON for TOM deserialization and Fabric import.
 
-    Applied to both input (before TOM deserialization) and output (before deploy).
-    Also converts calculated columns to data columns since Direct Lake
-    doesn't support them — we generated the values in the Delta tables.
+    Converts calculated columns to data columns (Direct Lake doesn't
+    support them — we generated the values in the Delta tables).
+    Uses an allowlist of valid data column properties to strip anything
+    TOM or Fabric won't recognize.
     """
-    _STRIP_COL_PROPS = {
-        "relatedColumnDetails", "isNameInferred", "isDataTypeInferred",
-        "columnOrigin", "sourceProviderType",
+    # Properties valid on a data column in model.bim
+    _DATA_COL_PROPS = {
+        "name", "dataType", "sourceColumn", "description", "isHidden",
+        "displayFolder", "formatString", "dataCategory", "sortByColumn",
+        "summarizeBy", "annotations", "extendedProperties", "lineageTag",
+        "sourceLineageTag", "isKey", "isNullable", "isUnique", "isDefaultLabel",
+        "isDefaultImage", "alignment", "tableDetailPosition",
+        "isAvailableInMDX", "isNameInferred", "isDataTypeInferred",
+        "groupByColumns", "alternateOf", "encodingHint",
     }
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
 
@@ -110,19 +117,20 @@ def _strip_unknown_bim_properties(bim):
     n_converted = 0
     for table in model.get("tables", []):
         for col in table.get("columns", []):
-            for prop in _STRIP_COL_PROPS:
-                col.pop(prop, None)
-
-            # Convert calculated columns to data columns
             col_type = col.get("type")
             if col_type in _CALC_TYPES:
-                col.pop("type", None)
-                col.pop("expression", None)
-                col["sourceColumn"] = col["name"]
+                # Rebuild as a clean data column — keep only valid properties
+                clean = {k: v for k, v in col.items() if k in _DATA_COL_PROPS}
+                clean["sourceColumn"] = col["name"]
+                clean.pop("type", None)  # default is "data"
+                col.clear()
+                col.update(clean)
                 n_converted += 1
-            elif col_type is None or col_type == "data":
-                # Ensure sourceColumn is set for data columns
-                if "sourceColumn" not in col:
+            else:
+                # Regular data columns — just ensure sourceColumn is set
+                col.pop("sourceProviderType", None)
+                col.pop("relatedColumnDetails", None)
+                if "sourceColumn" not in col and col.get("name"):
                     col["sourceColumn"] = col["name"]
 
     if n_converted:
