@@ -36,6 +36,31 @@ def _safe_table_name(name):
     return name
 
 
+# ---------------------------------------------------------------------------
+# OneLake filesystem helpers (notebookutils.fs preferred, os.path fallback)
+# ---------------------------------------------------------------------------
+
+def _fs_exists(path):
+    """Check if a path exists in the lakehouse. Uses notebookutils.fs first."""
+    try:
+        import notebookutils
+        # notebookutils.fs.ls throws if path doesn't exist
+        notebookutils.fs.ls(path)
+        return True
+    except Exception:
+        pass
+    # Fallback to FUSE
+    import os
+    return os.path.exists(path)
+
+
+def _fs_list_dirs(path):
+    """Return a set of directory names under *path*. Uses notebookutils.fs."""
+    import notebookutils
+    items = notebookutils.fs.ls(path)
+    return {item.name for item in items if item.isDir}
+
+
 def _compute_weights(values_spec, pool_size):
     """Build a probability array for weighted value selection.
 
@@ -384,22 +409,10 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
 
     # Safety check: refuse to overwrite existing table when not allowed
     if not allow_overwrite:
-        # Use Spark filesystem (reliable in Fabric, bypasses FUSE)
-        _table_exists = False
-        try:
-            _hp = spark._jvm.org.apache.hadoop.fs.Path(table_path)
-            _hfs = _hp.getFileSystem(spark._jsc.hadoopConfiguration())
-            _table_exists = _hfs.exists(_hp)
-        except Exception:
-            # Fallback to os.path
-            import os
-            for check in [table_path, f"/lakehouse/default/{table_path}"]:
-                if os.path.isdir(check):
-                    _table_exists = True
-                    break
-        if _table_exists:
+        _abs_path = f"/lakehouse/default/{table_path}"
+        if _fs_exists(_abs_path):
             raise FileExistsError(
-                f"Table '{table_name}' already exists at '{table_path}' and overwrite_tables=False. "
+                f"Table '{table_name}' already exists at '{_abs_path}' and overwrite_tables=False. "
                 f"Set overwrite_tables=True to regenerate, or delete the table manually."
             )
 
@@ -472,21 +485,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     # Detect schema-enabled lakehouse (Tables/dbo/ exists)
     import os
     if out_path.rstrip("/") == "Tables":
-        _schema_detected = False
-        # Prefer Spark filesystem check (bypasses unreliable FUSE mount)
-        try:
-            _hadoop_path = spark._jvm.org.apache.hadoop.fs.Path("Tables/dbo")
-            _fs = _hadoop_path.getFileSystem(spark._jsc.hadoopConfiguration())
-            _schema_detected = _fs.exists(_hadoop_path)
-        except Exception:
-            pass
-        # Fallback to os.path if Spark check isn't available
-        if not _schema_detected:
-            _schema_detected = (
-                os.path.isdir("Tables/dbo")
-                or os.path.isdir("/lakehouse/default/Tables/dbo")
-            )
-        if _schema_detected:
+        if _fs_exists("/lakehouse/default/Tables/dbo"):
             out_path = "Tables/dbo/"
 
     n = len(tables)
@@ -506,34 +505,17 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     existing_tables = set()
     if not overwrite:
         tables_dir = out_path.rstrip("/")
+        fs_path = f"/lakehouse/default/{tables_dir}"
 
-        # 1. Preferred: Spark Hadoop filesystem (reliable in Fabric)
+        # Primary: notebookutils.fs.ls (talks directly to OneLake)
         try:
-            _hadoop_path = spark._jvm.org.apache.hadoop.fs.Path(tables_dir)
-            _fs = _hadoop_path.getFileSystem(spark._jsc.hadoopConfiguration())
-            if _fs.exists(_hadoop_path):
-                _statuses = _fs.listStatus(_hadoop_path)
-                existing_tables = {
-                    s.getPath().getName()
-                    for s in _statuses
-                    if s.isDirectory()
-                }
+            existing_tables = _fs_list_dirs(fs_path)
         except Exception:
             pass
 
-        # 2. Fallback: notebookutils.fs.ls
+        # Fallback: os.listdir (FUSE mount — less reliable)
         if not existing_tables:
-            try:
-                import notebookutils
-                fs_path = f"/lakehouse/default/{tables_dir}"
-                items = notebookutils.fs.ls(fs_path)
-                existing_tables = {item.name for item in items if item.isDir}
-            except Exception:
-                pass
-
-        # 3. Last resort: os.listdir (FUSE mount — least reliable)
-        if not existing_tables:
-            for check_dir in [tables_dir, f"/lakehouse/default/{tables_dir}"]:
+            for check_dir in [tables_dir, fs_path]:
                 if os.path.isdir(check_dir):
                     existing_tables = {
                         name for name in os.listdir(check_dir)
@@ -545,7 +527,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         if existing_tables:
             print(f"  Found {len(existing_tables)} existing tables", flush=True)
         else:
-            print(f"  ⚠ No existing tables found (checked {tables_dir})", flush=True)
+            print(f"  ⚠ No existing tables found (checked {fs_path})", flush=True)
 
     # Try to use tqdm for progress bar (available in Fabric)
     try:
