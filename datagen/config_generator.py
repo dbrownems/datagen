@@ -72,6 +72,7 @@ def _is_boolean_like(col_name, cardinality):
     return False
 
 
+def _derive_prefix(col_name):
     """Derive a short string prefix from a column name.
 
     Examples: ProductKey → PROD, CustomerID → CUST, SKU → SKU
