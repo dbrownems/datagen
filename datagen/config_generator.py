@@ -340,7 +340,8 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None, table_n
 
         if key_style == "prefixed":
             prefix = _derive_prefix(name)
-            width = len(str(cardinality))
+            # Use a consistent width (5 digits) so PK and FK values match
+            width = 5
             avg_length = len(prefix) + 1 + width  # "PROD-00001"
             dist = DistributionConfig(avg_length=avg_length, prefix=prefix)
             return ColumnConfig(
