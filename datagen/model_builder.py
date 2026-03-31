@@ -231,6 +231,27 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     return db, expr_name
 
 
+def _strip_tmdl_unknown_properties(content):
+    """Remove lines with properties Fabric's import API doesn't accept.
+
+    TMDL is indented text — unknown properties appear as indented key: value lines.
+    We strip entire lines that start with a known-bad property name.
+    """
+    _UNKNOWN_PROPS = {
+        "columnOrigin", "relatedColumnDetails", "isNameInferred",
+        "isDataTypeInferred",
+    }
+    lines = content.split("\n")
+    filtered = []
+    for line in lines:
+        stripped = line.lstrip()
+        prop_name = stripped.split(":")[0].split(" ")[0] if stripped else ""
+        if prop_name in _UNKNOWN_PROPS:
+            continue
+        filtered.append(line)
+    return "\n".join(filtered)
+
+
 def _serialize_to_tmdl_parts(db):
     """Serialize a TOM Database to TMDL and return Items API definition parts."""
     import tempfile, os
@@ -256,11 +277,13 @@ def _serialize_to_tmdl_parts(db):
             for fname in files:
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, tmdl_dir).replace("\\", "/")
-                with open(fpath, "rb") as f:
+                with open(fpath, "r", encoding="utf-8") as f:
                     content = f.read()
+                # Strip properties Fabric doesn't accept
+                content = _strip_tmdl_unknown_properties(content)
                 parts.append({
                     "path": f"definition/{rel_path}",
-                    "payload": base64.b64encode(content).decode("utf-8"),
+                    "payload": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
                     "payloadType": "InlineBase64",
                 })
 

@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 
 def generate(
