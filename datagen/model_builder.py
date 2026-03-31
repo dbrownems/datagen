@@ -303,24 +303,6 @@ def deploy_semantic_model(
     print(f"  Measures:      {n_measures}", flush=True)
 
 
-def _log_headers(headers):
-    """Format headers for logging, redacting authorization tokens."""
-    safe = {}
-    for k, v in headers.items():
-        if k.lower() in ("authorization", "x-ms-authorization"):
-            safe[k] = "Bearer ***"
-        else:
-            safe[k] = v
-    return safe
-
-
-def _log_request(method, url, resp):
-    """Log API request URI and response details."""
-    print(f"    {method} {url}", flush=True)
-    print(f"    → Request headers: {_log_headers(dict(resp.request.headers))}", flush=True)
-    print(f"    ← {resp.status_code} | Response headers: {dict(resp.headers)}", flush=True)
-
-
 def _deploy_bim(bim, name, workspace=None, overwrite=False):
     """Deploy a model.bim via the Fabric REST API."""
     import sempy.fabric as fabric
@@ -328,17 +310,13 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     import time
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
-    print(f"    Workspace: {ws_name} ({ws_id})", flush=True)
 
     # Build model.bim payload
     bim_json = json.dumps(bim, indent=2)
     bim_b64 = base64.b64encode(bim_json.encode("utf-8")).decode("utf-8")
 
     # Build definition.pbism
-    pbism = {
-        "version": "4.0",
-        "settings": {},
-    }
+    pbism = {"version": "4.0", "settings": {}}
     pbism_b64 = base64.b64encode(json.dumps(pbism).encode("utf-8")).decode("utf-8")
 
     definition = {
@@ -353,23 +331,17 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
     existing = next((i for i in items if i["displayName"] == name), None)
 
-    if existing:
-        print(f"    Existing model found: id={existing['id']}", flush=True)
-    else:
-        print(f"    No existing model '{name}' — will create", flush=True)
-
     if existing and overwrite:
         model_id = existing["id"]
-        url = f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition"
-        print(f"    Updating definition (overwrite=True) ...", flush=True)
-        resp = client.post(url, json={"definition": definition})
-        _log_request("POST", url, resp)
+        print(f"    Updating existing model ({model_id}) ...", flush=True)
+        resp = client.post(
+            f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition",
+            json={"definition": definition},
+        )
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
-
         if resp.status_code == 202:
             _poll_async(client, resp)
-
         return existing["displayName"]
 
     elif existing and not overwrite:
@@ -380,18 +352,14 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
 
     else:
         # Create new
-        body = {
+        print(f"    Creating new semantic model ...", flush=True)
+        resp = client.post(f"/v1/workspaces/{ws_id}/items", json={
             "displayName": name,
             "type": "SemanticModel",
             "definition": definition,
-        }
-        url = f"/v1/workspaces/{ws_id}/items"
-        print(f"    Creating new semantic model ...", flush=True)
-        resp = client.post(url, json=body)
-        _log_request("POST", url, resp)
+        })
         if resp.status_code not in (200, 201, 202):
             raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:500]}")
-
         if resp.status_code == 202:
             _poll_async(client, resp)
 
@@ -399,18 +367,12 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         time.sleep(3)
         items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
         created = next((i for i in items if i["displayName"] == name), None)
+        if not created:
+            bim_name = bim.get("name", "")
+            created = next((i for i in items if i["displayName"] == bim_name), None)
         if created:
-            print(f"    ✓ Model created: id={created['id']}", flush=True)
             return created["displayName"]
 
-        # Fallback: check if Fabric used the bim name instead
-        bim_name = bim.get("name", "")
-        created = next((i for i in items if i["displayName"] == bim_name), None)
-        if created:
-            print(f"    ✓ Model created (as '{bim_name}'): id={created['id']}", flush=True)
-            return created["displayName"]
-
-        # Model not found — deployment failed silently
         all_names = [i["displayName"] for i in items]
         raise RuntimeError(
             f"Model '{name}' was not found after creation. "
@@ -424,20 +386,13 @@ def _poll_async(client, resp):
     location = resp.headers.get("Location", "")
     retry_after = int(resp.headers.get("Retry-After", "5"))
     if not location:
-        print(f"    No Location header — waiting 10s", flush=True)
         time.sleep(10)
         return
 
-    print(f"    Async operation — polling {location}", flush=True)
     for attempt in range(60):
         time.sleep(retry_after)
         poll = client.get(location)
 
-        if attempt == 0:
-            # Log first poll request/response in detail
-            _log_request("GET", location, poll)
-
-        # Parse response body
         body = {}
         try:
             body = poll.json()
@@ -445,24 +400,18 @@ def _poll_async(client, resp):
             pass
 
         status = body.get("status", "")
-        pct = body.get("percentComplete", "")
         error = body.get("error", {})
 
         if poll.status_code == 200:
             if status.lower() == "failed" or error:
-                print(f"    Poll #{attempt+1}: FAILED — response headers: {dict(poll.headers)}", flush=True)
                 err_msg = error.get("message", "") or body.get("failureReason", "") or str(body)[:500]
                 raise RuntimeError(f"Async operation failed: {err_msg}")
-            print(f"    Poll #{attempt+1}: completed (status={status or 'ok'})", flush=True)
             return
 
         if poll.status_code == 202:
             retry_after = int(poll.headers.get("Retry-After", "5"))
-            detail = f"{pct}%" if pct != "" else status or "in progress"
-            print(f"    Poll #{attempt+1}: {detail}", flush=True)
             continue
 
-        # Unexpected status
         err_detail = body.get("error", {}).get("message", poll.text[:300])
         raise RuntimeError(f"Async poll returned {poll.status_code}: {err_detail}")
 
