@@ -414,21 +414,13 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(table_name)}"
     fmt = output_format.lower()
 
-    # Safety check: refuse to overwrite existing table when not allowed
-    if not allow_overwrite:
-        _abs_path = f"/lakehouse/default/{table_path}"
-        if _fs_exists(_abs_path):
-            raise FileExistsError(
-                f"Table '{table_name}' already exists at '{_abs_path}' and overwrite_tables=False. "
-                f"Set overwrite_tables=True to regenerate, or delete the table manually."
-            )
-
     job_desc = f"datagen: {table_name} ({row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{table_name}", job_desc)
     spark.sparkContext.setJobDescription(job_desc)
     spark.sparkContext.setLocalProperty("callSite.short", job_desc)
     spark.sparkContext.setLocalProperty("callSite.long", job_desc)
-    result_df.write.format(fmt).mode("overwrite") \
+    write_mode = "overwrite" if allow_overwrite else "errorIfExists"
+    result_df.write.format(fmt).mode(write_mode) \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \
