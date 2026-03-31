@@ -94,27 +94,51 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 
 
 def _strip_unknown_bim_properties(bim):
-    """Remove properties from the BIM JSON that Fabric may not accept.
+    """Remove/fix properties in the BIM JSON that Fabric's import API rejects.
 
-    Strips properties that are either too new for the runtime's TOM version
-    or that the Fabric import API rejects.
+    Applied to both input (before TOM deserialization) and output (before deploy).
+    Also converts calculated columns to data columns since Direct Lake
+    doesn't support them — we generated the values in the Delta tables.
     """
-    _UNKNOWN_COL_PROPS = {
+    _STRIP_COL_PROPS = {
         "relatedColumnDetails", "isNameInferred", "isDataTypeInferred",
+        "columnOrigin", "sourceProviderType",
     }
+    _CALC_TYPES = {"calculated", "calculatedTableColumn"}
 
     model = bim.get("model", bim)
+    n_converted = 0
     for table in model.get("tables", []):
         for col in table.get("columns", []):
-            for prop in _UNKNOWN_COL_PROPS:
+            for prop in _STRIP_COL_PROPS:
                 col.pop(prop, None)
+
+            # Convert calculated columns to data columns
+            col_type = col.get("type")
+            if col_type in _CALC_TYPES:
+                col.pop("type", None)
+                col.pop("expression", None)
+                col["sourceColumn"] = col["name"]
+                n_converted += 1
+            elif col_type is None or col_type == "data":
+                # Ensure sourceColumn is set for data columns
+                if "sourceColumn" not in col:
+                    col["sourceColumn"] = col["name"]
+
+    if n_converted:
+        print(f"    Converted {n_converted} calculated column(s) to data", flush=True)
+
     return bim
 
 
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     """Modify model.bim using .NET TOM (Tabular Object Model).
 
-    Returns the TOM Database object (caller serializes to TMDL for deployment).
+    Uses TOM for structural changes (partitions, expressions, table filtering)
+    then serializes back to JSON. Calculated column conversion is handled by
+    JSON post-processing in _strip_unknown_bim_properties.
+
+    Returns (bim_dict, expr_name).
     """
     # Bootstrap .NET runtime via sempy (handles Fabric CLR setup)
     import sempy.fabric as fabric
@@ -217,148 +241,12 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     n_measures = sum(t.Measures.Count for t in model.Tables)
     print(f"    TOM: {n_tables} tables, {n_rels} relationships, {n_measures} measures", flush=True)
 
-    return db, expr_name
+    # Serialize back to JSON and post-process
+    result_json = JsonSerializer.SerializeDatabase(db)
+    result_bim = json.loads(result_json)
+    _strip_unknown_bim_properties(result_bim)
 
-
-def _convert_calc_columns_in_tmdl(content, filename=""):
-    """Convert calculated columns to data columns in TMDL text.
-
-    Replaces 'calculatedColumn' and 'calculatedTableColumn' keywords with
-    'column', removes calc-only properties, and adds sourceColumn.
-    """
-    import re
-
-    lines = content.split("\n")
-    result = []
-    i = 0
-    n_converted = 0
-
-    while i < len(lines):
-        line = lines[i]
-
-        # Detect calculatedColumn or calculatedTableColumn (tabs or spaces)
-        match = re.match(r'^(\s+)(calculatedColumn|calculatedTableColumn)\s+(.*)', line)
-        if match:
-            indent = match.group(1)
-            col_ref = match.group(3).rstrip()
-            n_converted += 1
-
-            # Handle inline expression: calculatedColumn 'X' = <expr>
-            if " = " in col_ref:
-                col_ref = col_ref.split(" = ")[0].strip()
-
-            col_name = col_ref.strip("'")
-
-            result.append(f"{indent}column {col_ref}")
-            i += 1
-
-            # Determine body indent (one level deeper than the keyword)
-            body_indent_len = len(indent) + 1  # at least one char deeper
-            added_source = False
-            in_expression_block = False
-
-            while i < len(lines):
-                bline = lines[i]
-                bstripped = bline.lstrip()
-                bindent_len = len(bline) - len(bstripped)
-
-                # Handle multi-line expression blocks (``` delimited)
-                if in_expression_block:
-                    if bstripped.startswith("```"):
-                        in_expression_block = False
-                    i += 1
-                    continue
-
-                # Empty lines within the block — keep them
-                if not bstripped:
-                    result.append(bline)
-                    i += 1
-                    continue
-
-                # Check if we've exited the column block (same or less indent)
-                if bindent_len <= len(indent):
-                    break
-
-                # Skip calc-only properties
-                prop = bstripped.split(":")[0].split("=")[0].split(" ")[0].strip()
-                if prop in ("expression", "columnOrigin", "isNameInferred",
-                            "isDataTypeInferred"):
-                    if "```" in bstripped:
-                        in_expression_block = True
-                    i += 1
-                    continue
-
-                # Insert sourceColumn after dataType if not yet added
-                if not added_source and prop == "dataType":
-                    result.append(bline)
-                    i += 1
-                    body_indent = bline[:bindent_len]
-                    result.append(f"{body_indent}sourceColumn: {col_name}")
-                    added_source = True
-                    continue
-
-                result.append(bline)
-                i += 1
-
-            if not added_source:
-                body_indent = indent + "\t"
-                result.append(f"{body_indent}sourceColumn: {col_name}")
-
-            continue
-
-        result.append(line)
-        i += 1
-
-    if n_converted and filename:
-        print(f"      {filename}: {n_converted} calculated column(s) → data", flush=True)
-
-    return "\n".join(result), n_converted
-
-
-def _serialize_to_tmdl_parts(db):
-    """Serialize a TOM Database to TMDL and return Items API definition parts."""
-    import tempfile, os
-
-    import clr
-    clr.AddReference("Microsoft.AnalysisServices.Tabular")
-    from Microsoft.AnalysisServices.Tabular import TmdlSerializer
-
-    with tempfile.TemporaryDirectory() as tmdl_dir:
-        TmdlSerializer.SerializeDatabaseToFolder(db, tmdl_dir)
-
-        parts = []
-        # Add definition.pbism
-        pbism = json.dumps({"version": "4.0", "settings": {}})
-        parts.append({
-            "path": "definition.pbism",
-            "payload": base64.b64encode(pbism.encode("utf-8")).decode("utf-8"),
-            "payloadType": "InlineBase64",
-        })
-
-        # Walk the TMDL folder, post-process table files, add each as a part
-        total_converted = 0
-        for root, _dirs, files in os.walk(tmdl_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                rel_path = os.path.relpath(fpath, tmdl_dir).replace("\\", "/")
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read()
-
-                # Convert calculated columns to data columns in table TMDL files
-                if rel_path.startswith("tables/") and fname.endswith(".tmdl"):
-                    content, n = _convert_calc_columns_in_tmdl(content, fname)
-                    total_converted += n
-
-                parts.append({
-                    "path": f"definition/{rel_path}",
-                    "payload": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
-                    "payloadType": "InlineBase64",
-                })
-
-        if total_converted:
-            print(f"    TMDL: converted {total_converted} calculated column(s) to data", flush=True)
-        print(f"    TMDL: {len(parts)} definition parts", flush=True)
-        return {"parts": parts}
+    return result_bim, expr_name
 
 
 def deploy_semantic_model(
@@ -413,26 +301,24 @@ def deploy_semantic_model(
     print("  Resolving lakehouse connection ...", flush=True)
     lh_info = _get_lakehouse_info(lakehouse, lakehouse_workspace or workspace)
 
-    # Modify the BIM for Direct Lake (returns TOM Database object)
+    # Modify the BIM for Direct Lake (TOM for structure, JSON for columns)
     print("  Converting model to Direct Lake on OneLake ...", flush=True)
-    db, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+    bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
 
     # Update model name
-    db.Name = name
-    db.Model.Name = name
+    bim["name"] = name
+    if "model" in bim and isinstance(bim["model"], dict):
+        bim["model"]["name"] = name
+    model = bim.get("model", bim)
 
-    n_tables = db.Model.Tables.Count
-    n_rels = db.Model.Relationships.Count
-    n_measures = sum(t.Measures.Count for t in db.Model.Tables)
-
-    # Serialize to TMDL parts for the Items API
-    print("  Serializing to TMDL ...", flush=True)
-    definition = _serialize_to_tmdl_parts(db)
+    n_tables = len(model.get("tables", []))
+    n_rels = len(model.get("relationships", []))
+    n_measures = sum(len(t.get("measures", [])) for t in model.get("tables", []))
 
     # Deploy via Fabric REST API
     print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
 
-    actual_name = _deploy_tmdl(definition, name, workspace, overwrite)
+    actual_name = _deploy_bim(bim, name, workspace, overwrite)
 
     # Refresh using the actual display name from the API
     print("  Refreshing model ...", flush=True)
@@ -455,13 +341,25 @@ def deploy_semantic_model(
     print(f"  Measures:      {n_measures}", flush=True)
 
 
-def _deploy_tmdl(definition, name, workspace=None, overwrite=False):
-    """Deploy a semantic model definition (TMDL parts) via the Fabric REST API."""
+def _deploy_bim(bim, name, workspace=None, overwrite=False):
+    """Deploy a model.bim via the Fabric REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
     import time
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
+
+    # Build model.bim payload
+    bim_json = json.dumps(bim, indent=2)
+    bim_b64 = base64.b64encode(bim_json.encode("utf-8")).decode("utf-8")
+    pbism_b64 = base64.b64encode(json.dumps({"version": "4.0", "settings": {}}).encode("utf-8")).decode("utf-8")
+
+    definition = {
+        "parts": [
+            {"path": "model.bim", "payload": bim_b64, "payloadType": "InlineBase64"},
+            {"path": "definition.pbism", "payload": pbism_b64, "payloadType": "InlineBase64"},
+        ]
+    }
 
     # Check if model exists
     client = fabric.FabricRestClient()
