@@ -340,7 +340,8 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None, table_n
 
         if key_style == "prefixed":
             prefix = _derive_prefix(name)
-            width = len(str(cardinality))
+            # Use a consistent width (5 digits) so PK and FK values match
+            width = 5
             avg_length = len(prefix) + 1 + width  # "PROD-00001"
             dist = DistributionConfig(avg_length=avg_length, prefix=prefix)
             return ColumnConfig(
@@ -460,11 +461,10 @@ def generate_config(
 
         columns = []
         for col_meta in table_meta.get("columns", []):
-            # Skip hidden columns unless requested
             if col_meta.get("is_hidden", False) and not include_hidden:
                 continue
-            # Always include calculated columns — they'll be generated as
-            # regular data columns (Direct Lake doesn't support calculated columns)
+            # Always include calculated columns — they need to exist in
+            # Delta tables for Direct Lake (calc columns aren't supported)
 
             col_config = _infer_column_config(col_meta, row_count, relationship_columns, table_name)
             columns.append(col_config)

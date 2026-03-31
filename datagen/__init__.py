@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.6.19"
+__version__ = "0.8.2"
 
 
 def generate(
@@ -84,13 +84,34 @@ def generate(
         include_hidden=include_hidden,
         include_calculated=include_calculated,
     )
+
+    # Cross-reference with BIM to add columns missing from VPAX stats
+    # (Direct Lake needs all BIM columns in Delta; Import mode doesn't)
+    if deploy_model and mode == "direct_lake":
+        from .model_builder import _extract_bim, _add_missing_bim_columns
+        try:
+            bim = _extract_bim(vpax_path)
+            n_added = _add_missing_bim_columns(config, bim)
+            if n_added:
+                print(f"  Added {n_added} column(s) from Model.bim not in VPAX stats", flush=True)
+        except Exception:
+            pass
+
+    # For import mode, determine which tables to skip (measure-only, enter-data)
+    tables_to_skip = set()
+    if mode == "import":
+        from .model_builder import get_tables_to_skip
+        tables_to_skip = get_tables_to_skip(vpax_path, mode)
+        if tables_to_skip:
+            print(f"  Skipping {len(tables_to_skip)} table(s) (measure-only / enter-data)", flush=True)
+
     print(f"  Config ready ({_time.time() - _t1:.1f}s)", flush=True)
 
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     succeeded_tables, actual_output_path = generate_all_tables(
         spark, config, output_path=output_path,
         output_format=output_format, vpax_model=vpax_model,
-        overwrite=overwrite_tables)
+        overwrite=overwrite_tables, skip_tables=tables_to_skip)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:

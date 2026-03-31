@@ -444,7 +444,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     }
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True):
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -457,6 +457,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             derived column values instead of random data.
         overwrite: If True, regenerate all tables. If False, skip tables
             that already exist as Delta/parquet and only generate missing ones.
+        skip_tables: Set of table names to skip entirely (e.g. measure-only,
+            enter-data tables in import mode).
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -538,16 +540,20 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         if progress:
             progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
 
+        # Skip tables excluded by mode (measure-only, enter-data in import mode)
+        if skip_tables and tname in skip_tables:
+            skipped_tables.append(tname)
+            if progress:
+                progress.update(1)
+            continue
+
         # Skip existing tables when not overwriting
         safe_name = _safe_table_name(tname)
         if not overwrite and (safe_name in existing_tables or tname in existing_tables):
             succeeded_tables.append(tname)
             skipped_tables.append(tname)
             if progress:
-                progress.write(f"  ⊘ {tname} — exists, skipped")
                 progress.update(1)
-            else:
-                print(f"  [{i}/{n}] ⊘ {tname} — exists, skipped", flush=True)
             continue
 
         if progress:
