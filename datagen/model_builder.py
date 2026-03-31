@@ -133,6 +133,9 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     db = JsonSerializer.DeserializeDatabase(bim_json)
     model = db.Model
 
+    # Set compatibility level first — DirectLake partitions require >= 1604
+    db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
+
     # Build the OneLake expression
     onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
     expr_name = f"DirectLake - {lh_info['lh_name']}"
@@ -208,9 +211,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
 
     # Set Direct Lake compatible options
     model.DefaultPowerBIDataSourceVersion = PowerBIDataSourceVersion.PowerBI_V3
-
-    # Update compatibility level
-    db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
 
     n_tables = model.Tables.Count
     n_rels = model.Relationships.Count
