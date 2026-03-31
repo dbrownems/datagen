@@ -102,12 +102,14 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, ColumnType, EntityPartitionSource,
-        NamedExpression,
+        JsonSerializer, DeserializeOptions, ColumnType,
+        EntityPartitionSource, NamedExpression,
     )
 
     bim_json = json.dumps(bim, indent=2)
-    db = JsonSerializer.DeserializeDatabase(bim_json)
+    options = DeserializeOptions()
+    options.SkipUnknownProperties = True
+    db = JsonSerializer.DeserializeDatabase(bim_json, options)
     model = db.Model
 
     # Build the OneLake expression
