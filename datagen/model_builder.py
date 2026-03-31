@@ -319,6 +319,17 @@ def deploy_semantic_model(
     n_rels = len(model.get("relationships", []))
     n_measures = sum(len(t.get("measures", [])) for t in model.get("tables", []))
 
+    # Save BIM for troubleshooting
+    bim_path = "/lakehouse/default/Files/datagen/model.bim"
+    try:
+        import os
+        os.makedirs(os.path.dirname(bim_path), exist_ok=True)
+        with open(bim_path, "w", encoding="utf-8") as f:
+            json.dump(bim, f, indent=2)
+        print(f"  Saved model.bim to Files/datagen/model.bim", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Could not save model.bim: {e}", flush=True)
+
     # Deploy via Fabric REST API
     print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
 
