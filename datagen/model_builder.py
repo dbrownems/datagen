@@ -206,7 +206,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         for table in model.Tables:
             if table.Name in filter_set:
                 continue
-            # Keep tables that exist only for measures (no Delta table needed)
             has_measures = table.Measures.Count > 0
             if has_measures:
                 continue
@@ -215,6 +214,18 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
             print(f"    Removing {len(tables_to_remove)} table(s) not in generated set", flush=True)
         for tname in tables_to_remove:
             model.Tables.Remove(tname)
+
+        # Remove orphaned relationships (TOM doesn't always cascade)
+        remaining_tables = {t.Name for t in model.Tables}
+        orphaned_rels = [
+            rel.Name for rel in model.Relationships
+            if rel.FromTable.Name not in remaining_tables
+            or rel.ToTable.Name not in remaining_tables
+        ]
+        if orphaned_rels:
+            print(f"    Removing {len(orphaned_rels)} orphaned relationship(s)", flush=True)
+            for rname in orphaned_rels:
+                model.Relationships.Remove(rname)
 
     # Modify each table for Direct Lake
     for table in model.Tables:
