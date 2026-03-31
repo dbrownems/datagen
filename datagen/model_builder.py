@@ -84,17 +84,332 @@ def _get_lakehouse_info(lakehouse=None, workspace=None):
     }
 
 
+def _add_missing_bim_columns(config, bim):
+    """Add columns from Model.bim that are missing from the generation config."""
+    from .config import ColumnConfig, DistributionConfig
+
+    _SKIP_TYPES = {"rowNumber"}
+    _BIM_TO_CONFIG_TYPE = {
+        "string": "string", "int64": "int64", "double": "double",
+        "boolean": "boolean", "dateTime": "datetime", "decimal": "double",
+    }
+
+    bim_model = bim.get("model", bim)
+
+    tables_list = config.tables if hasattr(config, "tables") else config.get("tables", [])
+    config_cols = {}
+    for tc in tables_list:
+        tname = tc.name if hasattr(tc, "name") else tc["name"]
+        cols = tc.columns if hasattr(tc, "columns") else tc.get("columns", [])
+        config_cols[tname] = {
+            (c.name if hasattr(c, "name") else c["name"]) for c in cols
+        }
+
+    n_added = 0
+    for bim_table in bim_model.get("tables", []):
+        tname = bim_table["name"]
+        if tname not in config_cols:
+            continue
+
+        existing = config_cols[tname]
+        config_table = next(
+            (tc for tc in tables_list
+             if (tc.name if hasattr(tc, "name") else tc["name"]) == tname),
+            None,
+        )
+        if config_table is None:
+            continue
+
+        for bim_col in bim_table.get("columns", []):
+            if bim_col.get("type") in _SKIP_TYPES:
+                continue
+            col_name = bim_col["name"]
+            if col_name in existing:
+                continue
+
+            data_type = _BIM_TO_CONFIG_TYPE.get(
+                bim_col.get("dataType", "string"), "string"
+            )
+            row_count = config_table.row_count if hasattr(config_table, "row_count") else config_table.get("row_count", 100)
+            new_col = ColumnConfig(
+                name=col_name,
+                data_type=data_type,
+                cardinality=min(10, row_count),
+                distribution=DistributionConfig(
+                    avg_length=12 if data_type == "string" else None,
+                    style="docker" if data_type == "string" else None,
+                ),
+            )
+            if hasattr(config_table, "columns"):
+                config_table.columns.append(new_col)
+            else:
+                config_table["columns"].append(new_col)
+            existing.add(col_name)
+            n_added += 1
+
+    return n_added
+
+
+def _is_enter_data_table(bim_table):
+    """Check if a BIM table is an 'enter data' table (pasted/inline data)."""
+    for part in bim_table.get("partitions", []):
+        source = part.get("source", {})
+        expr = source.get("expression", "")
+        if isinstance(expr, list):
+            expr = "\n".join(expr)
+        if "Table.FromRows" in expr and "Json.Document" in expr:
+            return True
+    return False
+
+
+def _is_measure_only_table(bim_table):
+    """Check if a BIM table has measures but no data columns."""
+    has_measures = bool(bim_table.get("measures"))
+    has_data_cols = any(
+        c.get("type", "data") not in ("calculated", "calculatedTableColumn", "rowNumber")
+        for c in bim_table.get("columns", [])
+    )
+    return has_measures and not has_data_cols
+
+
+def get_tables_to_skip(vpax_path, mode="direct_lake"):
+    """Return set of table names that should NOT get Delta tables generated.
+
+    For import mode: skip measure-only tables and enter-data tables.
+    For direct_lake mode: returns empty set (generate everything).
+    """
+    if mode == "direct_lake":
+        return set()
+
+    bim = _extract_bim(vpax_path)
+    model = bim.get("model", bim)
+    skip = set()
+    for table in model.get("tables", []):
+        tname = table["name"]
+        if _is_enter_data_table(table):
+            skip.add(tname)
+        elif _is_measure_only_table(table):
+            skip.add(tname)
+    return skip
+
+
+    """Add columns from Model.bim that are missing from the generation config.
+
+    The VPAX DaxModel.json stats may not include all columns (e.g. some
+    calculated columns). The BIM is authoritative — ensure every column
+    in the BIM has a corresponding column in the generation config so it
+    gets generated in the Delta table.
+    """
+    from .config import ColumnConfig, DistributionConfig
+
+    _CALC_TYPES = {"calculated", "calculatedTableColumn"}
+    _SKIP_TYPES = {"rowNumber"}
+    _BIM_TO_CONFIG_TYPE = {
+        "string": "string", "int64": "int64", "double": "double",
+        "boolean": "boolean", "dateTime": "datetime", "decimal": "double",
+    }
+
+    bim_model = bim.get("model", bim)
+
+    # Build lookup: table_name → set of column names in config
+    config_cols = {}
+    tables_list = config.tables if hasattr(config, "tables") else config.get("tables", [])
+    for tc in tables_list:
+        tname = tc.name if hasattr(tc, "name") else tc["name"]
+        cols = tc.columns if hasattr(tc, "columns") else tc.get("columns", [])
+        config_cols[tname] = {
+            (c.name if hasattr(c, "name") else c["name"])
+            for c in cols
+        }
+
+    n_added = 0
+    for bim_table in bim_model.get("tables", []):
+        tname = bim_table["name"]
+        if tname not in config_cols:
+            continue
+
+        existing = config_cols[tname]
+        # Find the config table object to append to
+        config_table = None
+        for tc in tables_list:
+            if (tc.name if hasattr(tc, "name") else tc["name"]) == tname:
+                config_table = tc
+                break
+        if config_table is None:
+            continue
+
+        for bim_col in bim_table.get("columns", []):
+            col_type = bim_col.get("type")
+            if col_type in _SKIP_TYPES:
+                continue
+            col_name = bim_col["name"]
+            if col_name in existing:
+                continue
+
+            # This column is in the BIM but not in the config — add it
+            data_type = _BIM_TO_CONFIG_TYPE.get(
+                bim_col.get("dataType", "string"), "string"
+            )
+            new_col = ColumnConfig(
+                name=col_name,
+                data_type=data_type,
+                cardinality=min(10, config_table.row_count if hasattr(config_table, "row_count") else config_table.get("row_count", 100)),
+                distribution=DistributionConfig(
+                    avg_length=12 if data_type == "string" else None,
+                    style="docker" if data_type == "string" else None,
+                ),
+            )
+            if hasattr(config_table, "columns"):
+                config_table.columns.append(new_col)
+            else:
+                config_table["columns"].append(new_col)
+            existing.add(col_name)
+            n_added += 1
+
+    return n_added
+
+
 def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     """Modify a model.bim to use Direct Lake on OneLake.
 
-    - Replaces all table partitions with entity partitions pointing at
-      OneLake Delta tables (using sanitized folder names).
-    - Replaces expressions with a single OneLake data source.
-    - Removes incompatible Import-mode settings.
-    - Preserves everything else: relationships, measures, columns,
-      hierarchies, roles, annotations, etc.
+    Uses the .NET TOM (Tabular Object Model) library to properly deserialize,
+    modify, and reserialize the BIM.
+    """
+    return _modify_bim_via_tom(bim, lh_info, table_filter)
+
+
+def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=False):
+    """Modify a model.bim for Import mode reading from OneLake Delta tables.
+
+    Keeps the original model structure (calculated columns, etc.) but rewrites
+    partition M queries to read from OneLake instead of the original source.
+
+    Args:
+        bim: The model.bim dict.
+        lh_info: Lakehouse connection info.
+        table_filter: Tables that have Delta backing (from generation).
+        use_sql_endpoint: If True, use SQL Analytics Endpoint instead of OneLake direct.
     """
     model = bim.get("model", bim)
+    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    filter_set = set(table_filter) if table_filter is not None else None
+
+    n_rewritten = 0
+    for table in model.get("tables", []):
+        tname = table["name"]
+        has_delta = filter_set is None or tname in filter_set
+
+        if not has_delta:
+            # Keep original partitions (enter-data, measure-only, etc.)
+            continue
+
+        safe_name = _safe_folder_name(tname)
+        table_url = f"{onelake_url}/Tables/{safe_name}/"
+
+        # Rewrite partition to read from OneLake Delta
+        m_expr = (
+            "let\n"
+            f'    Source = AzureStorage.DataLake("{table_url}", [HierarchicalNavigation=true]),\n'
+            "    ToDelta = DeltaLake.Table(Source)\n"
+            "in\n"
+            "    ToDelta"
+        )
+
+        table["partitions"] = [
+            {
+                "name": tname,
+                "source": {
+                    "type": "m",
+                    "expression": m_expr.split("\n"),
+                },
+            }
+        ]
+        n_rewritten += 1
+
+    print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
+    return bim
+
+
+def _strip_unknown_bim_properties(bim):
+    """Clean BIM JSON for TOM deserialization and Fabric import.
+
+    Converts calculated columns to data columns (Direct Lake doesn't
+    support them — we generate the values in the Delta tables).
+    Strips unknown column properties.
+    """
+    _KNOWN_COL_PROPS = {
+        "name", "type", "dataType", "sourceColumn", "description", "isHidden",
+        "displayFolder", "formatString", "dataCategory", "sortByColumn",
+        "summarizeBy", "annotations", "extendedProperties", "lineageTag",
+        "sourceLineageTag", "isKey", "isNullable", "isUnique", "isDefaultLabel",
+        "isDefaultImage", "alignment", "tableDetailPosition",
+        "isAvailableInMDX", "groupByColumns", "alternateOf", "encodingHint",
+    }
+    _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
+                     "isUnique", "isNullable", "lineageTag"}
+    _CALC_TYPES = {"calculated", "calculatedTableColumn"}
+
+    model = bim.get("model", bim)
+    n_converted = 0
+    for table in model.get("tables", []):
+        for col in table.get("columns", []):
+            col_type = col.get("type")
+
+            if col_type in _CALC_TYPES:
+                # Convert to data column — keep only valid data column props
+                clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
+                clean.pop("type", None)
+                clean["sourceColumn"] = col["name"]
+                col.clear()
+                col.update(clean)
+                n_converted += 1
+
+            elif col_type == "rowNumber":
+                unknown = [k for k in col if k not in _ROWNUM_PROPS]
+                for k in unknown:
+                    col.pop(k)
+
+            else:
+                unknown = [k for k in col if k not in _KNOWN_COL_PROPS]
+                for k in unknown:
+                    col.pop(k)
+                if "sourceColumn" not in col and col.get("name"):
+                    col["sourceColumn"] = col["name"]
+
+    if n_converted:
+        print(f"    Converted {n_converted} calculated column(s) to data", flush=True)
+
+    return bim
+
+
+def _modify_bim_via_tom(bim, lh_info, table_filter=None):
+    """Modify model.bim using .NET TOM (Tabular Object Model).
+
+    Uses TOM for structural changes (partitions, expressions, table filtering)
+    then serializes back to JSON. Calculated column conversion is handled by
+    JSON post-processing in _strip_unknown_bim_properties.
+
+    Returns (bim_dict, expr_name).
+    """
+    # Bootstrap .NET runtime via sempy (handles Fabric CLR setup)
+    import sempy.fabric as fabric
+    fabric.create_tom_server()
+
+    import clr
+    clr.AddReference("Microsoft.AnalysisServices.Tabular")
+    from Microsoft.AnalysisServices.Tabular import (
+        JsonSerializer, ColumnType, Partition, ModeType,
+        EntityPartitionSource, NamedExpression,
+        ExpressionKind, PowerBIDataSourceVersion,
+    )
+
+    _strip_unknown_bim_properties(bim)
+    bim_json = json.dumps(bim, indent=2)
+    db = JsonSerializer.DeserializeDatabase(bim_json)
+    model = db.Model
+
+    # Set compatibility level first — DirectLake partitions require >= 1604
+    db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
 
     # Build the OneLake expression
     onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
@@ -102,92 +417,85 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     schema = lh_info.get("default_schema", "dbo")
 
     # Replace all expressions with our single OneLake source
-    model["expressions"] = [
-        {
-            "name": expr_name,
-            "kind": "m",
-            "expression": [
-                "let",
-                f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])',
-                "in",
-                "    Source",
-            ],
-        }
-    ]
+    model.Expressions.Clear()
+    expr = NamedExpression()
+    expr.Name = expr_name
+    expr.Kind = ExpressionKind.M
+    expr.Expression = (
+        "let\n"
+        f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])\n'
+        "in\n"
+        "    Source"
+    )
+    model.Expressions.Add(expr)
 
-    # Filter tables if specified — but keep measure-only tables (no data columns)
-    if table_filter is not None:
-        filter_set = set(table_filter)
-        kept_tables = []
-        for t in model.get("tables", []):
-            if t["name"] in filter_set:
-                kept_tables.append(t)
-            else:
-                # Keep tables that only have measures (no data columns needing a Delta table)
-                has_data_cols = any(
-                    c.get("type", "data") != "calculated"
-                    for c in t.get("columns", [])
-                    if c.get("name", "").lower() != "rownumber-2662979b-1795-4f74-8f37-6a1ba8059b61"
-                )
-                has_measures = bool(t.get("measures"))
-                if has_measures and not has_data_cols:
-                    kept_tables.append(t)
-        model["tables"] = kept_tables
+    # Build filter set
+    filter_set = set(table_filter) if table_filter is not None else None
 
-    # Modify each table's partition to Direct Lake entity
-    # Convert all calculated columns to data columns (we generate values for
-    # them in the Delta tables, Direct Lake doesn't support calculated columns)
-    for table in model.get("tables", []):
-        tname = table["name"]
+    # Modify each table for Direct Lake
+    # Tables with Delta backing get entity partitions; others keep empty partitions
+    n_with_delta = 0
+    n_without = 0
+    for table in model.Tables:
+        tname = table.Name
         safe_name = _safe_folder_name(tname)
+        has_delta = filter_set is None or tname in filter_set
 
-        # Check if this table has a corresponding Delta table
-        has_delta = table_filter is None or tname in (table_filter or [])
+        table.Partitions.Clear()
+
         if not has_delta:
-            # Measure-only table — remove partitions entirely
-            table["partitions"] = []
+            n_without += 1
             continue
 
-        # Replace partitions with a single Direct Lake entity partition
-        table["partitions"] = [
-            {
-                "name": tname,
-                "mode": "directLake",
-                "source": {
-                    "type": "entity",
-                    "entityName": safe_name,
-                    "schemaName": schema,
-                    "expressionSource": expr_name,
-                },
-            }
-        ]
+        # Add Direct Lake entity partition
+        part = Partition()
+        part.Name = tname
+        part.Mode = ModeType.DirectLake
+        source = EntityPartitionSource()
+        source.EntityName = safe_name
+        source.SchemaName = schema
+        source.ExpressionSource = model.Expressions[expr_name]
+        part.Source = source
+        table.Partitions.Add(part)
+        n_with_delta += 1
 
-        # Process columns: convert calculated → data, fix sourceColumn
-        n_converted = 0
-        for col in table.get("columns", []):
-            col.pop("sourceProviderType", None)
-            if col.get("type") == "calculated":
-                col.pop("type", None)
-                col.pop("expression", None)
-                n_converted += 1
-            if "sourceColumn" in col or col.get("type", "data") == "data":
-                col["sourceColumn"] = col["name"]
+        # Fix sourceColumn on data columns
+        for col in table.Columns:
+            if col.Type == ColumnType.Data:
+                col.SourceColumn = col.Name
+                col.SourceProviderType = None
 
-        if n_converted:
-            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
+    # Remove query groups
+    if hasattr(model, "QueryGroups") and model.QueryGroups is not None:
+        model.QueryGroups.Clear()
 
-    # Remove query groups (import-mode M query organization)
-    model.pop("queryGroups", None)
+    # Set Direct Lake compatible options
+    model.DefaultPowerBIDataSourceVersion = PowerBIDataSourceVersion.PowerBI_V3
 
-    # Set Direct Lake compatible data access options
-    model["defaultPowerBIDataSourceVersion"] = "powerBI_V3"
-    if "dataAccessOptions" not in model:
-        model["dataAccessOptions"] = {}
+    # Remove relationships with incompatible data types (Direct Lake is strict)
+    incompatible_rels = []
+    for rel in model.Relationships:
+        try:
+            if rel.FromColumn.DataType != rel.ToColumn.DataType:
+                incompatible_rels.append(rel.Name)
+        except Exception:
+            pass
+    if incompatible_rels:
+        print(f"    Removing {len(incompatible_rels)} relationship(s) with incompatible data types", flush=True)
+        for rname in incompatible_rels:
+            model.Relationships.Remove(rname)
 
-    # Update top-level compatibility
-    bim["compatibilityLevel"] = max(bim.get("compatibilityLevel", 1604), 1604)
+    n_tables = model.Tables.Count
+    n_rels = model.Relationships.Count
+    n_measures = sum(t.Measures.Count for t in model.Tables)
+    print(f"    TOM: {n_with_delta} tables with Delta, {n_without} without, {n_rels} relationships, {n_measures} measures", flush=True)
 
-    return bim, expr_name
+    # Serialize back to JSON and post-process
+    result_json = JsonSerializer.SerializeDatabase(db)
+    result_bim = json.loads(result_json)
+    _strip_unknown_bim_properties(result_bim)
+
+    return result_bim, expr_name
 
 
 def deploy_semantic_model(
@@ -242,11 +550,16 @@ def deploy_semantic_model(
     print("  Resolving lakehouse connection ...", flush=True)
     lh_info = _get_lakehouse_info(lakehouse, lakehouse_workspace or workspace)
 
-    # Modify the BIM for Direct Lake
-    print("  Converting model to Direct Lake on OneLake ...", flush=True)
-    bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+    # Modify the BIM based on mode
+    if mode == "import":
+        print("  Converting model to Import from OneLake ...", flush=True)
+        _strip_unknown_bim_properties(bim)
+        bim = _modify_bim_for_import(bim, lh_info, table_filter)
+    else:
+        print("  Converting model to Direct Lake on OneLake ...", flush=True)
+        bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
 
-    # Update model name in the bim (strip .pbix and use our clean name)
+    # Update model name
     bim["name"] = name
     if "model" in bim and isinstance(bim["model"], dict):
         bim["model"]["name"] = name
@@ -254,10 +567,18 @@ def deploy_semantic_model(
 
     n_tables = len(model.get("tables", []))
     n_rels = len(model.get("relationships", []))
-    n_measures = sum(
-        len(t.get("measures", []))
-        for t in model.get("tables", [])
-    )
+    n_measures = sum(len(t.get("measures", [])) for t in model.get("tables", []))
+
+    # Save BIM for troubleshooting
+    bim_path = "/lakehouse/default/Files/datagen/model.bim"
+    try:
+        import os
+        os.makedirs(os.path.dirname(bim_path), exist_ok=True)
+        with open(bim_path, "w", encoding="utf-8") as f:
+            json.dump(bim, f, indent=2)
+        print(f"  Saved model.bim to Files/datagen/model.bim", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Could not save model.bim: {e}", flush=True)
 
     # Deploy via Fabric REST API
     print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
@@ -274,33 +595,92 @@ def deploy_semantic_model(
     except Exception as e:
         err_msg = str(e)[:300]
         print(f"    ✗ Refresh failed: {err_msg}", flush=True)
+        # Get detailed error from refresh history
+        import time as _time2
+        _time2.sleep(3)  # let refresh history populate
+        try:
+            _print_refresh_errors(actual_name, workspace)
+        except Exception as re:
+            print(f"    ⚠ Could not fetch refresh details: {re}", flush=True)
 
+    mode_label = "Direct Lake" if mode == "direct_lake" else "Import"
     print(flush=True)
     if refresh_ok:
-        print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
+        print(f"✓ Semantic model '{actual_name}' deployed ({mode_label} on OneLake)")
     else:
         print(f"⚠ Semantic model '{actual_name}' deployed but refresh failed")
+    print(f"  Mode:          {mode_label}")
     print(f"  Tables:        {n_tables}")
     print(f"  Relationships: {n_rels}")
     print(f"  Measures:      {n_measures}", flush=True)
 
 
-def _log_headers(headers):
-    """Format headers for logging, redacting authorization tokens."""
-    safe = {}
-    for k, v in headers.items():
-        if k.lower() in ("authorization", "x-ms-authorization"):
-            safe[k] = "Bearer ***"
-        else:
-            safe[k] = v
-    return safe
+def _print_refresh_errors(dataset, workspace=None):
+    """Fetch and display detailed refresh errors from the REST API."""
+    import sempy.fabric as fabric
+    from sempy_labs._helper_functions import resolve_workspace_name_and_id
 
+    (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
+    client = fabric.FabricRestClient()
 
-def _log_request(method, url, resp):
-    """Log API request URI and response details."""
-    print(f"    {method} {url}", flush=True)
-    print(f"    → Request headers: {_log_headers(dict(resp.request.headers))}", flush=True)
-    print(f"    ← {resp.status_code} | Response headers: {dict(resp.headers)}", flush=True)
+    # Find the semantic model ID
+    items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
+    model = next((i for i in items if i["displayName"] == dataset), None)
+    if not model:
+        return
+
+    # Get refresh history via XMLA-compatible endpoint
+    model_id = model["id"]
+    resp = client.get(f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
+    if resp.status_code != 200:
+        return
+
+    refreshes = resp.json().get("value", [])
+    if not refreshes:
+        return
+
+    # Show errors from the most recent refresh
+    latest = refreshes[0]
+    status = latest.get("status", "")
+
+    # Dump all keys so we can see what's available
+    if status.lower() not in ("completed", "succeeded"):
+        print(f"    Refresh details (status={status}):", flush=True)
+
+        # Check for top-level error
+        for key in ("serviceExceptionJson", "error", "messages", "extendedStatus"):
+            val = latest.get(key)
+            if val:
+                if isinstance(val, str):
+                    print(f"      {key}: {val[:500]}", flush=True)
+                elif isinstance(val, list):
+                    for msg in val[:5]:
+                        if isinstance(msg, dict):
+                            print(f"      {msg.get('message', msg)}", flush=True)
+                        else:
+                            print(f"      {msg}", flush=True)
+                elif isinstance(val, dict):
+                    print(f"      {key}: {json.dumps(val, indent=2)[:500]}", flush=True)
+
+        # Check per-object errors
+        for obj in latest.get("objects", []):
+            obj_status = obj.get("status", "")
+            if obj_status.lower() not in ("completed", "succeeded", ""):
+                table = obj.get("table", "?")
+                partition = obj.get("partition", "?")
+                msgs = obj.get("messages", [])
+                if msgs:
+                    for msg in msgs[:3]:
+                        if isinstance(msg, dict):
+                            print(f"      {table}: {msg.get('message', msg)}", flush=True)
+                        else:
+                            print(f"      {table}: {msg}", flush=True)
+                else:
+                    print(f"      {table}: status={obj_status}", flush=True)
+
+        # If nothing printed, dump the raw response
+        if not any(latest.get(k) for k in ("serviceExceptionJson", "error", "messages", "objects")):
+            print(f"      Raw: {json.dumps(latest, indent=2)[:800]}", flush=True)
 
 
 def _deploy_bim(bim, name, workspace=None, overwrite=False):
@@ -310,18 +690,11 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     import time
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
-    print(f"    Workspace: {ws_name} ({ws_id})", flush=True)
 
     # Build model.bim payload
     bim_json = json.dumps(bim, indent=2)
     bim_b64 = base64.b64encode(bim_json.encode("utf-8")).decode("utf-8")
-
-    # Build definition.pbism
-    pbism = {
-        "version": "4.0",
-        "settings": {},
-    }
-    pbism_b64 = base64.b64encode(json.dumps(pbism).encode("utf-8")).decode("utf-8")
+    pbism_b64 = base64.b64encode(json.dumps({"version": "4.0", "settings": {}}).encode("utf-8")).decode("utf-8")
 
     definition = {
         "parts": [
@@ -335,23 +708,17 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
     existing = next((i for i in items if i["displayName"] == name), None)
 
-    if existing:
-        print(f"    Existing model found: id={existing['id']}", flush=True)
-    else:
-        print(f"    No existing model '{name}' — will create", flush=True)
-
     if existing and overwrite:
         model_id = existing["id"]
-        url = f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition"
-        print(f"    Updating definition (overwrite=True) ...", flush=True)
-        resp = client.post(url, json={"definition": definition})
-        _log_request("POST", url, resp)
+        print(f"    Updating existing model ({model_id}) ...", flush=True)
+        resp = client.post(
+            f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition",
+            json={"definition": definition},
+        )
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
-
         if resp.status_code == 202:
             _poll_async(client, resp)
-
         return existing["displayName"]
 
     elif existing and not overwrite:
@@ -362,18 +729,14 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
 
     else:
         # Create new
-        body = {
+        print(f"    Creating new semantic model ...", flush=True)
+        resp = client.post(f"/v1/workspaces/{ws_id}/items", json={
             "displayName": name,
             "type": "SemanticModel",
             "definition": definition,
-        }
-        url = f"/v1/workspaces/{ws_id}/items"
-        print(f"    Creating new semantic model ...", flush=True)
-        resp = client.post(url, json=body)
-        _log_request("POST", url, resp)
+        })
         if resp.status_code not in (200, 201, 202):
             raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:500]}")
-
         if resp.status_code == 202:
             _poll_async(client, resp)
 
@@ -382,17 +745,8 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
         created = next((i for i in items if i["displayName"] == name), None)
         if created:
-            print(f"    ✓ Model created: id={created['id']}", flush=True)
             return created["displayName"]
 
-        # Fallback: check if Fabric used the bim name instead
-        bim_name = bim.get("name", "")
-        created = next((i for i in items if i["displayName"] == bim_name), None)
-        if created:
-            print(f"    ✓ Model created (as '{bim_name}'): id={created['id']}", flush=True)
-            return created["displayName"]
-
-        # Model not found — deployment failed silently
         all_names = [i["displayName"] for i in items]
         raise RuntimeError(
             f"Model '{name}' was not found after creation. "
@@ -406,20 +760,13 @@ def _poll_async(client, resp):
     location = resp.headers.get("Location", "")
     retry_after = int(resp.headers.get("Retry-After", "5"))
     if not location:
-        print(f"    No Location header — waiting 10s", flush=True)
         time.sleep(10)
         return
 
-    print(f"    Async operation — polling {location}", flush=True)
     for attempt in range(60):
         time.sleep(retry_after)
         poll = client.get(location)
 
-        if attempt == 0:
-            # Log first poll request/response in detail
-            _log_request("GET", location, poll)
-
-        # Parse response body
         body = {}
         try:
             body = poll.json()
@@ -427,24 +774,18 @@ def _poll_async(client, resp):
             pass
 
         status = body.get("status", "")
-        pct = body.get("percentComplete", "")
         error = body.get("error", {})
 
         if poll.status_code == 200:
             if status.lower() == "failed" or error:
-                print(f"    Poll #{attempt+1}: FAILED — response headers: {dict(poll.headers)}", flush=True)
                 err_msg = error.get("message", "") or body.get("failureReason", "") or str(body)[:500]
                 raise RuntimeError(f"Async operation failed: {err_msg}")
-            print(f"    Poll #{attempt+1}: completed (status={status or 'ok'})", flush=True)
             return
 
         if poll.status_code == 202:
             retry_after = int(poll.headers.get("Retry-After", "5"))
-            detail = f"{pct}%" if pct != "" else status or "in progress"
-            print(f"    Poll #{attempt+1}: {detail}", flush=True)
             continue
 
-        # Unexpected status
         err_detail = body.get("error", {}).get("message", poll.text[:300])
         raise RuntimeError(f"Async poll returned {poll.status_code}: {err_detail}")
 
