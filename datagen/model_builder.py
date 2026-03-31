@@ -127,11 +127,13 @@ def _strip_unknown_bim_properties(bim):
                 col.update(clean)
                 n_converted += 1
             else:
-                # Regular data columns — just ensure sourceColumn is set
+                # Regular data columns — clean up, ensure sourceColumn
                 col.pop("sourceProviderType", None)
                 col.pop("relatedColumnDetails", None)
-                if "sourceColumn" not in col and col.get("name"):
-                    col["sourceColumn"] = col["name"]
+                # Only add sourceColumn for actual data columns (not rowNumber etc.)
+                if col_type is None or col_type == "data":
+                    if "sourceColumn" not in col and col.get("name"):
+                        col["sourceColumn"] = col["name"]
 
     if n_converted:
         print(f"    Converted {n_converted} calculated column(s) to data", flush=True)
