@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.7.20"
+__version__ = "0.7.21"
 
 
 def generate(
@@ -84,6 +84,19 @@ def generate(
         include_hidden=include_hidden,
         include_calculated=include_calculated,
     )
+
+    # Cross-reference with BIM to add columns missing from VPAX stats
+    # (e.g. calculated columns not in DaxModel.json but present in Model.bim)
+    if deploy_model:
+        from .model_builder import _extract_bim, _add_missing_bim_columns
+        try:
+            bim = _extract_bim(vpax_path)
+            n_added = _add_missing_bim_columns(config, bim)
+            if n_added:
+                print(f"  Added {n_added} column(s) from Model.bim not in VPAX stats", flush=True)
+        except Exception:
+            pass
+
     print(f"  Config ready ({_time.time() - _t1:.1f}s)", flush=True)
 
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
