@@ -24,6 +24,13 @@ from .config import (
 _KEY_SUFFIXES = ("key", "id", "sk", "bk", "ak", "code", "number", "num", "no")
 _KEY_EXACT = {"id", "key", "sku", "code"}
 
+# Boolean-like column name patterns (case-insensitive)
+_BOOL_PREFIXES = ("is", "has", "can", "should", "allow", "enable", "disable",
+                  "show", "hide", "include", "exclude", "use", "need")
+_BOOL_EXACT = {"active", "inactive", "enabled", "disabled", "visible", "hidden",
+               "deleted", "archived", "approved", "verified", "locked",
+               "published", "completed", "required", "optional", "flag"}
+
 
 def _is_key_name(col_name):
     """Check if column name suggests it's a key."""
@@ -47,7 +54,24 @@ def _is_guid_column(col_name, avg_length):
     return False
 
 
-def _derive_prefix(col_name):
+def _is_boolean_like(col_name, cardinality):
+    """Detect columns that represent boolean/flag values by name and cardinality.
+
+    Returns True for names like IsActive, HasEmail, Active, Enabled, etc.
+    Only triggers when cardinality is ≤ 2 (true/false or yes/no).
+    """
+    if cardinality > 2:
+        return False
+    # Normalize: strip spaces, lowercase, split on common separators
+    normalized = col_name.replace(" ", "").replace("_", "").replace("-", "").lower()
+    if normalized in _BOOL_EXACT:
+        return True
+    for prefix in _BOOL_PREFIXES:
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            return True
+    return False
+
+
     """Derive a short string prefix from a column name.
 
     Examples: ProductKey → PROD, CustomerID → CUST, SKU → SKU
@@ -334,6 +358,24 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None, table_n
 
     # Non-key column: infer distribution normally
     selection, zipf_exp = _infer_selection(cardinality, row_count)
+
+    # Detect boolean-like columns (IsActive, HasEmail, etc.)
+    if _is_boolean_like(name, cardinality) and data_type in ("int64", "double"):
+        dist = DistributionConfig()
+        return ColumnConfig(
+            name=name, data_type=data_type, cardinality=2,
+            selection="uniform", zipf_exponent=1.0,
+            distribution=dist,
+            values=[{"value": 1, "frequency": 0.5}, {"value": 0, "frequency": 0.5}],
+        )
+    if _is_boolean_like(name, cardinality) and data_type == "string":
+        dist = DistributionConfig(avg_length=3)
+        return ColumnConfig(
+            name=name, data_type=data_type, cardinality=2,
+            selection="uniform", zipf_exponent=1.0,
+            distribution=dist,
+            values=[{"value": "Yes", "frequency": 0.5}, {"value": "No", "frequency": 0.5}],
+        )
 
     # Detect geography columns by name or data category
     geo_type = _detect_geo_type(col_meta)
