@@ -4,11 +4,68 @@ Uses mapInPandas for single-pass, multi-column generation with broadcast
 value pools. Designed for Fabric Spark at scale.
 """
 
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
 from .pool_generator import generate_value_pool, _parse_fixed_values
+
+
+import logging as _logging
+
+_logger = _logging.getLogger("datagen")
+if not _logger.handlers:
+    _handler = _logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(_logging.Formatter("%(message)s"))
+    _logger.addHandler(_handler)
+    _logger.setLevel(_logging.INFO)
+
+
+def _log(msg=""):
+    """Log progress — uses stderr + print + flush for Fabric notebook visibility."""
+    print(msg, flush=True)
+    _logger.info(msg)
+
+
+def _safe_table_name(name):
+    """Sanitize a table name for use as a file/folder name."""
+    # Replace path separators and other filesystem-unsafe characters
+    for ch in "/\\:*?\"<>|":
+        name = name.replace(ch, "_")
+    return name
+
+
+# ---------------------------------------------------------------------------
+# OneLake filesystem helpers (notebookutils.fs — talks directly to OneLake)
+# ---------------------------------------------------------------------------
+
+def _fs_exists(path):
+    """Check if a path exists in the lakehouse via notebookutils.fs."""
+    import notebookutils
+    try:
+        notebookutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
+
+
+def _fs_list_dirs(path):
+    """Return a set of directory names under *path* via notebookutils.fs."""
+    import notebookutils
+    items = notebookutils.fs.ls(path)
+    # FileInfo may use isDir or isDirectory — handle both
+    dirs = set()
+    for item in items:
+        is_dir = getattr(item, "isDir", None)
+        if is_dir is None:
+            is_dir = getattr(item, "isDirectory", None)
+        if is_dir is None:
+            # Infer from path (directories typically end with /)
+            is_dir = getattr(item, "path", "").endswith("/") or getattr(item, "size", 1) == 0
+        if is_dir:
+            dirs.add(item.name)
+    return dirs
 
 
 def _compute_weights(values_spec, pool_size):
@@ -220,7 +277,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
     return partition_generator
 
 
-def generate_table(spark, table_config, output_path, global_seed=42, output_format="delta"):
+def generate_table(spark, table_config, output_path, global_seed=42, output_format="delta", allow_overwrite=True):
     """Generate a single table and write it as a Delta (or parquet) table.
 
     Args:
@@ -229,6 +286,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         output_path: Base directory for output.
         global_seed: Seed for reproducible generation.
         output_format: "delta" (default) or "parquet".
+        allow_overwrite: If False, raise an error if the table already exists.
     """
     # Normalize access (support both dataclass and dict)
     if hasattr(table_config, "name"):
@@ -241,12 +299,12 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         columns = table_config["columns"]
 
     if not columns:
-        print(f"  Skipping table '{table_name}': no columns defined")
         return
 
-    print(f"Generating table '{table_name}' ({row_count:,} rows, {len(columns)} columns)")
+    import time as _time
+    _t0 = _time.time()
 
-    # Phase 1 — generate value pools on the driver
+    # Phase 1 — generate value pools on the driver (silent)
     pools = {}
     weights_map = {}
 
@@ -264,7 +322,6 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     geo_records = None
     if len(geo_cols) >= 2:
         from .geo_generator import generate_geo_records
-        # Use the city cardinality (or largest geo column) to size the record pool
         city_col = next((cn for cn, gt in geo_cols.items() if gt == "city"), None)
         if city_col:
             city_card = next(
@@ -279,14 +336,10 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
                 if (col.name if hasattr(col, "name") else col["name"]) in geo_cols
             )
         geo_records = generate_geo_records(city_card, seed=global_seed)
-        # Build per-column pools from the correlated records
         geo_field_map = {"city": "city", "state": "state", "country": "country", "postal_code": "postal_code"}
         for col_name, geo_type in geo_cols.items():
             field = geo_field_map.get(geo_type, geo_type)
             pools[col_name] = [r[field] for r in geo_records]
-            # Deduplicate for columns with lower cardinality (state, country)
-            # but keep the full list for index-based correlation
-            print(f"  Pool: {col_name} → {len(set(pools[col_name]))} unique values (geo-correlated)")
 
     # Detect correlated email+name columns
     from .email_generator import is_email_column, is_name_column, email_to_name
@@ -299,45 +352,36 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         elif is_name_column(cn):
             name_col_name = cn
 
-    # If both exist, derive name pool from email pool
     if email_col_name and name_col_name:
-        # Generate email pool first (if not already done)
         if email_col_name not in pools:
             email_col = next(c for c in columns
                              if (c.name if hasattr(c, "name") else c["name"]) == email_col_name)
             pools[email_col_name] = generate_value_pool(email_col, global_seed, table_name=table_name)
-            print(f"  Pool: {email_col_name} → {len(pools[email_col_name]):,} unique values")
-        # Derive name pool from email pool
         pools[name_col_name] = [email_to_name(e) for e in pools[email_col_name]]
-        print(f"  Pool: {name_col_name} → {len(pools[name_col_name]):,} unique values (derived from {email_col_name})")
 
     for col in columns:
         col_name = col.name if hasattr(col, "name") else col["name"]
         if col_name in geo_cols and geo_records is not None:
-            continue  # already generated above
+            continue
         if col_name == name_col_name and email_col_name:
-            continue  # derived from email above
+            continue
         if col_name == email_col_name and name_col_name and email_col_name in pools:
-            continue  # already generated above
+            continue
 
         pool = generate_value_pool(col, global_seed, table_name=table_name)
         pools[col_name] = pool
-        print(f"  Pool: {col_name} → {len(pool):,} unique values")
 
-        # Compute per-value weights if fixed values have frequencies
         values_spec = col.values if hasattr(col, "values") else (col.get("values") if isinstance(col, dict) else None)
         w = _compute_weights(values_spec, len(pool))
         if w is not None:
             weights_map[col_name] = w
 
-    # Phase 2 — build output schema
-    schema = _build_schema(columns)
+    _t1 = _time.time()
 
-    # Phase 3 — broadcast pools and column metadata
+    # Phase 2 — build schema + broadcast
+    schema = _build_schema(columns)
     col_dicts = [_col_to_dict(c) for c in columns]
 
-    # Mark primary-key columns so the partition generator can use direct
-    # ID-based indexing (guarantees every pool value appears exactly once).
     for cd in col_dicts:
         is_key = cd.get("is_key", False)
         key_style = cd.get("key_style")
@@ -345,13 +389,11 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
         if is_key and key_style and card >= row_count:
             cd["_primary_key_mode"] = True
 
-    # Mark correlated geo columns so they share the same selection index
     if geo_records is not None:
         for cd in col_dicts:
             if cd.get("name") in geo_cols:
                 cd["_geo_group"] = True
 
-    # Mark correlated email+name columns
     if email_col_name and name_col_name:
         for cd in col_dicts:
             if cd.get("name") in (email_col_name, name_col_name):
@@ -362,17 +404,30 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     seed_bc = spark.sparkContext.broadcast(global_seed)
     weights_bc = spark.sparkContext.broadcast(weights_map)
 
-    # Phase 4 — generate with mapInPandas (single pass, all columns at once)
+    _t2 = _time.time()
+
+    # Phase 3 — generate and write
     gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc)
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
 
-    # Phase 5 — write output
-    table_path = f"{output_path.rstrip('/')}/{table_name}"
+    table_path = f"{output_path.rstrip('/')}/{_safe_table_name(table_name)}"
     fmt = output_format.lower()
-    print(f"  Writing {fmt} table → {table_path}")
-    result_df.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
-    print(f"  ✓ {table_name} complete")
+
+    job_desc = f"datagen: {table_name} ({row_count:,} rows)"
+    spark.sparkContext.setJobGroup(f"datagen_{table_name}", job_desc)
+    spark.sparkContext.setJobDescription(job_desc)
+    spark.sparkContext.setLocalProperty("callSite.short", job_desc)
+    spark.sparkContext.setLocalProperty("callSite.long", job_desc)
+    write_mode = "overwrite" if allow_overwrite else "errorIfExists"
+    result_df.write.format(fmt).mode(write_mode) \
+        .option("overwriteSchema", "true") \
+        .option("delta.columnMapping.mode", "name") \
+        .option("delta.minReaderVersion", "2") \
+        .option("delta.minWriterVersion", "5") \
+        .save(table_path)
+    spark.sparkContext.setJobGroup(None, None)
+    _t3 = _time.time()
 
     # Cleanup
     pools_bc.unpersist()
@@ -380,8 +435,16 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     seed_bc.unpersist()
     weights_bc.unpersist()
 
+    # Return timing for caller to display
+    return {
+        "pool_time": _t1 - _t0,
+        "broadcast_time": _t2 - _t1,
+        "write_time": _t3 - _t2,
+        "total_time": _t3 - _t0,
+    }
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None):
+
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -392,6 +455,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         vpax_model: Parsed VPAX model dict (optional). When provided,
             date dimension tables are auto-detected and generated with
             derived column values instead of random data.
+        overwrite: If True, regenerate all tables. If False, skip tables
+            that already exist as Delta/parquet and only generate missing ones.
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -416,29 +481,129 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         for t in vpax_model.get("tables", []):
             vpax_tables[t["name"]] = t
 
+    # Detect schema-enabled lakehouse (Tables/dbo/ exists)
+    if out_path.rstrip("/") == "Tables":
+        try:
+            top_dirs = _fs_list_dirs("Tables")
+            if "dbo" in top_dirs:
+                out_path = "Tables/dbo/"
+        except Exception as e:
+            print(f"  ⚠ Schema detection failed: {e}", flush=True)
+
     n = len(tables)
-    print(f"{'=' * 60}")
-    print(f"Datagen: generating {n} table{'s' if n != 1 else ''} for '{model_name}'")
-    print(f"Output : {out_path}")
-    print(f"Seed   : {seed}")
-    print(f"{'=' * 60}")
-    print()
+    total_rows = sum(
+        (t.row_count if hasattr(t, "row_count") else t.get("row_count", 0))
+        for t in tables
+    )
+
+    from . import __version__
+    import time as _time
+    _overall_t0 = _time.time()
+
+    print(f"Datagen v{__version__} — {model_name}")
+    print(f"  Tables: {n}  |  Total rows: {total_rows:,}  |  Output: {out_path}  |  Seed: {seed}", flush=True)
+
+    # Build set of existing table folder names (for overwrite=False)
+    existing_tables = set()
+    if not overwrite:
+        tables_dir = out_path.rstrip("/")
+
+        try:
+            existing_tables = _fs_list_dirs(tables_dir)
+        except Exception as e:
+            print(f"  ⚠ Table listing failed ({tables_dir}): {e}", flush=True)
+
+        if existing_tables:
+            print(f"  Found {len(existing_tables)} existing tables", flush=True)
+        else:
+            print(f"  ⚠ No existing tables found (checked {tables_dir})", flush=True)
+
+    # Try to use tqdm for progress bar (available in Fabric)
+    try:
+        from tqdm.auto import tqdm
+        progress = tqdm(total=n, desc="Tables", unit="table", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+    except ImportError:
+        progress = None
+
+    rows_generated = 0
+    errors = []
+    succeeded_tables = []
+    skipped_tables = []
 
     for i, table in enumerate(tables, 1):
         tname = table.name if hasattr(table, "name") else table["name"]
-        print(f"[{i}/{n}] {tname}")
+        row_count = table.row_count if hasattr(table, "row_count") else table.get("row_count", 0)
+        n_cols = len(table.columns if hasattr(table, "columns") else table.get("columns", []))
 
-        # Check if this is a date table (using VPAX metadata for column roles)
-        vpax_table = vpax_tables.get(tname)
-        if vpax_table and _is_date_table(vpax_table):
-            _generate_date_table_spark(spark, vpax_table, out_path, output_format)
-        else:
-            generate_table(spark, table, out_path, seed, output_format)
-        print()
+        if progress:
+            progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
 
-    print(f"{'=' * 60}")
-    print(f"All {n} tables generated successfully.")
-    print(f"{'=' * 60}")
+        # Skip existing tables when not overwriting
+        safe_name = _safe_table_name(tname)
+        if not overwrite and (safe_name in existing_tables or tname in existing_tables):
+            succeeded_tables.append(tname)
+            skipped_tables.append(tname)
+            if progress:
+                progress.write(f"  ⊘ {tname} — exists, skipped")
+                progress.update(1)
+            else:
+                print(f"  [{i}/{n}] ⊘ {tname} — exists, skipped", flush=True)
+            continue
+
+        if progress:
+            progress.set_postfix_str(f"{tname} ({row_count:,} rows)")
+
+        try:
+            vpax_table = vpax_tables.get(tname)
+            if vpax_table and _is_date_table(vpax_table):
+                _generate_date_table_spark(spark, vpax_table, out_path, output_format)
+                timing = {"total_time": 0}
+            else:
+                timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
+
+            total_time = timing.get("total_time", 0)
+            rows_generated += row_count
+            succeeded_tables.append(tname)
+
+            if progress:
+                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)")
+            else:
+                print(f"  [{i}/{n}] ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)", flush=True)
+
+        except Exception as e:
+            errors.append((tname, str(e)))
+            if progress:
+                progress.write(f"  ✗ {tname} — {e}")
+            else:
+                print(f"  [{i}/{n}] ✗ {tname} — {e}", flush=True)
+
+        if progress:
+            progress.update(1)
+
+    if progress:
+        progress.close()
+
+    _overall_elapsed = _time.time() - _overall_t0
+    rows_per_sec = int(rows_generated / _overall_elapsed) if _overall_elapsed > 0 else 0
+
+    print(flush=True)
+    generated = n - len(errors) - len(skipped_tables)
+    parts = [f"Generated: {generated}/{n} tables"]
+    if skipped_tables:
+        parts.append(f"Skipped: {len(skipped_tables)}")
+    if errors:
+        parts.append(f"Errors: {len(errors)}")
+    parts.append(f"{rows_generated:,} rows")
+    parts.append(f"{_overall_elapsed:.0f}s")
+    if rows_generated > 0:
+        parts.append(f"{rows_per_sec:,} rows/s")
+    print("  |  ".join(parts))
+    if errors:
+        for tname, err in errors:
+            print(f"  ✗ {tname}: {err}")
+    print(flush=True)
+
+    return succeeded_tables, out_path
 
 
 def _is_date_table(vpax_table):
@@ -454,7 +619,7 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     tname = vpax_table["name"]
     row_count = vpax_table.get("row_count", 365)
 
-    print(f"  Date table detected — generating {row_count:,} days with derived columns")
+    _log(f"  Date table detected — generating {row_count:,} days with derived columns")
 
     rows = generate_date_table(vpax_table)
 
@@ -474,8 +639,17 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
 
     sdf = spark.createDataFrame(pdf)
 
-    table_path = f"{output_path.rstrip('/')}/{tname}"
+    table_path = f"{output_path.rstrip('/')}/{_safe_table_name(tname)}"
     fmt = output_format.lower()
-    print(f"  Writing {fmt} table → {table_path}")
-    sdf.write.format(fmt).mode("overwrite").option("overwriteSchema", "true").save(table_path)
-    print(f"  ✓ {tname} complete ({row_count:,} rows, {len(pdf.columns)} columns)")
+    job_desc = f"datagen: {tname} (date table, {row_count:,} rows)"
+    spark.sparkContext.setJobGroup(f"datagen_{tname}", job_desc)
+    spark.sparkContext.setJobDescription(job_desc)
+    spark.sparkContext.setLocalProperty("callSite.short", job_desc)
+    spark.sparkContext.setLocalProperty("callSite.long", job_desc)
+    sdf.write.format(fmt).mode("overwrite") \
+        .option("overwriteSchema", "true") \
+        .option("delta.columnMapping.mode", "name") \
+        .option("delta.minReaderVersion", "2") \
+        .option("delta.minWriterVersion", "5") \
+        .save(table_path)
+    spark.sparkContext.setJobGroup(None, None)

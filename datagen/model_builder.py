@@ -1,412 +1,193 @@
-"""Build a Direct Lake semantic model from VPAX metadata.
+"""Build a Direct Lake semantic model from the Model.bim in a VPAX file.
 
-Two modes:
-  - ``deploy_semantic_model()`` — runtime in a Fabric notebook using
-    *semantic-link-labs* (``sempy_labs``)
-  - ``build_tmdl()`` — offline TMDL folder generation for version control
-    or MCP import
+Extracts the full model definition (model.bim) from the VPAX, modifies
+table partitions to point at the generated OneLake Delta tables, and
+deploys via the Fabric REST API.  This preserves the entire original
+model — all relationships, measures, hierarchies, roles, column metadata,
+format strings, display folders, etc.
 """
 
-import hashlib
-import os
-from pathlib import Path
-
-from .vpax_parser import parse_vpax
+import base64
+import json
+import zipfile
 
 
-# ---------------------------------------------------------------------------
-# TMDL helpers
-# ---------------------------------------------------------------------------
-
-def _guid(name, seed="datagen"):
-    """Deterministic GUID from a name — reproducible lineage tags."""
-    h = hashlib.md5(f"{seed}:{name}".encode()).hexdigest()
-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-
-
-def _quote(name):
-    """Quote a TMDL identifier if it contains special characters."""
-    if " " in name or "'" in name or any(c in name for c in "\"[]{}().,;:!@#$%^&*+-=<>?/\\"):
-        escaped = name.replace("'", "''")
-        return f"'{escaped}'"
+def _safe_folder_name(name):
+    """Sanitize a table name for use as a Delta table folder name."""
+    for ch in "/\\:*?\"<>|":
+        name = name.replace(ch, "_")
     return name
 
 
-_TMDL_DTYPE = {
-    "string": "string",
-    "int64": "int64",
-    "double": "double",
-    "datetime": "dateTime",
-    "boolean": "boolean",
-    "binary": "binary",
-}
+def _extract_bim(vpax_path):
+    """Extract Model.bim JSON from a VPAX file."""
+    import io
+
+    try:
+        vpax_bytes = open(vpax_path, "rb").read()
+    except OSError:
+        # FUSE mount may be disconnected — try notebookutils
+        try:
+            import notebookutils
+            vpax_bytes = notebookutils.fs.read(vpax_path)
+            if isinstance(vpax_bytes, str):
+                vpax_bytes = vpax_bytes.encode("latin-1")
+        except Exception:
+            raise OSError(
+                f"Cannot read {vpax_path}. The lakehouse FUSE mount may be disconnected. "
+                f"Try restarting the notebook session."
+            )
+
+    with zipfile.ZipFile(io.BytesIO(vpax_bytes), "r") as zf:
+        names = zf.namelist()
+        bim_name = next((n for n in names if n.lower() == "model.bim"), None)
+        if bim_name:
+            return json.loads(zf.read(bim_name))
+        raise ValueError(f"No Model.bim found in {vpax_path}")
 
 
-def _datatype(dt):
-    return _TMDL_DTYPE.get(dt, "string")
+def _get_lakehouse_info(lakehouse=None, workspace=None):
+    """Get lakehouse details (IDs, OneLake host) from notebookutils."""
+    import notebookutils
 
+    if not lakehouse:
+        lakehouse = notebookutils.runtime.context.get("defaultLakehouseName")
+        if not lakehouse:
+            raise RuntimeError(
+                "No lakehouse specified and no default lakehouse attached. "
+                "Attach a lakehouse to the notebook or pass lakehouse='name'."
+            )
 
-# Default summarizeBy per data type (TMDL engine defaults)
-_DEFAULT_SUMMARIZE = {
-    "int64": "sum",
-    "double": "sum",
-    "string": "none",
-    "datetime": "none",
-    "boolean": "none",
-    "binary": "none",
-}
+    info = notebookutils.lakehouse.get(lakehouse)
 
+    props = info.get("properties", {})
+    ws_id = info["workspaceId"]
+    lh_id = info["id"]
+    lh_name = info.get("displayName", lakehouse or "lakehouse")
 
-def _normalize_summarize(val):
-    """Normalize a SummarizeBy value to lowercase TMDL form."""
-    if not val:
-        return None
-    mapping = {
-        "sum": "sum", "count": "count", "min": "min", "max": "max",
-        "average": "average", "distinctcount": "distinctCount",
-        "none": "none", "default": None,
+    # Extract OneLake host (handles msit vs prod)
+    tables_url = props.get("oneLakeTablesPath", "")
+    if tables_url:
+        from urllib.parse import urlparse
+        onelake_host = urlparse(tables_url).hostname
+    else:
+        onelake_host = "onelake.dfs.fabric.microsoft.com"
+
+    default_schema = props.get("defaultSchema", "dbo")
+
+    return {
+        "ws_id": ws_id,
+        "lh_id": lh_id,
+        "lh_name": lh_name,
+        "onelake_host": onelake_host,
+        "default_schema": default_schema,
     }
-    return mapping.get(val.lower().strip(), None)
 
 
-def _normalize_cross_filter(val):
-    """Normalize CrossFilteringBehavior to TMDL form."""
-    if not val:
-        return None
-    lower = val.lower().replace("_", "").replace(" ", "")
-    if "both" in lower:
-        return "bothDirections"
-    return None  # OneDirection is the default — omit from TMDL
+def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
+    """Modify a model.bim to use Direct Lake on OneLake.
 
-
-def _normalize_cardinality(val):
-    if not val:
-        return None
-    return val.lower().strip()
-
-
-# ---------------------------------------------------------------------------
-# TMDL file generators
-# ---------------------------------------------------------------------------
-
-def _gen_database(model_name, compat_level=1604):
-    lines = []
-    lines.append(f"database {_quote(model_name)}")
-    lines.append(f"\tcompatibilityLevel: {compat_level}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _gen_model(model_name, table_names):
-    lines = [
-        f"model {_quote(model_name)}",
-        "\tculture: en-US",
-        "\tdefaultPowerBIDataSourceVersion: powerBI_V3",
-        "\tsourceQueryCulture: en-US",
-        "\tdataAccessOptions",
-        "\t\tlegacyRedirects",
-        "\t\treturnErrorValuesAsNull",
-        "",
-    ]
-    for tname in table_names:
-        lines.append(f"ref table {_quote(tname)}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _gen_expression(expression_name, lakehouse_sql_endpoint=None, lakehouse_name=None):
-    """Generate the named expression TMDL for a lakehouse data source."""
-    server = lakehouse_sql_endpoint or "placeholder_endpoint"
-    db = lakehouse_name or "placeholder_lakehouse"
-
-    lines = [
-        f"expression {expression_name} =",
-        "\t\tlet",
-        f'\t\t\tdatabase = Sql.Database("{server}", "{db}")',
-        "\t\tin",
-        "\t\t\tdatabase",
-        f"\tlineageTag: {_guid(expression_name)}",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def _gen_relationship(rel):
-    """Generate TMDL for a single relationship."""
-    from_t = rel["from_table"]
-    from_c = rel["from_column"]
-    to_t = rel["to_table"]
-    to_c = rel["to_column"]
-
-    name = f"{from_t}_{from_c}_{to_t}_{to_c}"
-
-    lines = [f"relationship {_quote(name)}"]
-    lines.append(f"\tfromColumn: {_quote(from_t)}.{_quote(from_c)}")
-    lines.append(f"\ttoColumn: {_quote(to_t)}.{_quote(to_c)}")
-
-    # Non-default properties only
-    cross = _normalize_cross_filter(rel.get("cross_filtering"))
-    if cross:
-        lines.append(f"\tcrossFilteringBehavior: {cross}")
-
-    if rel.get("is_active") is False:
-        lines.append("\tisActive: false")
-
-    from_card = _normalize_cardinality(rel.get("from_cardinality"))
-    if from_card and from_card != "many":
-        lines.append(f"\tfromCardinality: {from_card}")
-
-    to_card = _normalize_cardinality(rel.get("to_cardinality"))
-    if to_card and to_card != "one":
-        lines.append(f"\ttoCardinality: {to_card}")
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _gen_relationships(relationships):
-    """Generate the full relationships.tmdl content."""
-    blocks = [_gen_relationship(r) for r in relationships]
-    return "\n".join(blocks)
-
-
-def _gen_measure(measure, table_name):
-    """Generate TMDL lines for a single measure (indented for table context)."""
-    lines = []
-    name = _quote(measure["name"])
-    expr = measure.get("expression", "")
-
-    # Description as comment
-    desc = measure.get("description")
-    if desc:
-        for desc_line in desc.splitlines():
-            lines.append(f"\t/// {desc_line}")
-
-    # Expression — single line or multi-line
-    expr_lines = [l for l in expr.splitlines() if l.strip()] if expr else []
-    if len(expr_lines) <= 1:
-        lines.append(f"\tmeasure {name} = {expr_lines[0] if expr_lines else ''}")
-    else:
-        lines.append(f"\tmeasure {name} =")
-        for el in expr_lines:
-            lines.append(f"\t\t\t{el}")
-
-    # Properties
-    fmt = measure.get("format_string")
-    if fmt:
-        lines.append(f"\t\tformatString: {fmt}")
-
-    folder = measure.get("display_folder")
-    if folder:
-        lines.append(f"\t\tdisplayFolder: {folder}")
-
-    if measure.get("is_hidden"):
-        lines.append("\t\tisHidden")
-
-    lines.append(f"\t\tlineageTag: {_guid(table_name + '.' + measure['name'])}")
-    lines.append("")
-    return lines
-
-
-def _gen_column(col, table_name):
-    """Generate TMDL lines for a single column (indented for table context)."""
-    lines = []
-    name = _quote(col["name"])
-
-    desc = col.get("description")
-    if desc:
-        for desc_line in desc.splitlines():
-            lines.append(f"\t/// {desc_line}")
-
-    lines.append(f"\tcolumn {name}")
-    lines.append(f"\t\tdataType: {_datatype(col['data_type'])}")
-
-    fmt = col.get("format_string")
-    if fmt:
-        lines.append(f"\t\tformatString: {fmt}")
-
-    lines.append(f"\t\tlineageTag: {_guid(table_name + '.' + col['name'])}")
-
-    # summarizeBy — only emit when non-default
-    raw_summ = col.get("summarize_by")
-    summ = _normalize_summarize(raw_summ)
-    default_summ = _DEFAULT_SUMMARIZE.get(col["data_type"], "none")
-    if summ and summ != default_summ:
-        lines.append(f"\t\tsummarizeBy: {summ}")
-
-    lines.append(f"\t\tsourceColumn: {col['name']}")
-
-    if col.get("is_hidden"):
-        lines.append("\t\tisHidden")
-
-    folder = col.get("display_folder")
-    if folder:
-        lines.append(f"\t\tdisplayFolder: {folder}")
-
-    sort_by = col.get("sort_by_column")
-    if sort_by:
-        lines.append(f"\t\tsortByColumn: {sort_by}")
-
-    cat = col.get("data_category")
-    if cat:
-        lines.append(f"\t\tdataCategory: {cat}")
-
-    lines.append("")
-    return lines
-
-
-def _gen_table(table, expression_name, mode="direct_lake"):
-    """Generate the full <TableName>.tmdl content."""
-    tname = table["name"]
-    lines = [f"table {_quote(tname)}"]
-    lines.append(f"\tlineageTag: {_guid(tname)}")
-
-    # Table description
-    desc = table.get("description")
-    if desc:
-        # Description as annotation since table-level /// is not standard
-        pass  # TMDL tables don't have /// comments at the top level
-
-    if table.get("is_hidden"):
-        lines.append("\tisHidden")
-
-    lines.append("")
-
-    # Measures first (convention)
-    for m in table.get("measures", []):
-        lines.extend(_gen_measure(m, tname))
-
-    # Columns
-    for col in table.get("columns", []):
-        # Skip calculated columns — they'd need DAX expressions
-        if col.get("is_calculated"):
-            continue
-        lines.extend(_gen_column(col, tname))
-
-    # Partition
-    if mode == "import":
-        m_expr = (
-            f'let\n'
-            f'\t\t\t\tSource = #"{expression_name}",\n'
-            f'\t\t\t\tdbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
-            f'\t\t\tin\n'
-            f'\t\t\t\tdbo_{tname}'
-        )
-        lines.append(f"\tpartition {_quote(tname)} = m")
-        lines.append("\t\tmode: import")
-        lines.append("\t\tsource")
-        lines.append(f"\t\t\texpression =")
-        for expr_line in m_expr.splitlines():
-            lines.append(f"\t\t\t\t{expr_line}")
-        lines.append("")
-    else:
-        # Direct Lake (default)
-        entity_name = tname
-        lines.append(f"\tpartition {_quote(tname)} = entity")
-        lines.append("\t\tmode: directLake")
-        lines.append("\t\tsource")
-        lines.append(f"\t\t\tentityName: {entity_name}")
-        lines.append(f"\t\t\texpressionSource: {expression_name}")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def _filter_tables(vpax_model, include_hidden=True, include_calculated=False):
-    """Return filtered tables list from a parsed VPAX model."""
-    tables = []
-    for t in vpax_model.get("tables", []):
-        if not include_hidden and t.get("is_hidden"):
-            continue
-        cols = [
-            c for c in t.get("columns", [])
-            if (include_hidden or not c.get("is_hidden"))
-            and (include_calculated or not c.get("is_calculated"))
-        ]
-        if not cols:
-            continue
-        t_copy = dict(t)
-        t_copy["columns"] = cols
-        tables.append(t_copy)
-    return tables
-
-
-def build_tmdl(
-    vpax_path,
-    output_folder,
-    lakehouse_name=None,
-    lakehouse_sql_endpoint=None,
-    model_name=None,
-    expression_name="DatabaseQuery",
-    compat_level=1604,
-    mode="direct_lake",
-    include_hidden=True,
-    include_calculated=False,
-):
-    """Generate a TMDL folder from a .vpax file.
-
-    All semantic model metadata (tables, columns, measures, relationships,
-    format strings, display folders, descriptions) is read directly from
-    the .vpax file.  No config YAML is involved.
-
-    Args:
-        vpax_path: Path to the .vpax file.
-        output_folder: Directory to write the TMDL files into.
-        lakehouse_name: Fabric lakehouse name (placeholder if omitted).
-        lakehouse_sql_endpoint: Lakehouse SQL endpoint (placeholder if omitted).
-        model_name: Override the model name from the VPAX.
-        expression_name: Name for the data source expression.
-        compat_level: Compatibility level (default: 1604).
-        mode: ``"direct_lake"`` (default) or ``"import"``.
-            Import mode uses M (Power Query) expressions to read from
-            the lakehouse SQL endpoint.
-        include_hidden: Include hidden columns/tables in the model.
-        include_calculated: Include calculated columns (they won't have data).
-
-    Returns:
-        Path to the generated TMDL folder.
+    - Replaces all table partitions with entity partitions pointing at
+      OneLake Delta tables (using sanitized folder names).
+    - Replaces expressions with a single OneLake data source.
+    - Removes incompatible Import-mode settings.
+    - Preserves everything else: relationships, measures, columns,
+      hierarchies, roles, annotations, etc.
     """
-    vpax_model = parse_vpax(vpax_path)
-    name = model_name or vpax_model.get("model_name", "Model")
-    tables = _filter_tables(vpax_model, include_hidden, include_calculated)
-    relationships = vpax_model.get("relationships", [])
+    model = bim.get("model", bim)
 
-    out = Path(output_folder)
-    tables_dir = out / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
+    # Build the OneLake expression
+    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    expr_name = f"DirectLake - {lh_info['lh_name']}"
+    schema = lh_info.get("default_schema", "dbo")
 
-    table_names = [t["name"] for t in tables]
-
-    valid_rels = [
-        r for r in relationships
-        if r["from_table"] in table_names and r["to_table"] in table_names
+    # Replace all expressions with our single OneLake source
+    model["expressions"] = [
+        {
+            "name": expr_name,
+            "kind": "m",
+            "expression": [
+                "let",
+                f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])',
+                "in",
+                "    Source",
+            ],
+        }
     ]
 
-    _write(out / "database.tmdl", _gen_database(name, compat_level))
-    _write(out / "model.tmdl", _gen_model(name, table_names))
-    _write(out / "expressions.tmdl",
-           _gen_expression(expression_name, lakehouse_sql_endpoint, lakehouse_name))
+    # Filter tables if specified — but keep measure-only tables (no data columns)
+    if table_filter is not None:
+        filter_set = set(table_filter)
+        kept_tables = []
+        for t in model.get("tables", []):
+            if t["name"] in filter_set:
+                kept_tables.append(t)
+            else:
+                # Keep tables that only have measures (no data columns needing a Delta table)
+                has_data_cols = any(
+                    c.get("type", "data") != "calculated"
+                    for c in t.get("columns", [])
+                    if c.get("name", "").lower() != "rownumber-2662979b-1795-4f74-8f37-6a1ba8059b61"
+                )
+                has_measures = bool(t.get("measures"))
+                if has_measures and not has_data_cols:
+                    kept_tables.append(t)
+        model["tables"] = kept_tables
 
-    if valid_rels:
-        _write(out / "relationships.tmdl", _gen_relationships(valid_rels))
+    # Modify each table's partition to Direct Lake entity
+    # Convert all calculated columns to data columns (we generate values for
+    # them in the Delta tables, Direct Lake doesn't support calculated columns)
+    for table in model.get("tables", []):
+        tname = table["name"]
+        safe_name = _safe_folder_name(tname)
 
-    for table in tables:
-        _write(tables_dir / f"{table['name']}.tmdl",
-               _gen_table(table, expression_name, mode=mode))
+        # Check if this table has a corresponding Delta table
+        has_delta = table_filter is None or tname in (table_filter or [])
+        if not has_delta:
+            # Measure-only table — remove partitions entirely
+            table["partitions"] = []
+            continue
 
-    n_measures = sum(len(t.get("measures", [])) for t in tables)
-    mode_label = "Import" if mode == "import" else "Direct Lake"
-    print(f"TMDL folder generated: {out}")
-    print(f"  Mode:          {mode_label}")
-    print(f"  Tables:        {len(tables)}")
-    print(f"  Relationships: {len(valid_rels)}")
-    print(f"  Measures:      {n_measures}")
+        # Replace partitions with a single Direct Lake entity partition
+        table["partitions"] = [
+            {
+                "name": tname,
+                "mode": "directLake",
+                "source": {
+                    "type": "entity",
+                    "entityName": safe_name,
+                    "schemaName": schema,
+                    "expressionSource": expr_name,
+                },
+            }
+        ]
 
-    return str(out)
+        # Process columns: convert calculated → data, fix sourceColumn
+        n_converted = 0
+        for col in table.get("columns", []):
+            col.pop("sourceProviderType", None)
+            if col.get("type") == "calculated":
+                col.pop("type", None)
+                col.pop("expression", None)
+                n_converted += 1
+            if "sourceColumn" in col or col.get("type", "data") == "data":
+                col["sourceColumn"] = col["name"]
+
+        if n_converted:
+            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
+
+    # Remove query groups (import-mode M query organization)
+    model.pop("queryGroups", None)
+
+    # Set Direct Lake compatible data access options
+    model["defaultPowerBIDataSourceVersion"] = "powerBI_V3"
+    if "dataAccessOptions" not in model:
+        model["dataAccessOptions"] = {}
+
+    # Update top-level compatibility
+    bim["compatibilityLevel"] = max(bim.get("compatibilityLevel", 1604), 1604)
+
+    return bim, expr_name
 
 
 def deploy_semantic_model(
@@ -419,18 +200,14 @@ def deploy_semantic_model(
     include_hidden=True,
     include_calculated=False,
     overwrite=False,
+    table_filter=None,
 ):
-    """Create a semantic model from a .vpax file.
+    """Deploy a semantic model from a VPAX file's Model.bim.
 
-    Reads all model metadata directly from the .vpax — tables, columns,
-    measures (with DAX), relationships, format strings, display folders,
-    descriptions, and hidden flags.  The generated Delta tables in the
-    attached lakehouse supply the data; the .vpax supplies the model
-    definition.
-
-    Requires ``semantic-link-labs`` (``pip install semantic-link-labs``).
-    Run inside a Fabric notebook after ``generate_all_tables()`` has
-    written the Delta tables to the lakehouse.
+    Extracts the full model definition from the VPAX, modifies partitions
+    to point at OneLake Delta tables, and deploys via the Fabric REST API.
+    Preserves the entire original model — relationships, measures, hierarchies,
+    roles, column metadata, format strings, display folders, etc.
 
     Args:
         vpax_path: Path to the .vpax file.
@@ -439,233 +216,250 @@ def deploy_semantic_model(
         lakehouse: Lakehouse containing the generated Delta tables.
         lakehouse_workspace: Workspace of the lakehouse (if different).
         mode: ``"direct_lake"`` (default) or ``"import"``.
-            Import mode creates M (Power Query) partitions that read
-            from the lakehouse SQL endpoint, then refreshes the model.
         include_hidden: Include hidden columns/tables from the VPAX.
         include_calculated: Include calculated columns.
         overwrite: Overwrite an existing model with the same name.
+        table_filter: Optional list of table names to include.
     """
+    import sempy_labs as sl
+
+    # Extract the full model.bim from the VPAX
+    print("  Extracting Model.bim from VPAX ...", flush=True)
+    bim = _extract_bim(vpax_path)
+
+    name = dataset
+    if not name:
+        # Try to get a friendly name from the VPAX filename
+        import os
+        vpax_basename = os.path.splitext(os.path.basename(vpax_path))[0]
+        # Strip common suffixes like " VPAX", ".vpax"
+        for suffix in [" VPAX", " vpax", "_VPAX", "_vpax"]:
+            if vpax_basename.endswith(suffix):
+                vpax_basename = vpax_basename[:-len(suffix)]
+        name = vpax_basename.strip() or "Model"
+
+    # Get lakehouse details
+    print("  Resolving lakehouse connection ...", flush=True)
+    lh_info = _get_lakehouse_info(lakehouse, lakehouse_workspace or workspace)
+
+    # Modify the BIM for Direct Lake
+    print("  Converting model to Direct Lake on OneLake ...", flush=True)
+    bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+
+    # Update model name in the bim (strip .pbix and use our clean name)
+    bim["name"] = name
+    if "model" in bim and isinstance(bim["model"], dict):
+        bim["model"]["name"] = name
+    model = bim.get("model", bim)
+
+    n_tables = len(model.get("tables", []))
+    n_rels = len(model.get("relationships", []))
+    n_measures = sum(
+        len(t.get("measures", []))
+        for t in model.get("tables", [])
+    )
+
+    # Deploy via Fabric REST API
+    print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
+
+    actual_name = _deploy_bim(bim, name, workspace, overwrite)
+
+    # Refresh using the actual display name from the API
+    print("  Refreshing model ...", flush=True)
+    refresh_ok = False
     try:
-        import sempy_labs as sl
-        from sempy_labs.tom import connect_semantic_model
-    except ImportError:
-        raise ImportError(
-            "semantic-link-labs is required for deploy_semantic_model().\n"
-            "Install it with:  pip install semantic-link-labs\n"
-            "Or use build_tmdl() for offline TMDL generation."
-        )
+        sl.refresh_semantic_model(dataset=actual_name, workspace=workspace)
+        print("    ✓ Refresh complete", flush=True)
+        refresh_ok = True
+    except Exception as e:
+        err_msg = str(e)[:300]
+        print(f"    ✗ Refresh failed: {err_msg}", flush=True)
 
-    vpax_model = parse_vpax(vpax_path)
-    name = dataset or vpax_model.get("model_name", "Model")
-    tables = _filter_tables(vpax_model, include_hidden, include_calculated)
-    relationships = vpax_model.get("relationships", [])
-    table_names = [t["name"] for t in tables]
-    mode_label = "Import" if mode == "import" else "Direct Lake"
-
-    # ------------------------------------------------------------------
-    # 1. Create a blank semantic model
-    # ------------------------------------------------------------------
-    print(f"Creating semantic model '{name}' ({mode_label}) ...")
-    sl.create_blank_semantic_model(
-        dataset=name,
-        workspace=workspace,
-        overwrite=overwrite,
-    )
-
-    # ------------------------------------------------------------------
-    # 1b. Set up the lakehouse connection (shared expression)
-    #     Required before adding Direct Lake tables and for Import M partitions.
-    # ------------------------------------------------------------------
-    from sempy_labs.directlake import generate_shared_expression
-
-    shared_expr = generate_shared_expression(
-        item_name=lakehouse,
-        item_type="Lakehouse",
-        workspace=lakehouse_workspace or workspace,
-    )
-
-    with connect_semantic_model(
-        dataset=name, workspace=workspace, readonly=False
-    ) as tom:
-        tom.add_expression(name="DatabaseQuery", expression=shared_expr)
-
-    # ------------------------------------------------------------------
-    # 2. Add tables — method depends on mode
-    # ------------------------------------------------------------------
-    if mode == "import":
-        _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspace)
+    print(flush=True)
+    if refresh_ok:
+        print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
     else:
-        _deploy_direct_lake_tables(name, table_names, workspace)
+        print(f"⚠ Semantic model '{actual_name}' deployed but refresh failed")
+    print(f"  Tables:        {n_tables}")
+    print(f"  Relationships: {n_rels}")
+    print(f"  Measures:      {n_measures}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 3. Apply the semantic layer from the VPAX: relationships, measures,
-    #    column metadata (format strings, folders, descriptions, etc.)
-    # ------------------------------------------------------------------
-    print("  Applying semantic layer from VPAX ...")
-    n_measures = 0
-    valid_rels = []
 
-    with connect_semantic_model(
-        dataset=name, workspace=workspace, readonly=False
-    ) as tom:
-        # --- Relationships ---
-        valid_rels = [
-            r for r in relationships
-            if r["from_table"] in table_names and r["to_table"] in table_names
+def _log_headers(headers):
+    """Format headers for logging, redacting authorization tokens."""
+    safe = {}
+    for k, v in headers.items():
+        if k.lower() in ("authorization", "x-ms-authorization"):
+            safe[k] = "Bearer ***"
+        else:
+            safe[k] = v
+    return safe
+
+
+def _log_request(method, url, resp):
+    """Log API request URI and response details."""
+    print(f"    {method} {url}", flush=True)
+    print(f"    → Request headers: {_log_headers(dict(resp.request.headers))}", flush=True)
+    print(f"    ← {resp.status_code} | Response headers: {dict(resp.headers)}", flush=True)
+
+
+def _deploy_bim(bim, name, workspace=None, overwrite=False):
+    """Deploy a model.bim via the Fabric REST API."""
+    import sempy.fabric as fabric
+    from sempy_labs._helper_functions import resolve_workspace_name_and_id
+    import time
+
+    (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
+    print(f"    Workspace: {ws_name} ({ws_id})", flush=True)
+
+    # Build model.bim payload
+    bim_json = json.dumps(bim, indent=2)
+    bim_b64 = base64.b64encode(bim_json.encode("utf-8")).decode("utf-8")
+
+    # Build definition.pbism
+    pbism = {
+        "version": "4.0",
+        "settings": {},
+    }
+    pbism_b64 = base64.b64encode(json.dumps(pbism).encode("utf-8")).decode("utf-8")
+
+    definition = {
+        "parts": [
+            {"path": "model.bim", "payload": bim_b64, "payloadType": "InlineBase64"},
+            {"path": "definition.pbism", "payload": pbism_b64, "payloadType": "InlineBase64"},
         ]
-        for rel in valid_rels:
-            try:
-                tom.add_relationship(
-                    from_table=rel["from_table"],
-                    from_column=rel["from_column"],
-                    to_table=rel["to_table"],
-                    to_column=rel["to_column"],
-                    from_cardinality=rel.get("from_cardinality", "Many"),
-                    to_cardinality=rel.get("to_cardinality", "One"),
-                    cross_filtering_behavior=rel.get("cross_filtering"),
-                    is_active=rel.get("is_active", True),
-                    security_filtering_behavior=rel.get("security_filtering"),
-                )
-            except Exception as e:
-                print(f"    ⚠ Relationship {rel['from_table']}.{rel['from_column']}"
-                      f" → {rel['to_table']}.{rel['to_column']}: {e}")
+    }
 
-        # --- Measures ---
-        for table in tables:
-            for m in table.get("measures", []):
-                if not m.get("expression"):
-                    continue
-                try:
-                    tom.add_measure(
-                        table_name=table["name"],
-                        measure_name=m["name"],
-                        expression=m["expression"],
-                        format_string=m.get("format_string"),
-                        hidden=m.get("is_hidden", False),
-                        description=m.get("description"),
-                        display_folder=m.get("display_folder"),
-                    )
-                    n_measures += 1
-                except Exception as e:
-                    print(f"    ⚠ Measure '{m['name']}': {e}")
+    # Check if model exists
+    client = fabric.FabricRestClient()
+    items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
+    existing = next((i for i in items if i["displayName"] == name), None)
 
-        # --- Column metadata overlay (from VPAX onto lakehouse schema) ---
-        _apply_column_metadata(tom, tables)
+    if existing:
+        print(f"    Existing model found: id={existing['id']}", flush=True)
+    else:
+        print(f"    No existing model '{name}' — will create", flush=True)
 
-    # ------------------------------------------------------------------
-    # 4. For import mode, refresh to pull data in
-    # ------------------------------------------------------------------
-    if mode == "import":
-        print("  Refreshing model (importing data) ...")
-        try:
-            sl.refresh_semantic_model(dataset=name, workspace=workspace)
-        except Exception as e:
-            print(f"    ⚠ Refresh: {e}")
-            print("    You may need to refresh manually from the Fabric UI.")
+    if existing and overwrite:
+        model_id = existing["id"]
+        url = f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition"
+        print(f"    Updating definition (overwrite=True) ...", flush=True)
+        resp = client.post(url, json={"definition": definition})
+        _log_request("POST", url, resp)
+        if resp.status_code not in (200, 202):
+            raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
 
-    print()
-    print(f"✓ Semantic model '{name}' deployed ({mode_label})")
-    print(f"  Tables:        {len(table_names)}")
-    print(f"  Relationships: {len(valid_rels)}")
-    print(f"  Measures:      {n_measures}")
+        if resp.status_code == 202:
+            _poll_async(client, resp)
 
+        return existing["displayName"]
 
-def _deploy_direct_lake_tables(name, table_names, workspace):
-    """Add tables in Direct Lake mode (entity partitions from lakehouse)."""
-    from sempy_labs.directlake import add_table_to_direct_lake_semantic_model
+    elif existing and not overwrite:
+        raise RuntimeError(
+            f"Semantic model '{name}' already exists in '{ws_name}'. "
+            f"Use overwrite=True or overwrite_model=True to replace it."
+        )
 
-    for tname in table_names:
-        print(f"  Adding table (Direct Lake): {tname}")
-        add_table_to_direct_lake_semantic_model(
-            dataset=name,
-            table_name=tname,
-            lakehouse_table_name=tname,
-            workspace=workspace,
-            refresh=False,
+    else:
+        # Create new
+        body = {
+            "displayName": name,
+            "type": "SemanticModel",
+            "definition": definition,
+        }
+        url = f"/v1/workspaces/{ws_id}/items"
+        print(f"    Creating new semantic model ...", flush=True)
+        resp = client.post(url, json=body)
+        _log_request("POST", url, resp)
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:500]}")
+
+        if resp.status_code == 202:
+            _poll_async(client, resp)
+
+        # Verify the model was actually created
+        time.sleep(3)
+        items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
+        created = next((i for i in items if i["displayName"] == name), None)
+        if created:
+            print(f"    ✓ Model created: id={created['id']}", flush=True)
+            return created["displayName"]
+
+        # Fallback: check if Fabric used the bim name instead
+        bim_name = bim.get("name", "")
+        created = next((i for i in items if i["displayName"] == bim_name), None)
+        if created:
+            print(f"    ✓ Model created (as '{bim_name}'): id={created['id']}", flush=True)
+            return created["displayName"]
+
+        # Model not found — deployment failed silently
+        all_names = [i["displayName"] for i in items]
+        raise RuntimeError(
+            f"Model '{name}' was not found after creation. "
+            f"Models in workspace: {all_names}"
         )
 
 
-_SLL_DATA_TYPE = {
-    "string": "String",
-    "int64": "Int64",
-    "double": "Double",
-    "datetime": "DateTime",
-    "boolean": "Boolean",
-    "binary": "Binary",
-}
+def _poll_async(client, resp):
+    """Poll an async Fabric REST API operation until completion."""
+    import time
+    location = resp.headers.get("Location", "")
+    retry_after = int(resp.headers.get("Retry-After", "5"))
+    if not location:
+        print(f"    No Location header — waiting 10s", flush=True)
+        time.sleep(10)
+        return
+
+    print(f"    Async operation — polling {location}", flush=True)
+    for attempt in range(60):
+        time.sleep(retry_after)
+        poll = client.get(location)
+
+        if attempt == 0:
+            # Log first poll request/response in detail
+            _log_request("GET", location, poll)
+
+        # Parse response body
+        body = {}
+        try:
+            body = poll.json()
+        except Exception:
+            pass
+
+        status = body.get("status", "")
+        pct = body.get("percentComplete", "")
+        error = body.get("error", {})
+
+        if poll.status_code == 200:
+            if status.lower() == "failed" or error:
+                print(f"    Poll #{attempt+1}: FAILED — response headers: {dict(poll.headers)}", flush=True)
+                err_msg = error.get("message", "") or body.get("failureReason", "") or str(body)[:500]
+                raise RuntimeError(f"Async operation failed: {err_msg}")
+            print(f"    Poll #{attempt+1}: completed (status={status or 'ok'})", flush=True)
+            return
+
+        if poll.status_code == 202:
+            retry_after = int(poll.headers.get("Retry-After", "5"))
+            detail = f"{pct}%" if pct != "" else status or "in progress"
+            print(f"    Poll #{attempt+1}: {detail}", flush=True)
+            continue
+
+        # Unexpected status
+        err_detail = body.get("error", {}).get("message", poll.text[:300])
+        raise RuntimeError(f"Async poll returned {poll.status_code}: {err_detail}")
+
+    raise RuntimeError("Async operation timed out after 60 poll attempts")
 
 
-def _deploy_import_tables(name, tables, workspace, lakehouse, lakehouse_workspace):
-    """Add tables in Import mode with M partitions reading from lakehouse."""
-    from sempy_labs.tom import connect_semantic_model
+# ---------------------------------------------------------------------------
+# TMDL offline generation (kept for version control / MCP import)
+# ---------------------------------------------------------------------------
 
-    # Shared expression is already set up by deploy_semantic_model
-    with connect_semantic_model(
-        dataset=name, workspace=workspace, readonly=False
-    ) as tom:
-        for table in tables:
-            tname = table["name"]
-            print(f"  Adding table (Import): {tname}")
-
-            # Create the table object
-            tom.add_table(name=tname)
-
-            # Add columns
-            for col in table.get("columns", []):
-                if col.get("is_calculated"):
-                    continue
-                dt = _SLL_DATA_TYPE.get(col["data_type"], "String")
-                tom.add_data_column(
-                    table_name=tname,
-                    column_name=col["name"],
-                    source_column=col["name"],
-                    data_type=dt,
-                )
-
-            # Add M partition that reads from the lakehouse
-            m_expr = (
-                f'let\n'
-                f'    Source = #"DatabaseQuery",\n'
-                f'    dbo_{tname} = Source{{[Schema="dbo",Item="{tname}"]}}[Data]\n'
-                f'in\n'
-                f'    dbo_{tname}'
-            )
-            tom.add_m_partition(
-                table_name=tname,
-                partition_name=tname,
-                expression=m_expr,
-                mode="Import",
-            )
-
-
-def _apply_column_metadata(tom, tables):
-    """Apply VPAX column metadata (format strings, folders, etc.) via TOM."""
-    for table in tables:
-        for col in table.get("columns", []):
-            try:
-                tom_col = tom.model.Tables[table["name"]].Columns[col["name"]]
-                if col.get("format_string"):
-                    tom_col.FormatString = col["format_string"]
-                if col.get("description"):
-                    tom_col.Description = col["description"]
-                if col.get("display_folder"):
-                    tom_col.DisplayFolder = col["display_folder"]
-                if col.get("is_hidden"):
-                    tom_col.IsHidden = True
-                if col.get("data_category"):
-                    tom_col.DataCategory = col["data_category"]
-                if col.get("sort_by_column"):
-                    try:
-                        sort_col = tom.model.Tables[table["name"]].Columns[col["sort_by_column"]]
-                        tom_col.SortByColumn = sort_col
-                    except Exception:
-                        pass
-            except Exception:
-                pass  # Column may not exist in the lakehouse
-
-
-def _write(path, content):
-    """Write content to a file, creating parent dirs."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+def build_tmdl(vpax_path, output_folder, **kwargs):
+    """Generate a TMDL folder from a .vpax file (offline, for version control)."""
+    # This is a simplified version — for full model fidelity, use deploy_semantic_model
+    raise NotImplementedError(
+        "build_tmdl is deprecated in favor of deploy_semantic_model which uses "
+        "the full Model.bim from the VPAX. For offline use, extract Model.bim "
+        "directly from the VPAX file."
+    )
