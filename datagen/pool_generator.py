@@ -197,9 +197,17 @@ def generate_sequential_int_pool(cardinality, start=1):
     return list(range(start, start + cardinality))
 
 
-def generate_prefixed_string_pool(cardinality, prefix="ID", seed=42):
-    """Generate a pool of prefixed sequential strings: PREFIX-001, PREFIX-002, ..."""
-    width = max(1, len(str(cardinality)))
+def generate_prefixed_string_pool(cardinality, prefix="ID", seed=42, avg_length=None):
+    """Generate a pool of prefixed sequential strings: PREFIX-001, PREFIX-002, ...
+
+    Width is derived from avg_length if provided (for consistency across
+    primary/foreign key pairs), otherwise from cardinality.
+    """
+    if avg_length is not None:
+        # avg_length = len(prefix) + 1 (dash) + width
+        width = max(1, avg_length - len(prefix) - 1)
+    else:
+        width = max(1, len(str(cardinality)))
     return [f"{prefix}-{str(i).zfill(width)}" for i in range(1, cardinality + 1)]
 
 
@@ -343,7 +351,10 @@ def generate_value_pool(col_config, global_seed=42, table_name=""):
             return generate_sequential_int_pool(cardinality, start=start)
         if key_style == "prefixed":
             prefix = dist.prefix or name[:4].upper()
-            return generate_prefixed_string_pool(cardinality, prefix=prefix, seed=col_seed)
+            return generate_prefixed_string_pool(
+                cardinality, prefix=prefix, seed=col_seed,
+                avg_length=dist.avg_length,
+            )
         if key_style == "guid":
             return generate_guid_pool(cardinality, seed=col_seed)
 
