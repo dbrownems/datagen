@@ -259,15 +259,20 @@ def deploy_semantic_model(
 
     # Refresh using the actual display name from the API
     print("  Refreshing model ...", flush=True)
+    refresh_ok = False
     try:
         sl.refresh_semantic_model(dataset=actual_name, workspace=workspace)
-        print("  Refresh complete.", flush=True)
+        print("    ✓ Refresh complete", flush=True)
+        refresh_ok = True
     except Exception as e:
-        err_msg = str(e)[:200]
-        print(f"    ⚠ Refresh: {err_msg}", flush=True)
+        err_msg = str(e)[:300]
+        print(f"    ✗ Refresh failed: {err_msg}", flush=True)
 
     print(flush=True)
-    print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
+    if refresh_ok:
+        print(f"✓ Semantic model '{actual_name}' deployed (Direct Lake on OneLake)")
+    else:
+        print(f"⚠ Semantic model '{actual_name}' deployed but refresh failed")
     print(f"  Tables:        {n_tables}")
     print(f"  Relationships: {n_rels}")
     print(f"  Measures:      {n_measures}", flush=True)
@@ -277,8 +282,10 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     """Deploy a model.bim via the Fabric REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
+    import time
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
+    print(f"    Workspace: {ws_name} ({ws_id})", flush=True)
 
     # Build model.bim payload
     bim_json = json.dumps(bim, indent=2)
@@ -303,40 +310,33 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
     items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
     existing = next((i for i in items if i["displayName"] == name), None)
 
+    if existing:
+        print(f"    Existing model found: id={existing['id']}", flush=True)
+    else:
+        print(f"    No existing model '{name}' — will create", flush=True)
+
     if existing and overwrite:
-        # Update existing model definition
         model_id = existing["id"]
+        print(f"    Updating definition (overwrite=True) ...", flush=True)
         resp = client.post(
             f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/updateDefinition",
             json={"definition": definition},
         )
+        print(f"    Update response: {resp.status_code}", flush=True)
         if resp.status_code not in (200, 202):
-            raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:300]}")
+            raise RuntimeError(f"Update failed ({resp.status_code}): {resp.text[:500]}")
 
-        # Wait for async update to complete
         if resp.status_code == 202:
-            import time
-            location = resp.headers.get("Location", "")
-            retry_after = int(resp.headers.get("Retry-After", "5"))
-            if location:
-                for _ in range(60):
-                    time.sleep(retry_after)
-                    poll = client.get(location)
-                    if poll.status_code == 200:
-                        break
-                    if poll.status_code == 202:
-                        retry_after = int(poll.headers.get("Retry-After", "5"))
-                        continue
-                    break
-            else:
-                time.sleep(10)
+            _poll_async(client, resp)
 
         return existing["displayName"]
+
     elif existing and not overwrite:
         raise RuntimeError(
             f"Semantic model '{name}' already exists in '{ws_name}'. "
             f"Use overwrite=True or overwrite_model=True to replace it."
         )
+
     else:
         # Create new
         body = {
@@ -344,41 +344,64 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
             "type": "SemanticModel",
             "definition": definition,
         }
+        print(f"    Creating new semantic model ...", flush=True)
         resp = client.post(f"/v1/workspaces/{ws_id}/items", json=body)
+        print(f"    Create response: {resp.status_code}", flush=True)
         if resp.status_code not in (200, 201, 202):
-            raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:300]}")
+            raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:500]}")
 
-        # Handle async creation (202) — poll until complete
         if resp.status_code == 202:
-            import time
-            location = resp.headers.get("Location", "")
-            retry_after = int(resp.headers.get("Retry-After", "5"))
-            if location:
-                for _ in range(60):  # max 5 minutes
-                    time.sleep(retry_after)
-                    poll = client.get(location)
-                    if poll.status_code == 200:
-                        break
-                    if poll.status_code == 202:
-                        retry_after = int(poll.headers.get("Retry-After", "5"))
-                        continue
-                    break
-            else:
-                time.sleep(10)  # fallback wait
+            _poll_async(client, resp)
 
-        # Find the actual item to get the display name
+        # Verify the model was actually created
+        time.sleep(3)
         items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
         created = next((i for i in items if i["displayName"] == name), None)
         if created:
+            print(f"    ✓ Model created: id={created['id']}", flush=True)
             return created["displayName"]
 
-        # Fallback: find by bim name in case Fabric used that
+        # Fallback: check if Fabric used the bim name instead
         bim_name = bim.get("name", "")
         created = next((i for i in items if i["displayName"] == bim_name), None)
         if created:
+            print(f"    ✓ Model created (as '{bim_name}'): id={created['id']}", flush=True)
             return created["displayName"]
 
-        return name
+        # Model not found — deployment failed silently
+        all_names = [i["displayName"] for i in items]
+        raise RuntimeError(
+            f"Model '{name}' was not found after creation. "
+            f"Models in workspace: {all_names}"
+        )
+
+
+def _poll_async(client, resp):
+    """Poll an async Fabric REST API operation until completion."""
+    import time
+    location = resp.headers.get("Location", "")
+    retry_after = int(resp.headers.get("Retry-After", "5"))
+    if not location:
+        print(f"    No Location header — waiting 10s", flush=True)
+        time.sleep(10)
+        return
+
+    print(f"    Async operation — polling ...", flush=True)
+    for attempt in range(60):
+        time.sleep(retry_after)
+        poll = client.get(location)
+        status = poll.json().get("status", "") if poll.status_code == 200 else ""
+        if poll.status_code == 200:
+            print(f"    Poll #{attempt+1}: completed (200)", flush=True)
+            return
+        if poll.status_code == 202:
+            retry_after = int(poll.headers.get("Retry-After", "5"))
+            pct = poll.json().get("percentComplete", "?") if poll.headers.get("Content-Type", "").startswith("application/json") else "?"
+            print(f"    Poll #{attempt+1}: in progress ({pct}%)", flush=True)
+            continue
+        print(f"    Poll #{attempt+1}: unexpected {poll.status_code}", flush=True)
+        break
+    print(f"    ⚠ Async polling timed out", flush=True)
 
 
 # ---------------------------------------------------------------------------
