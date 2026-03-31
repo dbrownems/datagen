@@ -241,9 +241,39 @@ def _find_model_name(model_json):
     return "Model"
 
 
+def _build_id_map(model_json):
+    """Build a map of $id → (table_name, column_name) for $ref resolution."""
+    id_map = {}
+    tables_data = _find_tables(model_json)
+    for table_data in tables_data:
+        tname = _get(table_data, "TableName", "Name", "name", "tableName", default="")
+        for col_data in _get(table_data, "Columns", "columns", default=[]):
+            cid = col_data.get("$id")
+            cname = _get(col_data, "ColumnName", "Name", "name", "columnName", default="")
+            if cid and cname:
+                id_map[str(cid)] = (tname, cname)
+    return id_map
+
+
+def _resolve_column_ref(value, id_map):
+    """Resolve a column reference — either a $ref dict, a plain string, or None."""
+    if isinstance(value, dict):
+        ref = value.get("$ref")
+        if ref and str(ref) in id_map:
+            return id_map[str(ref)]
+        return None
+    if isinstance(value, str):
+        return None  # handled separately via FromTableName/FromColumnName
+    return None
+
+
 def _parse_relationships(model_json):
-    """Extract relationship data from the VPAX model JSON."""
-    # Try top-level, then nested under Model
+    """Extract relationship data from the VPAX model JSON.
+
+    Handles two formats:
+    - Direct: FromTableName/FromColumnName as strings
+    - $ref: FromColumn/ToColumn as {"$ref": "id"} referencing column $id
+    """
     rels_data = _get(model_json, "Relationships", "relationships")
     if not rels_data:
         model = _get(model_json, "Model", "model")
@@ -253,17 +283,50 @@ def _parse_relationships(model_json):
     if not rels_data:
         return []
 
+    # Build $id map for resolving $ref references
+    id_map = _build_id_map(model_json)
+
     relationships = []
     for rel in rels_data:
-        from_card = _get(rel, "FromCardinality", "fromCardinality", default="Many")
-        to_card = _get(rel, "ToCardinality", "toCardinality", default="One")
+        # Try direct string names first
+        from_table = _get(rel, "FromTableName", "fromTableName", "FromTable", default="")
+        from_column = _get(rel, "FromColumnName", "fromColumnName", default="")
+        to_table = _get(rel, "ToTableName", "toTableName", "ToTable", default="")
+        to_column = _get(rel, "ToColumnName", "toColumnName", default="")
+
+        # If column is a dict ($ref), resolve it
+        if not from_column or isinstance(from_column, dict):
+            fc_val = _get(rel, "FromColumn", "fromColumn", default=None)
+            resolved = _resolve_column_ref(fc_val, id_map)
+            if resolved:
+                from_table, from_column = resolved
+
+        if not to_column or isinstance(to_column, dict):
+            tc_val = _get(rel, "ToColumn", "toColumn", default=None)
+            resolved = _resolve_column_ref(tc_val, id_map)
+            if resolved:
+                to_table, to_column = resolved
+
+        # Skip if we couldn't resolve
+        if not from_table or not from_column or not to_table or not to_column:
+            continue
+        # Ensure strings (not dicts)
+        if not isinstance(from_column, str) or not isinstance(to_column, str):
+            continue
+
+        from_card = _get(rel, "FromCardinality", "fromCardinality",
+                         "FromCardinalityType", default="Many")
+        to_card = _get(rel, "ToCardinality", "toCardinality",
+                        "ToCardinalityType", default="One")
         cross = _get(
             rel,
             "CrossFilteringBehavior", "crossFilteringBehavior",
             "CrossFilterDirection",
             default="OneDirection",
         )
-        is_active = _get(rel, "IsActive", "isActive", default=True)
+        is_active_raw = _get(rel, "IsActive", "isActive", default=None)
+        # In VPAX JSON: True = active, None/null/absent = inactive
+        is_active = (is_active_raw is True)
         sec = _get(
             rel,
             "SecurityFilteringBehavior", "securityFilteringBehavior",
@@ -271,10 +334,10 @@ def _parse_relationships(model_json):
         )
 
         relationships.append({
-            "from_table": _get(rel, "FromTableName", "fromTableName", "FromTable", default=""),
-            "from_column": _get(rel, "FromColumnName", "fromColumnName", "FromColumn", default=""),
-            "to_table": _get(rel, "ToTableName", "toTableName", "ToTable", default=""),
-            "to_column": _get(rel, "ToColumnName", "toColumnName", "ToColumn", default=""),
+            "from_table": str(from_table),
+            "from_column": str(from_column),
+            "to_table": str(to_table),
+            "to_column": str(to_column),
             "from_cardinality": str(from_card),
             "to_cardinality": str(to_card),
             "cross_filtering": str(cross),
@@ -298,12 +361,22 @@ def parse_vpax(vpax_path):
     """
     vpax_path = Path(vpax_path)
 
-    if not vpax_path.exists():
-        raise FileNotFoundError(f"VPAX file not found: {vpax_path}")
+    # Read the file — with fallback for FUSE mount issues
+    import io
+    try:
+        vpax_bytes = vpax_path.read_bytes()
+    except OSError:
+        try:
+            import notebookutils
+            vpax_bytes = notebookutils.fs.read(str(vpax_path))
+            if isinstance(vpax_bytes, str):
+                vpax_bytes = vpax_bytes.encode("latin-1")
+        except Exception:
+            raise FileNotFoundError(f"VPAX file not found or unreadable: {vpax_path}")
 
     model_json = None
 
-    with zipfile.ZipFile(vpax_path, "r") as zf:
+    with zipfile.ZipFile(io.BytesIO(vpax_bytes), "r") as zf:
         # Look for the model JSON file
         json_files = [
             n for n in zf.namelist()
