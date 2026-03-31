@@ -460,11 +460,11 @@ def generate_config(
 
         columns = []
         for col_meta in table_meta.get("columns", []):
-            # Skip hidden/calculated columns unless requested
+            # Skip hidden columns unless requested
             if col_meta.get("is_hidden", False) and not include_hidden:
                 continue
-            if col_meta.get("is_calculated", False) and not include_calculated:
-                continue
+            # Always include calculated columns — they'll be generated as
+            # regular data columns (Direct Lake doesn't support calculated columns)
 
             col_config = _infer_column_config(col_meta, row_count, relationship_columns, table_name)
             columns.append(col_config)
