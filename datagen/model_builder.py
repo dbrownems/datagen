@@ -431,10 +431,12 @@ def deploy_semantic_model(
         err_msg = str(e)[:300]
         print(f"    ✗ Refresh failed: {err_msg}", flush=True)
         # Get detailed error from refresh history
+        import time as _time2
+        _time2.sleep(3)  # let refresh history populate
         try:
             _print_refresh_errors(actual_name, workspace)
-        except Exception:
-            pass
+        except Exception as re:
+            print(f"    ⚠ Could not fetch refresh details: {re}", flush=True)
 
     print(flush=True)
     if refresh_ok:
@@ -473,38 +475,45 @@ def _print_refresh_errors(dataset, workspace=None):
     # Show errors from the most recent refresh
     latest = refreshes[0]
     status = latest.get("status", "")
-    if status.lower() != "failed":
-        return
 
-    print(f"    Refresh details (status={status}):", flush=True)
+    # Dump all keys so we can see what's available
+    if status.lower() not in ("completed", "succeeded"):
+        print(f"    Refresh details (status={status}):", flush=True)
 
-    # Check for top-level error
-    for key in ("serviceExceptionJson", "error", "messages"):
-        val = latest.get(key)
-        if val:
-            if isinstance(val, str):
-                print(f"      {val[:500]}", flush=True)
-            elif isinstance(val, list):
-                for msg in val[:5]:
-                    if isinstance(msg, dict):
-                        print(f"      {msg.get('message', msg)}", flush=True)
-                    else:
-                        print(f"      {msg}", flush=True)
-            elif isinstance(val, dict):
-                print(f"      {json.dumps(val, indent=2)[:500]}", flush=True)
+        # Check for top-level error
+        for key in ("serviceExceptionJson", "error", "messages", "extendedStatus"):
+            val = latest.get(key)
+            if val:
+                if isinstance(val, str):
+                    print(f"      {key}: {val[:500]}", flush=True)
+                elif isinstance(val, list):
+                    for msg in val[:5]:
+                        if isinstance(msg, dict):
+                            print(f"      {msg.get('message', msg)}", flush=True)
+                        else:
+                            print(f"      {msg}", flush=True)
+                elif isinstance(val, dict):
+                    print(f"      {key}: {json.dumps(val, indent=2)[:500]}", flush=True)
 
-    # Check per-object errors
-    for obj in latest.get("objects", []):
-        obj_status = obj.get("status", "")
-        if obj_status.lower() in ("failed", "error"):
-            table = obj.get("table", "?")
-            partition = obj.get("partition", "?")
-            msgs = obj.get("messages", [])
-            for msg in msgs[:3]:
-                if isinstance(msg, dict):
-                    print(f"      {table}/{partition}: {msg.get('message', msg)}", flush=True)
+        # Check per-object errors
+        for obj in latest.get("objects", []):
+            obj_status = obj.get("status", "")
+            if obj_status.lower() not in ("completed", "succeeded", ""):
+                table = obj.get("table", "?")
+                partition = obj.get("partition", "?")
+                msgs = obj.get("messages", [])
+                if msgs:
+                    for msg in msgs[:3]:
+                        if isinstance(msg, dict):
+                            print(f"      {table}: {msg.get('message', msg)}", flush=True)
+                        else:
+                            print(f"      {table}: {msg}", flush=True)
                 else:
-                    print(f"      {table}/{partition}: {msg}", flush=True)
+                    print(f"      {table}: status={obj_status}", flush=True)
+
+        # If nothing printed, dump the raw response
+        if not any(latest.get(k) for k in ("serviceExceptionJson", "error", "messages", "objects")):
+            print(f"      Raw: {json.dumps(latest, indent=2)[:800]}", flush=True)
 
 
 def _deploy_bim(bim, name, workspace=None, overwrite=False):
