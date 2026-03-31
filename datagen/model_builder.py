@@ -84,6 +84,83 @@ def _get_lakehouse_info(lakehouse=None, workspace=None):
     }
 
 
+def _add_missing_bim_columns(config, bim):
+    """Add columns from Model.bim that are missing from the generation config.
+
+    The VPAX DaxModel.json stats may not include all columns (e.g. some
+    calculated columns). The BIM is authoritative — ensure every column
+    in the BIM has a corresponding column in the generation config so it
+    gets generated in the Delta table.
+    """
+    from .config import ColumnConfig, DistributionConfig
+
+    _CALC_TYPES = {"calculated", "calculatedTableColumn"}
+    _SKIP_TYPES = {"rowNumber"}
+    _BIM_TO_CONFIG_TYPE = {
+        "string": "string", "int64": "int64", "double": "double",
+        "boolean": "boolean", "dateTime": "datetime", "decimal": "double",
+    }
+
+    bim_model = bim.get("model", bim)
+
+    # Build lookup: table_name → set of column names in config
+    config_cols = {}
+    tables_list = config.tables if hasattr(config, "tables") else config.get("tables", [])
+    for tc in tables_list:
+        tname = tc.name if hasattr(tc, "name") else tc["name"]
+        cols = tc.columns if hasattr(tc, "columns") else tc.get("columns", [])
+        config_cols[tname] = {
+            (c.name if hasattr(c, "name") else c["name"])
+            for c in cols
+        }
+
+    n_added = 0
+    for bim_table in bim_model.get("tables", []):
+        tname = bim_table["name"]
+        if tname not in config_cols:
+            continue
+
+        existing = config_cols[tname]
+        # Find the config table object to append to
+        config_table = None
+        for tc in tables_list:
+            if (tc.name if hasattr(tc, "name") else tc["name"]) == tname:
+                config_table = tc
+                break
+        if config_table is None:
+            continue
+
+        for bim_col in bim_table.get("columns", []):
+            col_type = bim_col.get("type")
+            if col_type in _SKIP_TYPES:
+                continue
+            col_name = bim_col["name"]
+            if col_name in existing:
+                continue
+
+            # This column is in the BIM but not in the config — add it
+            data_type = _BIM_TO_CONFIG_TYPE.get(
+                bim_col.get("dataType", "string"), "string"
+            )
+            new_col = ColumnConfig(
+                name=col_name,
+                data_type=data_type,
+                cardinality=min(10, config_table.row_count if hasattr(config_table, "row_count") else config_table.get("row_count", 100)),
+                distribution=DistributionConfig(
+                    avg_length=12 if data_type == "string" else None,
+                    style="docker" if data_type == "string" else None,
+                ),
+            )
+            if hasattr(config_table, "columns"):
+                config_table.columns.append(new_col)
+            else:
+                config_table["columns"].append(new_col)
+            existing.add(col_name)
+            n_added += 1
+
+    return n_added
+
+
 def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     """Modify a model.bim to use Direct Lake on OneLake.
 
@@ -97,11 +174,9 @@ def _strip_unknown_bim_properties(bim):
     """Clean BIM JSON for TOM deserialization and Fabric import.
 
     Converts calculated columns to data columns (Direct Lake doesn't
-    support them — we generated the values in the Delta tables).
-    Strips any column properties not recognized by the Fabric runtime's
-    TOM version.
+    support them — we generate the values in the Delta tables).
+    Strips unknown column properties.
     """
-    # Properties recognized by TOM on data columns
     _KNOWN_COL_PROPS = {
         "name", "type", "dataType", "sourceColumn", "description", "isHidden",
         "displayFolder", "formatString", "dataCategory", "sortByColumn",
@@ -110,7 +185,6 @@ def _strip_unknown_bim_properties(bim):
         "isDefaultImage", "alignment", "tableDetailPosition",
         "isAvailableInMDX", "groupByColumns", "alternateOf", "encodingHint",
     }
-    # RowNumber columns have a minimal set
     _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
                      "isUnique", "isNullable", "lineageTag"}
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
@@ -131,13 +205,11 @@ def _strip_unknown_bim_properties(bim):
                 n_converted += 1
 
             elif col_type == "rowNumber":
-                # Strip anything invalid on rowNumber columns
                 unknown = [k for k in col if k not in _ROWNUM_PROPS]
                 for k in unknown:
                     col.pop(k)
 
             else:
-                # Data column — strip unknown props, ensure sourceColumn
                 unknown = [k for k in col if k not in _KNOWN_COL_PROPS]
                 for k in unknown:
                     col.pop(k)
