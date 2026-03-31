@@ -94,10 +94,14 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 
 
 def _strip_unknown_bim_properties(bim):
-    """Remove properties from the BIM that older TOM versions don't recognize."""
-    # Properties introduced in newer compatibility levels that may not be
-    # supported by the TOM assembly in the current Fabric runtime
-    _UNKNOWN_COL_PROPS = {"relatedColumnDetails"}
+    """Remove properties from the BIM JSON that Fabric may not accept.
+
+    Strips properties that are either too new for the runtime's TOM version
+    or that the Fabric import API rejects.
+    """
+    _UNKNOWN_COL_PROPS = {
+        "relatedColumnDetails", "isNameInferred", "isDataTypeInferred",
+    }
 
     model = bim.get("model", bim)
     for table in model.get("tables", []):
@@ -108,7 +112,10 @@ def _strip_unknown_bim_properties(bim):
 
 
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
-    """Modify model.bim using .NET TOM (Tabular Object Model)."""
+    """Modify model.bim using .NET TOM (Tabular Object Model).
+
+    Returns the TOM Database object (caller serializes to TMDL for deployment).
+    """
     # Bootstrap .NET runtime via sempy (handles Fabric CLR setup)
     import sempy.fabric as fabric
     fabric.create_tom_server()
@@ -153,7 +160,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         for table in model.Tables:
             if table.Name in filter_set:
                 continue
-            # Keep measure-only tables
             has_data_cols = any(
                 col.Type != ColumnType.RowNumber
                 for col in table.Columns
@@ -175,7 +181,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         has_delta = filter_set is None or tname in filter_set
 
         if not has_delta:
-            # Measure-only table — clear partitions
             table.Partitions.Clear()
             continue
 
@@ -196,7 +201,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
             if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
                 col.Type = ColumnType.Data
                 col.SourceColumn = col.Name
-                # Clear DAX expression if it's a calculated column
                 try:
                     col.Expression = None
                 except Exception:
@@ -219,15 +223,49 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     # Update compatibility level
     db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
 
-    # Serialize back to JSON dict
-    result_json = JsonSerializer.SerializeDatabase(db)
-    result_bim = json.loads(result_json)
-
     n_tables = model.Tables.Count
     n_rels = model.Relationships.Count
-    print(f"    TOM: {n_tables} tables, {n_rels} relationships processed", flush=True)
+    n_measures = sum(t.Measures.Count for t in model.Tables)
+    print(f"    TOM: {n_tables} tables, {n_rels} relationships, {n_measures} measures", flush=True)
 
-    return result_bim, expr_name
+    return db, expr_name
+
+
+def _serialize_to_tmdl_parts(db):
+    """Serialize a TOM Database to TMDL and return Items API definition parts."""
+    import tempfile, os
+
+    import clr
+    clr.AddReference("Microsoft.AnalysisServices.Tabular")
+    from Microsoft.AnalysisServices.Tabular import TmdlSerializer
+
+    with tempfile.TemporaryDirectory() as tmdl_dir:
+        TmdlSerializer.SerializeDatabaseToFolder(db, tmdl_dir)
+
+        parts = []
+        # Add definition.pbism
+        pbism = json.dumps({"version": "4.0", "settings": {}})
+        parts.append({
+            "path": "definition.pbism",
+            "payload": base64.b64encode(pbism.encode("utf-8")).decode("utf-8"),
+            "payloadType": "InlineBase64",
+        })
+
+        # Walk the TMDL folder and add each file as a part
+        for root, _dirs, files in os.walk(tmdl_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                rel_path = os.path.relpath(fpath, tmdl_dir).replace("\\", "/")
+                with open(fpath, "rb") as f:
+                    content = f.read()
+                parts.append({
+                    "path": f"definition/{rel_path}",
+                    "payload": base64.b64encode(content).decode("utf-8"),
+                    "payloadType": "InlineBase64",
+                })
+
+        print(f"    TMDL: {len(parts)} definition parts", flush=True)
+        return {"parts": parts}
 
 
 def deploy_semantic_model(
@@ -282,27 +320,26 @@ def deploy_semantic_model(
     print("  Resolving lakehouse connection ...", flush=True)
     lh_info = _get_lakehouse_info(lakehouse, lakehouse_workspace or workspace)
 
-    # Modify the BIM for Direct Lake
+    # Modify the BIM for Direct Lake (returns TOM Database object)
     print("  Converting model to Direct Lake on OneLake ...", flush=True)
-    bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+    db, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
 
-    # Update model name in the bim (strip .pbix and use our clean name)
-    bim["name"] = name
-    if "model" in bim and isinstance(bim["model"], dict):
-        bim["model"]["name"] = name
-    model = bim.get("model", bim)
+    # Update model name
+    db.Name = name
+    db.Model.Name = name
 
-    n_tables = len(model.get("tables", []))
-    n_rels = len(model.get("relationships", []))
-    n_measures = sum(
-        len(t.get("measures", []))
-        for t in model.get("tables", [])
-    )
+    n_tables = db.Model.Tables.Count
+    n_rels = db.Model.Relationships.Count
+    n_measures = sum(t.Measures.Count for t in db.Model.Tables)
+
+    # Serialize to TMDL parts for the Items API
+    print("  Serializing to TMDL ...", flush=True)
+    definition = _serialize_to_tmdl_parts(db)
 
     # Deploy via Fabric REST API
     print(f"  Deploying '{name}' ({n_tables} tables, {n_rels} relationships, {n_measures} measures) ...", flush=True)
 
-    actual_name = _deploy_bim(bim, name, workspace, overwrite)
+    actual_name = _deploy_tmdl(definition, name, workspace, overwrite)
 
     # Refresh using the actual display name from the API
     print("  Refreshing model ...", flush=True)
@@ -325,28 +362,13 @@ def deploy_semantic_model(
     print(f"  Measures:      {n_measures}", flush=True)
 
 
-def _deploy_bim(bim, name, workspace=None, overwrite=False):
-    """Deploy a model.bim via the Fabric REST API."""
+def _deploy_tmdl(definition, name, workspace=None, overwrite=False):
+    """Deploy a semantic model definition (TMDL parts) via the Fabric REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
     import time
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
-
-    # Build model.bim payload
-    bim_json = json.dumps(bim, indent=2)
-    bim_b64 = base64.b64encode(bim_json.encode("utf-8")).decode("utf-8")
-
-    # Build definition.pbism
-    pbism = {"version": "4.0", "settings": {}}
-    pbism_b64 = base64.b64encode(json.dumps(pbism).encode("utf-8")).decode("utf-8")
-
-    definition = {
-        "parts": [
-            {"path": "model.bim", "payload": bim_b64, "payloadType": "InlineBase64"},
-            {"path": "definition.pbism", "payload": pbism_b64, "payloadType": "InlineBase64"},
-        ]
-    }
 
     # Check if model exists
     client = fabric.FabricRestClient()
@@ -389,9 +411,6 @@ def _deploy_bim(bim, name, workspace=None, overwrite=False):
         time.sleep(3)
         items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
         created = next((i for i in items if i["displayName"] == name), None)
-        if not created:
-            bim_name = bim.get("name", "")
-            created = next((i for i in items if i["displayName"] == bim_name), None)
         if created:
             return created["displayName"]
 
