@@ -480,8 +480,12 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
 
     # Detect schema-enabled lakehouse (Tables/dbo/ exists)
     if out_path.rstrip("/") == "Tables":
-        if _fs_exists("/lakehouse/default/Tables/dbo"):
-            out_path = "Tables/dbo/"
+        try:
+            top_dirs = _fs_list_dirs("/lakehouse/default/Tables")
+            if "dbo" in top_dirs:
+                out_path = "Tables/dbo/"
+        except Exception:
+            pass
 
     n = len(tables)
     total_rows = sum(
