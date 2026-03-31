@@ -87,13 +87,134 @@ def _get_lakehouse_info(lakehouse=None, workspace=None):
 def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     """Modify a model.bim to use Direct Lake on OneLake.
 
-    - Replaces all table partitions with entity partitions pointing at
-      OneLake Delta tables (using sanitized folder names).
-    - Replaces expressions with a single OneLake data source.
-    - Removes incompatible Import-mode settings.
-    - Preserves everything else: relationships, measures, columns,
-      hierarchies, roles, annotations, etc.
+    Uses the .NET TOM (Tabular Object Model) library to properly deserialize,
+    modify, and reserialize the BIM — avoiding fragile JSON key matching.
+    Falls back to direct JSON manipulation if TOM is unavailable.
     """
+    try:
+        return _modify_bim_via_tom(bim, lh_info, table_filter)
+    except Exception as e:
+        print(f"    ⚠ TOM not available ({e}), falling back to JSON manipulation", flush=True)
+        return _modify_bim_via_json(bim, lh_info, table_filter)
+
+
+def _modify_bim_via_tom(bim, lh_info, table_filter=None):
+    """Modify model.bim using .NET TOM (Tabular Object Model)."""
+    import clr
+    clr.AddReference("Microsoft.AnalysisServices.Tabular")
+    from Microsoft.AnalysisServices.Tabular import (
+        JsonSerializer, Database, ColumnType, EntityPartitionSource,
+        MPartitionSource, NamedExpression,
+    )
+
+    bim_json = json.dumps(bim, indent=2)
+    db = JsonSerializer.DeserializeDatabase(bim_json)
+    model = db.Model
+
+    # Build the OneLake expression
+    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    expr_name = f"DirectLake - {lh_info['lh_name']}"
+    schema = lh_info.get("default_schema", "dbo")
+
+    # Replace all expressions with our single OneLake source
+    model.Expressions.Clear()
+    expr = NamedExpression()
+    expr.Name = expr_name
+    expr.Kind = "m"
+    expr.Expression = (
+        "let\n"
+        f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])\n'
+        "in\n"
+        "    Source"
+    )
+    model.Expressions.Add(expr)
+
+    # Build filter set
+    filter_set = set(table_filter) if table_filter is not None else None
+
+    # Remove tables not in filter (keep measure-only tables)
+    if filter_set is not None:
+        tables_to_remove = []
+        for table in model.Tables:
+            if table.Name in filter_set:
+                continue
+            # Keep measure-only tables
+            has_data_cols = any(
+                col.Type != ColumnType.RowNumber
+                for col in table.Columns
+                if col.Type not in (ColumnType.Calculated, ColumnType.CalculatedTableColumn)
+            )
+            has_measures = table.Measures.Count > 0
+            if has_measures and not has_data_cols:
+                continue
+            if not has_measures and not has_data_cols:
+                continue
+            tables_to_remove.append(table.Name)
+        for tname in tables_to_remove:
+            model.Tables.Remove(tname)
+
+    # Modify each table for Direct Lake
+    for table in model.Tables:
+        tname = table.Name
+        safe_name = _safe_folder_name(tname)
+        has_delta = filter_set is None or tname in filter_set
+
+        if not has_delta:
+            # Measure-only table — clear partitions
+            table.Partitions.Clear()
+            continue
+
+        # Replace partitions with Direct Lake entity partition
+        table.Partitions.Clear()
+        part = table.Partitions.Add(tname)
+        source = EntityPartitionSource()
+        source.EntityName = safe_name
+        source.SchemaName = schema
+        source.ExpressionSource = model.Expressions[expr_name]
+        part.Source = source
+
+        # Convert calculated columns to data columns
+        n_converted = 0
+        for col in table.Columns:
+            if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
+                col.Type = ColumnType.Data
+                col.SourceColumn = col.Name
+                # Clear DAX expression if it's a calculated column
+                try:
+                    col.Expression = None
+                except Exception:
+                    pass
+                n_converted += 1
+            elif col.Type == ColumnType.Data:
+                col.SourceColumn = col.Name
+            col.SourceProviderType = None
+
+        if n_converted:
+            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
+
+    # Remove query groups
+    if hasattr(model, "QueryGroups") and model.QueryGroups is not None:
+        model.QueryGroups.Clear()
+
+    # Set Direct Lake compatible options
+    model.DefaultPowerBIDataSourceVersion = "powerBI_V3"
+
+    # Update compatibility level
+    db.CompatibilityLevel = max(db.CompatibilityLevel, 1604)
+
+    # Serialize back to JSON dict
+    result_json = JsonSerializer.SerializeDatabase(db)
+    result_bim = json.loads(result_json)
+
+    n_tables = model.Tables.Count
+    n_rels = model.Relationships.Count
+    print(f"    TOM: {n_tables} tables, {n_rels} relationships processed", flush=True)
+
+    return result_bim, expr_name
+
+
+def _modify_bim_via_json(bim, lh_info, table_filter=None):
+    """Fallback: modify model.bim via direct JSON manipulation."""
     model = bim.get("model", bim)
 
     # Build the OneLake expression
@@ -162,19 +283,21 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
             }
         ]
 
-        # Process columns: convert calculated → data, fix sourceColumn
+        # Process columns: convert any non-data columns to data columns
+        # Direct Lake only supports regular data columns sourced from Delta
+        # BIM uses "calculated", "calculatedTableColumn", etc.
         n_converted = 0
         for col in table.get("columns", []):
             col.pop("sourceProviderType", None)
-            if col.get("type") == "calculated":
+            col_type = col.get("type")
+            if col_type and col_type != "data":
                 col.pop("type", None)
                 col.pop("expression", None)
                 n_converted += 1
-            if "sourceColumn" in col or col.get("type", "data") == "data":
-                col["sourceColumn"] = col["name"]
+            col["sourceColumn"] = col["name"]
 
         if n_converted:
-            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
+            print(f"    {tname}: converted {n_converted} calculated/non-data column(s) to data", flush=True)
 
     # Remove query groups (import-mode M query organization)
     model.pop("queryGroups", None)
