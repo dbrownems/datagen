@@ -123,7 +123,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, ColumnType, Partition, DataColumn,
+        JsonSerializer, ColumnType, Partition,
         EntityPartitionSource, NamedExpression,
         ExpressionKind, PowerBIDataSourceVersion,
     )
@@ -201,82 +201,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
                 col.SourceColumn = col.Name
                 col.SourceProviderType = None
 
-    # Replace calculated columns globally (two-pass to handle cross-table relationships).
-    # Pass 1: collect ALL calc columns and ALL affected relationships
-    from Microsoft.AnalysisServices.Tabular import SingleColumnRelationship
-
-    all_calc_cols = []  # (table, old_col) pairs
-    for table in model.Tables:
-        for col in table.Columns:
-            if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
-                all_calc_cols.append((table, col))
-
-    if all_calc_cols:
-        calc_col_keys = {(t.Name, c.Name) for t, c in all_calc_cols}
-
-        # Save all relationships touching calc columns
-        saved_rels = []
-        for rel in model.Relationships:
-            from_key = (rel.FromTable.Name, rel.FromColumn.Name)
-            to_key = (rel.ToTable.Name, rel.ToColumn.Name)
-            if from_key in calc_col_keys or to_key in calc_col_keys:
-                saved_rels.append({
-                    "name": rel.Name,
-                    "fromTable": rel.FromTable.Name,
-                    "fromColumn": rel.FromColumn.Name,
-                    "toTable": rel.ToTable.Name,
-                    "toColumn": rel.ToColumn.Name,
-                    "isActive": rel.IsActive,
-                    "crossFilteringBehavior": rel.CrossFilteringBehavior,
-                    "fromCardinality": rel.FromCardinality,
-                    "toCardinality": rel.ToCardinality,
-                })
-
-        # Pass 2: replace all calc columns with DataColumns
-        for table, old_col in all_calc_cols:
-            new_col = DataColumn()
-            new_col.Name = old_col.Name
-            new_col.DataType = old_col.DataType
-            new_col.SourceColumn = old_col.Name
-            new_col.IsHidden = old_col.IsHidden
-            if old_col.Description:
-                new_col.Description = old_col.Description
-            if old_col.DisplayFolder:
-                new_col.DisplayFolder = old_col.DisplayFolder
-            if old_col.FormatString:
-                new_col.FormatString = old_col.FormatString
-            if old_col.DataCategory:
-                new_col.DataCategory = old_col.DataCategory
-            for ann in old_col.Annotations:
-                new_col.Annotations.Add(ann.Clone())
-
-            table.Columns.Remove(old_col.Name)
-            table.Columns.Add(new_col)
-
-        # Pass 3: restore cascade-deleted relationships
-        existing_rel_names = {r.Name for r in model.Relationships}
-        n_restored = 0
-        for rinfo in saved_rels:
-            if rinfo["name"] in existing_rel_names:
-                continue
-            try:
-                rel = SingleColumnRelationship()
-                rel.Name = rinfo["name"]
-                rel.FromColumn = model.Tables[rinfo["fromTable"]].Columns[rinfo["fromColumn"]]
-                rel.ToColumn = model.Tables[rinfo["toTable"]].Columns[rinfo["toColumn"]]
-                rel.IsActive = rinfo["isActive"]
-                rel.CrossFilteringBehavior = rinfo["crossFilteringBehavior"]
-                rel.FromCardinality = rinfo["fromCardinality"]
-                rel.ToCardinality = rinfo["toCardinality"]
-                model.Relationships.Add(rel)
-                n_restored += 1
-            except Exception as e:
-                print(f"    ⚠ Could not restore relationship {rinfo['name']}: {e}", flush=True)
-
-        print(f"    Replaced {len(all_calc_cols)} calculated column(s) across {len({t.Name for t, _ in all_calc_cols})} table(s)", flush=True)
-        if saved_rels:
-            print(f"    Restored {n_restored}/{len(saved_rels)} relationship(s)", flush=True)
-
     # Remove query groups
     if hasattr(model, "QueryGroups") and model.QueryGroups is not None:
         model.QueryGroups.Clear()
@@ -293,6 +217,93 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     print(f"    TOM: {n_tables} tables, {n_rels} relationships, {n_measures} measures", flush=True)
 
     return db, expr_name
+
+
+def _convert_calc_columns_in_tmdl(content):
+    """Convert calculated columns to data columns in TMDL text.
+
+    In TMDL, a calculated column looks like:
+        calculatedColumn 'Name'
+            expression = ...
+            columnOrigin = ...
+
+    A data column looks like:
+        column 'Name'
+            sourceColumn: Name
+
+    We replace the keyword, remove calc-only properties, and add sourceColumn.
+    """
+    import re
+
+    lines = content.split("\n")
+    result = []
+    i = 0
+    n_converted = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Detect calculatedColumn or calculatedTableColumn
+        match = re.match(r'^(\t+)(calculatedColumn|calculatedTableColumn)\s+(.*)', line)
+        if match:
+            indent = match.group(1)
+            col_ref = match.group(3)  # e.g. "'GPS Flag'" or "Name"
+            n_converted += 1
+
+            # Extract the column name from the reference for sourceColumn
+            col_name = col_ref.strip().strip("'")
+
+            # Write as regular column
+            result.append(f"{indent}column {col_ref}")
+
+            # Process the column's body — skip calc-only properties, add sourceColumn
+            i += 1
+            body_indent = indent + "\t"
+            added_source = False
+
+            while i < len(lines):
+                bline = lines[i]
+                bstripped = bline.lstrip()
+
+                # Check if we've exited the column block (same or less indent)
+                if bline.strip() and not bline.startswith(body_indent):
+                    break
+
+                # Skip calc-only properties
+                prop_name = bstripped.split(":")[0].split(" ")[0].split("=")[0].strip()
+                if prop_name in ("expression", "columnOrigin", "isNameInferred",
+                                 "isDataTypeInferred"):
+                    # Skip multi-line expressions (```...```)
+                    if "```" in bstripped:
+                        i += 1
+                        while i < len(lines) and "```" not in lines[i]:
+                            i += 1
+                        i += 1  # skip closing ```
+                    else:
+                        i += 1
+                    continue
+
+                # Add sourceColumn before the first property if not yet added
+                if not added_source and bstripped.startswith("dataType"):
+                    result.append(bline)
+                    i += 1
+                    result.append(f"{body_indent}sourceColumn: {col_name}")
+                    added_source = True
+                    continue
+
+                result.append(bline)
+                i += 1
+
+            if not added_source:
+                result.append(f"{body_indent}sourceColumn: {col_name}")
+
+            continue
+
+        result.append(line)
+        i += 1
+
+    return "\n".join(result), n_converted
 
 
 def _serialize_to_tmdl_parts(db):
@@ -315,19 +326,28 @@ def _serialize_to_tmdl_parts(db):
             "payloadType": "InlineBase64",
         })
 
-        # Walk the TMDL folder and add each file as a part
+        # Walk the TMDL folder, post-process table files, add each as a part
+        total_converted = 0
         for root, _dirs, files in os.walk(tmdl_dir):
             for fname in files:
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, tmdl_dir).replace("\\", "/")
-                with open(fpath, "rb") as f:
+                with open(fpath, "r", encoding="utf-8") as f:
                     content = f.read()
+
+                # Convert calculated columns to data columns in table TMDL files
+                if rel_path.startswith("tables/") and fname.endswith(".tmdl"):
+                    content, n = _convert_calc_columns_in_tmdl(content)
+                    total_converted += n
+
                 parts.append({
                     "path": f"definition/{rel_path}",
-                    "payload": base64.b64encode(content).decode("utf-8"),
+                    "payload": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
                     "payloadType": "InlineBase64",
                 })
 
+        if total_converted:
+            print(f"    TMDL: converted {total_converted} calculated column(s) to data", flush=True)
         print(f"    TMDL: {len(parts)} definition parts", flush=True)
         return {"parts": parts}
 
