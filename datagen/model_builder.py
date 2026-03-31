@@ -162,12 +162,22 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
         ]
 
         # Remove import-mode column source properties that conflict
+        # Convert calculated columns to regular data columns (we generated
+        # the values in the Delta table, so they're no longer calculated)
+        n_converted = 0
         for col in table.get("columns", []):
-            # sourceColumn must match column name for Direct Lake
             if "sourceColumn" in col:
                 col["sourceColumn"] = col["name"]
-            # Remove any import-specific properties
             col.pop("sourceProviderType", None)
+
+            if col.get("type") == "calculated":
+                col.pop("type", None)         # default type = "data"
+                col.pop("expression", None)    # DAX expression no longer needed
+                col["sourceColumn"] = col["name"]
+                n_converted += 1
+
+        if n_converted:
+            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
 
     # Remove query groups (import-mode M query organization)
     model.pop("queryGroups", None)
