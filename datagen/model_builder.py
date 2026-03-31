@@ -123,7 +123,7 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     import clr
     clr.AddReference("Microsoft.AnalysisServices.Tabular")
     from Microsoft.AnalysisServices.Tabular import (
-        JsonSerializer, ColumnType, Partition,
+        JsonSerializer, ColumnType, Partition, DataColumn,
         EntityPartitionSource, NamedExpression,
         ExpressionKind, PowerBIDataSourceVersion,
     )
@@ -195,23 +195,43 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
         part.Source = source
         table.Partitions.Add(part)
 
-        # Convert calculated columns to data columns
-        n_converted = 0
+        # Replace calculated columns with proper DataColumn objects.
+        # Mutating col.Type doesn't change the CLR object — a CalculatedTableColumn
+        # still serializes its own properties (columnOrigin, etc.).
+        calc_cols = []
         for col in table.Columns:
             if col.Type in (ColumnType.Calculated, ColumnType.CalculatedTableColumn):
-                col.Type = ColumnType.Data
-                col.SourceColumn = col.Name
-                try:
-                    col.Expression = None
-                except Exception:
-                    pass
-                n_converted += 1
+                calc_cols.append(col)
             elif col.Type == ColumnType.Data:
                 col.SourceColumn = col.Name
-            col.SourceProviderType = None
+                col.SourceProviderType = None
 
-        if n_converted:
-            print(f"    {tname}: converted {n_converted} calculated column(s) to data", flush=True)
+        for old_col in calc_cols:
+            new_col = DataColumn()
+            new_col.Name = old_col.Name
+            new_col.DataType = old_col.DataType
+            new_col.SourceColumn = old_col.Name
+            new_col.IsHidden = old_col.IsHidden
+            if old_col.Description:
+                new_col.Description = old_col.Description
+            if old_col.DisplayFolder:
+                new_col.DisplayFolder = old_col.DisplayFolder
+            if old_col.FormatString:
+                new_col.FormatString = old_col.FormatString
+            if old_col.DataCategory:
+                new_col.DataCategory = old_col.DataCategory
+            if old_col.SortByColumn is not None:
+                new_col.SortByColumn = old_col.SortByColumn
+
+            # Copy annotations
+            for ann in old_col.Annotations:
+                new_col.Annotations.Add(ann.Clone())
+
+            table.Columns.Remove(old_col.Name)
+            table.Columns.Add(new_col)
+
+        if calc_cols:
+            print(f"    {tname}: replaced {len(calc_cols)} calculated column(s) with DataColumn", flush=True)
 
     # Remove query groups
     if hasattr(model, "QueryGroups") and model.QueryGroups is not None:
@@ -229,27 +249,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     print(f"    TOM: {n_tables} tables, {n_rels} relationships, {n_measures} measures", flush=True)
 
     return db, expr_name
-
-
-def _strip_tmdl_unknown_properties(content):
-    """Remove lines with properties Fabric's import API doesn't accept.
-
-    TMDL is indented text — unknown properties appear as indented key: value lines.
-    We strip entire lines that start with a known-bad property name.
-    """
-    _UNKNOWN_PROPS = {
-        "columnOrigin", "relatedColumnDetails", "isNameInferred",
-        "isDataTypeInferred",
-    }
-    lines = content.split("\n")
-    filtered = []
-    for line in lines:
-        stripped = line.lstrip()
-        prop_name = stripped.split(":")[0].split(" ")[0] if stripped else ""
-        if prop_name in _UNKNOWN_PROPS:
-            continue
-        filtered.append(line)
-    return "\n".join(filtered)
 
 
 def _serialize_to_tmdl_parts(db):
@@ -277,13 +276,11 @@ def _serialize_to_tmdl_parts(db):
             for fname in files:
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, tmdl_dir).replace("\\", "/")
-                with open(fpath, "r", encoding="utf-8") as f:
+                with open(fpath, "rb") as f:
                     content = f.read()
-                # Strip properties Fabric doesn't accept
-                content = _strip_tmdl_unknown_properties(content)
                 parts.append({
                     "path": f"definition/{rel_path}",
-                    "payload": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+                    "payload": base64.b64encode(content).decode("utf-8"),
                     "payloadType": "InlineBase64",
                 })
 
