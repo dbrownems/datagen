@@ -88,14 +88,9 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
     """Modify a model.bim to use Direct Lake on OneLake.
 
     Uses the .NET TOM (Tabular Object Model) library to properly deserialize,
-    modify, and reserialize the BIM — avoiding fragile JSON key matching.
-    Falls back to direct JSON manipulation if TOM is unavailable.
+    modify, and reserialize the BIM.
     """
-    try:
-        return _modify_bim_via_tom(bim, lh_info, table_filter)
-    except Exception as e:
-        print(f"    ⚠ TOM not available ({e}), falling back to JSON manipulation", flush=True)
-        return _modify_bim_via_json(bim, lh_info, table_filter)
+    return _modify_bim_via_tom(bim, lh_info, table_filter)
 
 
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
@@ -211,106 +206,6 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     print(f"    TOM: {n_tables} tables, {n_rels} relationships processed", flush=True)
 
     return result_bim, expr_name
-
-
-def _modify_bim_via_json(bim, lh_info, table_filter=None):
-    """Fallback: modify model.bim via direct JSON manipulation."""
-    model = bim.get("model", bim)
-
-    # Build the OneLake expression
-    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
-    expr_name = f"DirectLake - {lh_info['lh_name']}"
-    schema = lh_info.get("default_schema", "dbo")
-
-    # Replace all expressions with our single OneLake source
-    model["expressions"] = [
-        {
-            "name": expr_name,
-            "kind": "m",
-            "expression": [
-                "let",
-                f'    Source = AzureStorage.DataLake("{onelake_url}", [HierarchicalNavigation=true])',
-                "in",
-                "    Source",
-            ],
-        }
-    ]
-
-    # Filter tables if specified — but keep measure-only tables (no data columns)
-    if table_filter is not None:
-        filter_set = set(table_filter)
-        kept_tables = []
-        for t in model.get("tables", []):
-            if t["name"] in filter_set:
-                kept_tables.append(t)
-            else:
-                # Keep tables that only have measures (no data columns needing a Delta table)
-                has_data_cols = any(
-                    c.get("type", "data") != "calculated"
-                    for c in t.get("columns", [])
-                    if c.get("name", "").lower() != "rownumber-2662979b-1795-4f74-8f37-6a1ba8059b61"
-                )
-                has_measures = bool(t.get("measures"))
-                if has_measures and not has_data_cols:
-                    kept_tables.append(t)
-        model["tables"] = kept_tables
-
-    # Modify each table's partition to Direct Lake entity
-    # Convert all calculated columns to data columns (we generate values for
-    # them in the Delta tables, Direct Lake doesn't support calculated columns)
-    for table in model.get("tables", []):
-        tname = table["name"]
-        safe_name = _safe_folder_name(tname)
-
-        # Check if this table has a corresponding Delta table
-        has_delta = table_filter is None or tname in (table_filter or [])
-        if not has_delta:
-            # Measure-only table — remove partitions entirely
-            table["partitions"] = []
-            continue
-
-        # Replace partitions with a single Direct Lake entity partition
-        table["partitions"] = [
-            {
-                "name": tname,
-                "mode": "directLake",
-                "source": {
-                    "type": "entity",
-                    "entityName": safe_name,
-                    "schemaName": schema,
-                    "expressionSource": expr_name,
-                },
-            }
-        ]
-
-        # Process columns: convert any non-data columns to data columns
-        # Direct Lake only supports regular data columns sourced from Delta
-        # BIM uses "calculated", "calculatedTableColumn", etc.
-        n_converted = 0
-        for col in table.get("columns", []):
-            col.pop("sourceProviderType", None)
-            col_type = col.get("type")
-            if col_type and col_type != "data":
-                col.pop("type", None)
-                col.pop("expression", None)
-                n_converted += 1
-            col["sourceColumn"] = col["name"]
-
-        if n_converted:
-            print(f"    {tname}: converted {n_converted} calculated/non-data column(s) to data", flush=True)
-
-    # Remove query groups (import-mode M query organization)
-    model.pop("queryGroups", None)
-
-    # Set Direct Lake compatible data access options
-    model["defaultPowerBIDataSourceVersion"] = "powerBI_V3"
-    if "dataAccessOptions" not in model:
-        model["dataAccessOptions"] = {}
-
-    # Update top-level compatibility
-    bim["compatibilityLevel"] = max(bim.get("compatibilityLevel", 1604), 1604)
-
-    return bim, expr_name
 
 
 def deploy_semantic_model(
