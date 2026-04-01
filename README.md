@@ -66,10 +66,16 @@ generate(spark, f"{DATAGEN_DIR}/model.vpax",
     mode="direct_lake",              # "direct_lake" or "import"
     deploy_model=True,               # False to skip semantic model deployment
     compare=True,                    # False to skip comparison report
-    overwrite=True,                  # overwrite existing semantic model
+    overwrite_tables=True,           # False to skip tables that already exist
+    overwrite_model=True,            # False to fail if model already exists
     seed=42,                         # reproducible generation
     output_path="Tables/",           # Delta table location
+    output_format="delta",           # "delta" or "parquet"
     dataset="MyModel",               # override model name
+    workspace=None,                  # target Fabric workspace (default: current)
+    lakehouse=None,                  # lakehouse name (default: attached)
+    include_hidden=False,            # include hidden columns/tables from VPAX
+    include_calculated=False,        # include calculated columns
 )
 ```
 
@@ -141,6 +147,10 @@ Country, State, City, and PostalCode columns are auto-detected and generated wit
 
 Docker-style human-readable names: `bold_raven`, `ancient_ivory_cascade`. Length varies naturally around the target average.
 
+### Email Columns
+
+Email and username columns are auto-detected by name (e.g. `Email`, `UserPrincipalName`, `Login`) and populated with realistic addresses. Internal/employee tables use Marvel hero names at `@contoso.com`; external tables (customers, suppliers) use DC hero names at `@adventureworks.com` or `@wideworldimporters.com`.
+
 ### Numeric Distributions
 
 Skew-normal distributions with configurable mean, std_dev, and skewness. Value frequency uses Zipf power-law selection for realistic skew.
@@ -185,8 +195,12 @@ from datagen.spark_generator import generate_all_tables
 ## CLI Reference
 
 ```bash
-python -m datagen parse model.vpax -o config.yaml
-python -m datagen generate config.yaml -o Tables/
-python -m datagen model model.vpax --mode direct_lake
-python -m datagen model model.vpax --mode import --lakehouse MyLakehouse
+# Parse a .vpax → YAML config
+python -m datagen parse model.vpax [-o config.yaml] [--output-path Tables/] [--seed 42] [--include-hidden] [--include-calculated]
+
+# Generate Delta tables from a YAML config
+python -m datagen generate config.yaml [-o Tables/]
+
+# Generate a TMDL semantic model definition
+python -m datagen model model.vpax [--mode direct_lake|import] [--lakehouse MyLakehouse] [--endpoint <sql-endpoint>] [--model-name MyModel] [-o MyModel.SemanticModel] [--include-hidden] [--include-calculated]
 ```
