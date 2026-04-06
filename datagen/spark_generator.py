@@ -621,6 +621,7 @@ def _is_date_table(vpax_table):
 def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     """Generate a date table from VPAX metadata and write it."""
     from .date_table import generate_date_table
+    from pyspark.sql.types import StructType, StructField
 
     tname = vpax_table["name"]
     row_count = vpax_table.get("row_count", 365)
@@ -628,22 +629,31 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     _log(f"  Date table detected — generating {row_count:,} days with derived columns")
 
     rows = generate_date_table(vpax_table)
-
     pdf = pd.DataFrame(rows)
 
-    # Convert datetime columns
+    # Build explicit schema from VPAX column types
+    fields = []
     for col in vpax_table.get("columns", []):
         cname = col["name"]
         if cname not in pdf.columns:
             continue
-        if col.get("data_type") == "datetime":
-            pdf[cname] = pd.to_datetime(pdf[cname])
-        elif col.get("data_type") == "int64":
-            pdf[cname] = pdf[cname].astype("int64")
-        elif col.get("data_type") == "boolean":
-            pdf[cname] = pdf[cname].astype("bool")
+        dtype = col.get("data_type", "string")
+        fields.append(StructField(cname, _spark_type(dtype), True))
 
-    sdf = spark.createDataFrame(pdf)
+        # Ensure Python types match the schema
+        if dtype == "datetime":
+            pdf[cname] = pd.to_datetime(pdf[cname])
+        elif dtype == "int64":
+            pdf[cname] = pdf[cname].astype("int64")
+        elif dtype == "double":
+            pdf[cname] = pdf[cname].astype("float64")
+        elif dtype == "boolean":
+            pdf[cname] = pdf[cname].astype("bool")
+        else:
+            pdf[cname] = pdf[cname].astype("str")
+
+    schema = StructType(fields)
+    sdf = spark.createDataFrame(pdf, schema=schema)
 
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(tname)}"
     fmt = output_format.lower()

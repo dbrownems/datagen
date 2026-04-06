@@ -217,10 +217,10 @@ def _derive_value(dt, role, dtype, end_date=None):
         return int(dt.strftime("%Y%m%d"))
 
     if role == "date":
-        # Midnight, no time portion
         if dtype == "int64":
             return int(dt.strftime("%Y%m%d"))
-        return dt.strftime("%Y-%m-%d 00:00:00")
+        # Return actual datetime object so Spark infers TimestampType
+        return dt
 
     if role == "year":
         return dt.year
@@ -233,12 +233,11 @@ def _derive_value(dt, role, dtype, end_date=None):
         return (dt.month - 1) // 3 + 1
 
     if role == "quarter_date":
-        # First day of the quarter
         q_month = ((dt.month - 1) // 3) * 3 + 1
         qd = dt.replace(month=q_month, day=1)
         if dtype == "int64":
             return int(qd.strftime("%Y%m%d"))
-        return qd.strftime("%Y-%m-%d 00:00:00")
+        return qd
 
     if role == "month_name":
         return dt.strftime("%B")  # "January", "February", ...
@@ -307,9 +306,9 @@ def _derive_value(dt, role, dtype, end_date=None):
             return 1
         return 0
 
-    # Unknown role — return the date as a string fallback
+    # Unknown role — return appropriate type
     if dtype == "int64":
         return int(dt.strftime("%Y%m%d"))
     if dtype == "datetime":
-        return dt.strftime("%Y-%m-%d 00:00:00")
+        return dt  # actual datetime object for Spark TimestampType
     return dt.strftime("%Y-%m-%d")
