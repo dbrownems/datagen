@@ -94,19 +94,26 @@ def extract_filter_bindings(dax_text):
         vals_str = m.group(3)
 
         str_vals = re.findall(r'"([^"]*)"', vals_str)
-        # Also handle numeric values
+        # Also handle numeric values (unquoted)
         num_vals = re.findall(r'(?<!["\w])(-?\d+(?:\.\d+)?)(?!["\w])', vals_str)
 
         data_vals = [v for v in str_vals if not _is_column_reference(v)]
-        if not data_vals and not num_vals:
+        is_numeric = False
+        if data_vals:
+            values = data_vals
+        elif num_vals:
+            values = num_vals
+            is_numeric = True
+        else:
             continue
 
         bindings.append({
             "table": table,
             "column": column,
-            "values": data_vals or num_vals,
+            "values": values,
             "span": (m.start(3), m.end(3)),
             "pattern": "in",
+            "is_numeric": is_numeric,
         })
 
     # 3. 'Table'[Column] = "literal" (outside DEFINE MEASURE blocks)
@@ -222,6 +229,15 @@ def build_value_map(spark, queries, output_path="Tables/", max_values=100):
 # Rewrite — substitute literal values in DAX queries
 # ---------------------------------------------------------------------------
 
+def _format_dax_value(val):
+    """Format a value for DAX — quote strings, leave numbers bare."""
+    try:
+        float(val)
+        return str(val)
+    except (ValueError, TypeError):
+        return f'"{val}"'
+
+
 def _pick_replacement_values(original_values, available_values, rng):
     """Pick replacement values from available values.
 
@@ -269,14 +285,16 @@ def rewrite_query(dax_text, value_map, rng):
         replacements = _pick_replacement_values(binding["values"], available, rng)
 
         if binding["pattern"] == "treatas":
-            # Rebuild the {values} block
-            new_vals = ", ".join(f'"{v}"' for v in replacements)
+            new_vals = ", ".join(_format_dax_value(v) for v in replacements)
             start, end = binding["span"]
             result = result[:start] + new_vals + result[end:]
             n_replaced += 1
 
         elif binding["pattern"] == "in":
-            new_vals = ", ".join(f'"{v}"' for v in replacements)
+            if binding.get("is_numeric"):
+                new_vals = ", ".join(str(v) for v in replacements)
+            else:
+                new_vals = ", ".join(_format_dax_value(v) for v in replacements)
             start, end = binding["span"]
             result = result[:start] + new_vals + result[end:]
             n_replaced += 1
