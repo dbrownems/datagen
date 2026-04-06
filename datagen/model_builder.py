@@ -640,8 +640,9 @@ def _print_refresh_errors(dataset, workspace=None):
 
     # Get refresh history via XMLA-compatible endpoint
     model_id = model["id"]
-    resp = client.get(f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
+    resp = client.get(f"v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
     if resp.status_code != 200:
+        print(f"    ⚠ Refresh history API returned {resp.status_code}", flush=True)
         return
 
     refreshes = resp.json().get("value", [])
