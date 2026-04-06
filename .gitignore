@@ -22,3 +22,4 @@ test_*.vpax
 .token
 queries*.json
 scripts/
+*.dax
