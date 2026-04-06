@@ -281,17 +281,27 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=False):
     """Modify a model.bim for Import mode reading from OneLake Delta tables.
 
-    Keeps the original model structure (calculated columns, etc.) but rewrites
-    partition M queries to read from OneLake instead of the original source.
+    Uses a single shared data source pointing at the Tables folder, with
+    each table referenced by folder name. This ensures Power BI sees one
+    data source for all queries.
 
-    Args:
-        bim: The model.bim dict.
-        lh_info: Lakehouse connection info.
-        table_filter: Tables that have Delta backing (from generation).
-        use_sql_endpoint: If True, use SQL Analytics Endpoint instead of OneLake direct.
+    M query pattern:
+        let
+            Source = AzureStorage.DataLake("https://{host}/{ws}/{lh}/Tables/dbo/", ...),
+            Table = Source{[Name="TableName"]}[Content],
+            Data = DeltaLake.Table(Table)
+        in
+            Data
     """
     model = bim.get("model", bim)
-    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    onelake_host = lh_info["onelake_host"]
+    ws_id = lh_info["ws_id"]
+    lh_id = lh_info["lh_id"]
+    schema = lh_info.get("default_schema", "dbo")
+
+    # Build the shared source URL (includes schema folder if present)
+    source_url = f"https://{onelake_host}/{ws_id}/{lh_id}/Tables/{schema}/"
+
     filter_set = set(table_filter) if table_filter is not None else None
 
     n_rewritten = 0
@@ -300,19 +310,17 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         has_delta = filter_set is None or tname in filter_set
 
         if not has_delta:
-            # Keep original partitions (enter-data, measure-only, etc.)
             continue
 
         safe_name = _safe_folder_name(tname)
-        table_url = f"{onelake_url}/Tables/{safe_name}/"
 
-        # Rewrite partition to read from OneLake Delta
         m_expr = (
             "let\n"
-            f'    Source = AzureStorage.DataLake("{table_url}", [HierarchicalNavigation=true]),\n'
-            "    ToDelta = DeltaLake.Table(Source)\n"
+            f'    Source = AzureStorage.DataLake("{source_url}", [HierarchicalNavigation=true]),\n'
+            f'    Table = Source{{[Name="{safe_name}"]}}[Content],\n'
+            "    Data = DeltaLake.Table(Table)\n"
             "in\n"
-            "    ToDelta"
+            "    Data"
         )
 
         table["partitions"] = [
@@ -326,6 +334,7 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         ]
         n_rewritten += 1
 
+    print(f"    Source: {source_url}", flush=True)
     print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
     return bim
 
