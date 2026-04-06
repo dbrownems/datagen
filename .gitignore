@@ -20,6 +20,6 @@ test_*.yaml
 test_*.vpax
 *.tmdl.bak
 .token
-queries*.json
+*.json
 scripts/
 *.dax
