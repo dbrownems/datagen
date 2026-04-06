@@ -353,15 +353,15 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
     return bim
 
 
-def _strip_unknown_bim_properties(bim, table_filter=None):
+def _strip_unknown_bim_properties(bim, table_filter=None, convert_calc=True):
     """Clean BIM JSON for TOM deserialization and Fabric import.
 
-    Converts calculated columns to data columns (Direct Lake doesn't
-    support them — we generate the values in the Delta tables).
-    Strips unknown column properties.
+    When convert_calc=True (Direct Lake): converts calculated columns to data
+    columns since Direct Lake doesn't support them.
+    When convert_calc=False (Import): leaves calculated columns untouched.
 
-    If table_filter is provided, only modifies tables in the filter set
-    (import mode: leave enter-data tables untouched).
+    Strips unknown column properties in either mode.
+    If table_filter is provided, only modifies tables in the filter set.
     """
     _KNOWN_COL_PROPS = {
         "name", "type", "dataType", "sourceColumn", "description", "isHidden",
@@ -371,6 +371,8 @@ def _strip_unknown_bim_properties(bim, table_filter=None):
         "isDefaultImage", "alignment", "tableDetailPosition",
         "isAvailableInMDX", "groupByColumns", "alternateOf", "encodingHint",
     }
+    # Calc columns have additional valid props
+    _CALC_COL_PROPS = _KNOWN_COL_PROPS | {"expression", "type"}
     _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
                      "isUnique", "isNullable", "lineageTag"}
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
@@ -389,13 +391,19 @@ def _strip_unknown_bim_properties(bim, table_filter=None):
             col_type = col.get("type")
 
             if col_type in _CALC_TYPES:
-                # Convert to data column — keep only valid data column props
-                clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
-                clean.pop("type", None)
-                clean["sourceColumn"] = col["name"]
-                col.clear()
-                col.update(clean)
-                n_converted += 1
+                if convert_calc:
+                    # Convert to data column — keep only valid data column props
+                    clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
+                    clean.pop("type", None)
+                    clean["sourceColumn"] = col["name"]
+                    col.clear()
+                    col.update(clean)
+                    n_converted += 1
+                else:
+                    # Import mode: keep calc columns, just strip unknown props
+                    unknown = [k for k in col if k not in _CALC_COL_PROPS]
+                    for k in unknown:
+                        col.pop(k)
 
             elif col_type == "rowNumber":
                 unknown = [k for k in col if k not in _ROWNUM_PROPS]
@@ -586,7 +594,7 @@ def deploy_semantic_model(
     # Modify the BIM based on mode
     if mode == "import":
         print("  Converting model to Import from OneLake ...", flush=True)
-        _strip_unknown_bim_properties(bim, table_filter=table_filter)
+        _strip_unknown_bim_properties(bim, table_filter=table_filter, convert_calc=False)
         bim = _modify_bim_for_import(bim, lh_info, table_filter)
     else:
         print("  Converting model to Direct Lake on OneLake ...", flush=True)
