@@ -255,13 +255,14 @@ def _pick_replacement_values(original_values, available_values, rng):
     return [available_values[i] for i in indices]
 
 
-def rewrite_query(dax_text, value_map, rng):
+def rewrite_query(dax_text, value_map, rng, skip_tables=None):
     """Rewrite a single DAX query, replacing filter literals with generated values.
 
     Args:
         dax_text: Original DAX query string.
         value_map: Dict mapping (table, column) → [available values].
         rng: numpy random generator for reproducible selection.
+        skip_tables: Set of table names to leave untouched (e.g. enter-data tables).
 
     Returns:
         (rewritten_text, n_replacements) tuple.
@@ -277,6 +278,10 @@ def rewrite_query(dax_text, value_map, rng):
     n_replaced = 0
 
     for binding in bindings:
+        # Skip enter-data tables — their values are original
+        if skip_tables and binding["table"] in skip_tables:
+            continue
+
         key = (binding["table"], binding["column"])
         if key not in value_map:
             continue
@@ -309,13 +314,14 @@ def rewrite_query(dax_text, value_map, rng):
     return result, n_replaced
 
 
-def rewrite_queries(queries, value_map, seed=42):
+def rewrite_queries(queries, value_map, seed=42, skip_tables=None):
     """Rewrite all queries in a list, replacing filter literals.
 
     Args:
         queries: List of query dicts (from queries.json).
         value_map: Dict mapping (table, column) → [available values].
         seed: Random seed for reproducible value selection.
+        skip_tables: Set of table names to leave untouched (enter-data tables).
 
     Returns:
         List of rewritten query dicts (original dicts are not modified).
@@ -332,7 +338,7 @@ def rewrite_queries(queries, value_map, seed=42):
         text = q.get(text_key, "")
 
         if text:
-            new_text, n = rewrite_query(text, value_map, rng)
+            new_text, n = rewrite_query(text, value_map, rng, skip_tables=skip_tables)
             new_q[text_key] = new_text
             total_replacements += n
 
@@ -348,7 +354,7 @@ def rewrite_queries(queries, value_map, seed=42):
 # ---------------------------------------------------------------------------
 
 def rewrite_queries_file(spark, input_path, output_path=None,
-                         tables_path="Tables/", seed=42):
+                         tables_path="Tables/", seed=42, skip_tables=None):
     """Rewrite a queries.json file, replacing filter values with generated data.
 
     Args:
@@ -357,6 +363,7 @@ def rewrite_queries_file(spark, input_path, output_path=None,
         output_path: Path for the output file (default: overwrites input).
         tables_path: Base path for generated Delta tables.
         seed: Random seed.
+        skip_tables: Set of table names to leave untouched (enter-data tables).
 
     Returns:
         Number of replacements made.
@@ -374,8 +381,11 @@ def rewrite_queries_file(spark, input_path, output_path=None,
     print("Building value map from Delta tables ...", flush=True)
     value_map = build_value_map(spark, queries, tables_path)
 
+    if skip_tables:
+        print(f"  Skipping {len(skip_tables)} enter-data table(s)", flush=True)
+
     print("Rewriting queries ...", flush=True)
-    rewritten = rewrite_queries(queries, value_map, seed)
+    rewritten = rewrite_queries(queries, value_map, seed, skip_tables=skip_tables)
 
     print(f"Saving to {output_path} ...", flush=True)
     with open(output_path, "w", encoding="utf-8") as f:

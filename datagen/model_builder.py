@@ -193,6 +193,20 @@ def get_tables_to_skip(vpax_path, mode="direct_lake"):
     return skip
 
 
+def get_enter_data_tables(vpax_path):
+    """Return set of table names that are enter-data tables.
+
+    These tables have inline data in their M expressions and should
+    not have their filter values replaced in DAX queries.
+    """
+    bim = _extract_bim(vpax_path)
+    model = bim.get("model", bim)
+    return {
+        table["name"] for table in model.get("tables", [])
+        if _is_enter_data_table(table)
+    }
+
+
     """Add columns from Model.bim that are missing from the generation config.
 
     The VPAX DaxModel.json stats may not include all columns (e.g. some

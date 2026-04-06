@@ -306,9 +306,15 @@ def _derive_value(dt, role, dtype, end_date=None):
             return 1
         return 0
 
-    # Unknown role — return appropriate type
+    # Unknown role — return appropriate type based on column data type
     if dtype == "int64":
         return int(dt.strftime("%Y%m%d"))
+    if dtype == "double":
+        # Numeric representation of date (e.g. Excel serial date or YYYYMMDD.0)
+        return float(dt.strftime("%Y%m%d"))
     if dtype == "datetime":
-        return dt  # actual datetime object for Spark TimestampType
+        return dt
+    if dtype == "boolean":
+        return True
+    # String fallback
     return dt.strftime("%Y-%m-%d")
