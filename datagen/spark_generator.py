@@ -577,11 +577,12 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
                 print(f"  [{i}/{n}] ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)", flush=True)
 
         except Exception as e:
-            errors.append((tname, str(e)))
             if progress:
                 progress.write(f"  ✗ {tname} — {e}")
+                progress.close()
             else:
                 print(f"  [{i}/{n}] ✗ {tname} — {e}", flush=True)
+            raise RuntimeError(f"Failed to generate table '{tname}': {e}") from e
 
         if progress:
             progress.update(1)
