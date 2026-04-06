@@ -339,12 +339,15 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
     return bim
 
 
-def _strip_unknown_bim_properties(bim):
+def _strip_unknown_bim_properties(bim, table_filter=None):
     """Clean BIM JSON for TOM deserialization and Fabric import.
 
     Converts calculated columns to data columns (Direct Lake doesn't
     support them — we generate the values in the Delta tables).
     Strips unknown column properties.
+
+    If table_filter is provided, only modifies tables in the filter set
+    (import mode: leave enter-data tables untouched).
     """
     _KNOWN_COL_PROPS = {
         "name", "type", "dataType", "sourceColumn", "description", "isHidden",
@@ -357,10 +360,17 @@ def _strip_unknown_bim_properties(bim):
     _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
                      "isUnique", "isNullable", "lineageTag"}
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
+    filter_set = set(table_filter) if table_filter is not None else None
 
     model = bim.get("model", bim)
     n_converted = 0
     for table in model.get("tables", []):
+        tname = table.get("name", "")
+
+        # Skip tables not in filter (e.g. enter-data tables in import mode)
+        if filter_set is not None and tname not in filter_set:
+            continue
+
         for col in table.get("columns", []):
             col_type = col.get("type")
 
@@ -562,7 +572,7 @@ def deploy_semantic_model(
     # Modify the BIM based on mode
     if mode == "import":
         print("  Converting model to Import from OneLake ...", flush=True)
-        _strip_unknown_bim_properties(bim)
+        _strip_unknown_bim_properties(bim, table_filter=table_filter)
         bim = _modify_bim_for_import(bim, lh_info, table_filter)
     else:
         print("  Converting model to Direct Lake on OneLake ...", flush=True)
