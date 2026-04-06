@@ -98,19 +98,22 @@ _COL_PATTERNS = {
     },
     "current_year": {
         "currentyear", "current_year", "iscurrentyear", "is_current_year",
-        "iscy", "cy_flag",
+        "iscy", "cy_flag", "currentyearflag", "current_year_flag",
     },
     "current_date": {
         "currentdate", "current_date", "istoday", "is_today",
         "iscurrentdate", "is_current_date", "today_flag",
+        "currentdateflag", "current_date_flag",
     },
     "current_quarter": {
         "currentquarter", "current_quarter", "iscurrentquarter",
         "is_current_quarter", "cq_flag",
+        "currentquarterflag", "current_quarter_flag",
     },
     "current_month": {
         "currentmonth", "current_month", "iscurrentmonth",
         "is_current_month", "cm_flag",
+        "currentmonthflag", "current_month_flag",
     },
 }
 
@@ -181,8 +184,8 @@ def generate_date_table(table_meta, seed=42):
     row_count = max(1, table_meta.get("row_count", 365))
     cols = table_meta.get("columns", [])
 
-    # Determine date range: end at Jan 1 of current year
-    end_date = datetime(datetime.now().year, 1, 1)
+    # Determine date range: end at today, go back row_count days
+    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=row_count - 1)
 
     # Map columns to roles
