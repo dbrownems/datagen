@@ -23,9 +23,8 @@ if not _logger.handlers:
 
 
 def _log(msg=""):
-    """Log progress — uses stderr + print + flush for Fabric notebook visibility."""
+    """Log progress — uses print + flush for Fabric notebook visibility."""
     print(msg, flush=True)
-    _logger.info(msg)
 
 
 def _safe_table_name(name):
@@ -564,15 +563,18 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             if vpax_table and _is_date_table(vpax_table):
                 _generate_date_table_spark(spark, vpax_table, out_path, output_format)
                 timing = {"total_time": 0}
+                is_date = True
             else:
                 timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
+                is_date = False
 
             total_time = timing.get("total_time", 0)
             rows_generated += row_count
             succeeded_tables.append(tname)
 
+            suffix = " (date table)" if is_date else ""
             if progress:
-                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)")
+                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s){suffix}")
             else:
                 print(f"  [{i}/{n}] ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)", flush=True)
 
@@ -626,8 +628,6 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
 
     tname = vpax_table["name"]
     row_count = vpax_table.get("row_count", 365)
-
-    _log(f"  Date table detected — generating {row_count:,} days with derived columns")
 
     rows = generate_date_table(vpax_table)
     pdf = pd.DataFrame(rows)
