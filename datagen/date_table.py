@@ -30,6 +30,7 @@ _COL_PATTERNS = {
     "date": {
         "date", "fulldate", "full_date", "calendardate", "calendar_date",
         "thedate", "the_date", "datevalue",
+        "calendardt", "calendar_dt", "dt",
     },
     "year": {
         "year", "calendaryear", "calendar_year", "yr",
@@ -41,6 +42,11 @@ _COL_PATTERNS = {
     "quarter_number": {
         "quarternumber", "quarter_number", "quarternum", "quarter_num",
         "qtrnumber", "qtrnum", "quarterint",
+        "quarterid", "quarter_id",
+    },
+    "quarter_date": {
+        "quarterdt", "quarter_dt", "quarterdate", "quarter_date",
+        "quarterstartdate", "quarter_start_date",
     },
     "month_name": {
         "monthname", "month_name", "month", "calendarmonth",
@@ -50,6 +56,7 @@ _COL_PATTERNS = {
         "monthnumber", "month_number", "monthnum", "month_num",
         "monthno", "month_no", "monthint", "monthorder", "month_order",
         "monthindex", "month_index", "monthsort",
+        "monthid", "month_id",
     },
     "month_year": {
         "monthyear", "month_year", "yearmonth", "year_month",
@@ -71,6 +78,7 @@ _COL_PATTERNS = {
     "week_number": {
         "weeknumber", "week_number", "weeknum", "week_num",
         "weekofyear", "week_of_year", "isoweek", "iso_week",
+        "weekid", "week_id",
     },
     "year_quarter": {
         "yearquarter", "year_quarter",
@@ -87,6 +95,22 @@ _COL_PATTERNS = {
     },
     "fiscal_quarter": {
         "fiscalquarter", "fiscal_quarter", "fq",
+    },
+    "current_year": {
+        "currentyear", "current_year", "iscurrentyear", "is_current_year",
+        "iscy", "cy_flag",
+    },
+    "current_date": {
+        "currentdate", "current_date", "istoday", "is_today",
+        "iscurrentdate", "is_current_date", "today_flag",
+    },
+    "current_quarter": {
+        "currentquarter", "current_quarter", "iscurrentquarter",
+        "is_current_quarter", "cq_flag",
+    },
+    "current_month": {
+        "currentmonth", "current_month", "iscurrentmonth",
+        "is_current_month", "cm_flag",
     },
 }
 
@@ -112,7 +136,13 @@ def is_date_table(table_meta):
     is likely a date/calendar dimension.
     """
     name = _normalize(table_meta.get("name", ""))
+    # Match exact name or name with numeric prefix (e.g. "017-Date" → "017date")
     if name in {_normalize(n) for n in _DATE_TABLE_NAMES}:
+        return True
+    # Strip leading digits and separators for prefix-numbered tables
+    import re
+    stripped = re.sub(r'^[\d]+[-_\s]*', '', table_meta.get("name", ""))
+    if stripped and _normalize(stripped) in {_normalize(n) for n in _DATE_TABLE_NAMES}:
         return True
 
     # If table name doesn't match, check column composition:
@@ -127,7 +157,7 @@ def is_date_table(table_meta):
     # Must have a date or date_key column, plus at least 2 derived columns
     has_anchor = bool(roles_found & {"date", "date_key"})
     has_derived = len(roles_found & {
-        "year", "quarter", "month_name", "month_number",
+        "year", "quarter", "quarter_number", "month_name", "month_number",
         "day_of_week", "week_number",
     }) >= 2
 
@@ -168,20 +198,25 @@ def generate_date_table(table_meta, seed=42):
         row = {}
 
         for col_name, (role, dtype) in col_roles.items():
-            row[col_name] = _derive_value(dt, role, dtype)
+            row[col_name] = _derive_value(dt, role, dtype, end_date=end_date)
 
         rows.append(row)
 
     return rows
 
 
-def _derive_value(dt, role, dtype):
-    """Derive a column value from a date based on its role."""
+def _derive_value(dt, role, dtype, end_date=None):
+    """Derive a column value from a date based on its role.
+    
+    end_date is the last date in the generated range (for current_* flags).
+    """
     if role == "date_key":
         return int(dt.strftime("%Y%m%d"))
 
     if role == "date":
         # Midnight, no time portion
+        if dtype == "int64":
+            return int(dt.strftime("%Y%m%d"))
         return dt.strftime("%Y-%m-%d 00:00:00")
 
     if role == "year":
@@ -193,6 +228,14 @@ def _derive_value(dt, role, dtype):
 
     if role == "quarter_number":
         return (dt.month - 1) // 3 + 1
+
+    if role == "quarter_date":
+        # First day of the quarter
+        q_month = ((dt.month - 1) // 3) * 3 + 1
+        qd = dt.replace(month=q_month, day=1)
+        if dtype == "int64":
+            return int(qd.strftime("%Y%m%d"))
+        return qd.strftime("%Y-%m-%d 00:00:00")
 
     if role == "month_name":
         return dt.strftime("%B")  # "January", "February", ...
@@ -223,24 +266,43 @@ def _derive_value(dt, role, dtype):
         return f"{dt.year}-Q{q}"
 
     if role == "is_weekend":
-        if dtype == "boolean":
-            return dt.weekday() >= 5
-        return dt.weekday() >= 5
+        return 1 if dt.weekday() >= 5 else 0
 
     if role == "is_weekday":
-        if dtype == "boolean":
-            return dt.weekday() < 5
-        return dt.weekday() < 5
+        return 1 if dt.weekday() < 5 else 0
 
     if role == "fiscal_year":
-        # Common: fiscal year starts July 1
         return dt.year if dt.month >= 7 else dt.year - 1
 
     if role == "fiscal_quarter":
-        # FY starts July 1: Jul-Sep=FQ1, Oct-Dec=FQ2, Jan-Mar=FQ3, Apr-Jun=FQ4
         fiscal_month = (dt.month - 7) % 12 + 1
         fq = (fiscal_month - 1) // 3 + 1
         return f"FQ{fq}"
+
+    if role == "current_year":
+        # 1 if date is in the same year as the last generated date
+        if end_date and dt.year == end_date.year:
+            return 1
+        return 0
+
+    if role == "current_date":
+        # 1 if date is the last generated date
+        if end_date and dt.date() == end_date.date():
+            return 1
+        return 0
+
+    if role == "current_quarter":
+        if end_date:
+            dt_q = (dt.month - 1) // 3 + 1
+            end_q = (end_date.month - 1) // 3 + 1
+            if dt.year == end_date.year and dt_q == end_q:
+                return 1
+        return 0
+
+    if role == "current_month":
+        if end_date and dt.year == end_date.year and dt.month == end_date.month:
+            return 1
+        return 0
 
     # Unknown role — return the date as a string fallback
     if dtype == "int64":
