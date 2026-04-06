@@ -625,24 +625,26 @@ def deploy_semantic_model(
 
 
 def _print_refresh_errors(dataset, workspace=None):
-    """Fetch and display detailed refresh errors from the REST API."""
+    """Fetch and display detailed refresh errors from the Power BI REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
-    client = fabric.FabricRestClient()
 
-    # Find the semantic model ID
+    # Find the semantic model ID via Fabric API
+    client = fabric.FabricRestClient()
     items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
     model = next((i for i in items if i["displayName"] == dataset), None)
     if not model:
         return
 
-    # Get refresh history via XMLA-compatible endpoint
     model_id = model["id"]
-    resp = client.get(f"v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
+
+    # Get refresh history via Power BI API (not Fabric Items API)
+    pbi_client = fabric.PowerBIRestClient()
+    resp = pbi_client.get(f"/v1.0/myorg/groups/{ws_id}/datasets/{model_id}/refreshes?$top=1")
     if resp.status_code != 200:
-        print(f"    ⚠ Refresh history API returned {resp.status_code}", flush=True)
+        print(f"    ⚠ Refresh history API returned {resp.status_code}: {resp.text[:200]}", flush=True)
         return
 
     refreshes = resp.json().get("value", [])
