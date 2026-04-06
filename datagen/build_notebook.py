@@ -1,0 +1,182 @@
+"""Build the 'Datagen Main.Notebook' artifact for deployment via `fab import`.
+
+Usage:
+    python -m datagen build-notebook
+    python -m datagen build-notebook --output-dir ./my-dist
+"""
+
+import json
+import os
+import shutil
+
+
+def build_notebook(output_dir=None):
+    """Build the Fabric notebook artifact.
+
+    Args:
+        output_dir: Directory to write the notebook artifact.
+                    Default: dist/ relative to current working directory.
+    """
+    if output_dir is None:
+        output_dir = os.path.join(os.getcwd(), "dist")
+
+    nb_dir = os.path.join(output_dir, "Datagen Main.Notebook")
+    if os.path.exists(nb_dir):
+        shutil.rmtree(nb_dir)
+    os.makedirs(nb_dir)
+
+    cells = [
+        # ── Markdown: title ──
+        {
+            "cell_type": "markdown",
+            "source": [
+                "# Datagen\n",
+                "\n",
+                "Generate realistic Delta tables and a Direct Lake semantic model from a Power BI `.vpax` file.\n",
+                "\n",
+                "## Setup\n",
+                "\n",
+                "1. **Attach a Lakehouse** — click the Lakehouse icon in the left sidebar and select (or create) a Lakehouse\n",
+                "2. **Upload your `.vpax` file** — place it in `Files/datagen/` in the attached Lakehouse\n",
+                "   - Export a `.vpax` from [DAX Studio](https://daxstudio.org/) → Advanced → Export Metrics\n",
+                "3. **Run Cell 1** below to install datagen (auto-downloads from GitHub if needed)\n",
+                "4. **Edit Cell 2** — change the `.vpax` filename to match yours\n",
+                "5. **Run Cell 2** — generates Delta tables, deploys a semantic model, and prints a comparison report\n",
+            ],
+            "metadata": {},
+        },
+        # ── Code: setup ──
+        {
+            "cell_type": "code",
+            "source": [
+                "# Install datagen — downloads the latest release from GitHub if not cached locally\n",
+                "import glob, subprocess, sys, os, urllib.request, json\n",
+                "\n",
+                "if not os.path.isdir('/lakehouse/default'):\n",
+                "    raise RuntimeError(\n",
+                "        'No lakehouse attached. Click the Lakehouse icon in the left sidebar, '\n",
+                "        'then select or create a Lakehouse before running this notebook.'\n",
+                "    )\n",
+                "\n",
+                'DATAGEN_DIR = "/lakehouse/default/Files/datagen"\n',
+                "os.makedirs(DATAGEN_DIR, exist_ok=True)\n",
+                "\n",
+                "USE_LATEST = True  # Set False to use a cached .whl instead of downloading\n",
+                "\n",
+                "def _get_latest_whl():\n",
+                '    api_url = "https://api.github.com/repos/dbrownems/datagen/releases/latest"\n',
+                "    with urllib.request.urlopen(api_url) as resp:\n",
+                "        release = json.loads(resp.read())\n",
+                '    asset = next(a for a in release["assets"] if a["name"].endswith(".whl"))\n',
+                '    local = f"{DATAGEN_DIR}/{asset[\'name\']}"\n',
+                "    if not os.path.exists(local):\n",
+                '        print(f"Downloading {asset[\'name\']} ...")\n',
+                '        urllib.request.urlretrieve(asset["browser_download_url"], local)\n',
+                "    return local\n",
+                "\n",
+                "if USE_LATEST:\n",
+                "    whl = _get_latest_whl()\n",
+                "else:\n",
+                '    whls = sorted(glob.glob(f"{DATAGEN_DIR}/datagen_fabric-*.whl"))\n',
+                "    whl = whls[-1] if whls else _get_latest_whl()\n",
+                "\n",
+                'print(f"Installing {os.path.basename(whl)}")\n',
+                "subprocess.check_call([\n",
+                '    sys.executable, "-m", "pip", "install", whl, "semantic-link-labs",\n',
+                '    "-q", "--no-warn-conflicts", "--disable-pip-version-check", "--force-reinstall", "--no-deps",\n',
+                "])\n",
+                'subprocess.check_call([sys.executable, "-m", "pip", "install", "semantic-link-labs", "-q", "--no-warn-conflicts", "--disable-pip-version-check"])\n',
+                'import datagen; print(f"Ready — datagen v{datagen.__version__}")\n',
+                "\n",
+                "# Verify the installed version matches the loaded version\n",
+                "import importlib.metadata\n",
+                "installed = importlib.metadata.version('datagen-fabric')\n",
+                "loaded = datagen.__version__\n",
+                "if installed != loaded:\n",
+                "    raise RuntimeError(\n",
+                "        f'Version mismatch: installed v{installed} but loaded v{loaded}. '\n",
+                "        f'Please restart the Spark session (Session → Stop session) and re-run.'\n",
+                "    )\n",
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+        # ── Markdown: generate instructions ──
+        {
+            "cell_type": "markdown",
+            "source": [
+                "## Generate\n",
+                "\n",
+                "Edit the `.vpax` filename below, then run the cell. This will:\n",
+                "\n",
+                "1. **Parse** the `.vpax` and infer data distributions from column statistics\n",
+                "2. **Generate** Delta tables matching the original row counts and cardinality\n",
+                "3. **Deploy** a Direct Lake semantic model with all measures, relationships, and column metadata\n",
+                "4. **Compare** the generated tables against the expected statistics and print a report\n",
+                "\n",
+                "### Options\n",
+                "\n",
+                "| Parameter | Default | Description |\n",
+                "|---|---|---|\n",
+                "| `mode` | `\"direct_lake\"` | `\"import\"` for Power Query import mode |\n",
+                "| `deploy_model` | `True` | `False` to skip semantic model deployment |\n",
+                "| `compare` | `True` | `False` to skip comparison report |\n",
+                "| `overwrite_tables` | `True` | `False` to skip existing tables, only generate missing |\n",
+                "| `overwrite_model` | `True` | `False` to fail if semantic model already exists |\n",
+                "| `seed` | `42` | Random seed for reproducible generation |\n",
+            ],
+            "metadata": {},
+        },
+        # ── Code: generate ──
+        {
+            "cell_type": "code",
+            "source": [
+                "from datagen import generate\n",
+                "\n",
+                "VPAX_FILE = \"\"  # ← set your .vpax filename, or leave blank to auto-detect\n",
+                "\n",
+                "# Auto-detect: use the first .vpax file in the datagen folder\n",
+                "if not VPAX_FILE:\n",
+                "    vpax_files = sorted(glob.glob(f\"{DATAGEN_DIR}/*.vpax\"))\n",
+                "    if not vpax_files:\n",
+                "        raise FileNotFoundError(f\"No .vpax files found in {DATAGEN_DIR}. Upload one and re-run.\")\n",
+                "    vpax_path = vpax_files[0]\n",
+                "    print(f\"Auto-detected: {os.path.basename(vpax_path)}\")\n",
+                "else:\n",
+                "    vpax_path = f\"{DATAGEN_DIR}/{VPAX_FILE}\"\n",
+                "\n",
+                "report = generate(\n",
+                "    spark,\n",
+                "    vpax_path,\n",
+                "    compare=False,\n",
+                "    overwrite_tables=False,\n",
+                "    overwrite_model=True,\n",
+                ")",
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+    ]
+
+    notebook = {
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {
+            "language_info": {"name": "python"},
+            "kernel_info": {"name": "synapse_pyspark"},
+            "kernelspec": {"display_name": "synapse_pyspark", "name": "synapse_pyspark"},
+            "microsoft": {"language": "python", "language_group": "synapse_pyspark"},
+        },
+        "cells": cells,
+    }
+
+    platform = {
+        "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+        "metadata": {"type": "Notebook", "displayName": "Datagen Main"},
+        "config": {"version": "2.0", "logicalId": "00000000-0000-0000-0000-000000000000"},
+    }
+
+    with open(os.path.join(nb_dir, "notebook-content.ipynb"), "w", encoding="utf-8") as f:
+        json.dump(notebook, f, indent=2)
+    with open(os.path.join(nb_dir, ".platform"), "w", encoding="utf-8") as f:
+        json.dump(platform, f, indent=2)
+
+    print(f"Notebook built: {nb_dir}")
+    return nb_dir
