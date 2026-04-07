@@ -23,3 +23,5 @@ test_*.vpax
 *.json
 scripts/
 *.dax
+
+.vs/
