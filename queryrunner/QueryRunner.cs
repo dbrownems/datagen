@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
-using System.Xml;
 using Microsoft.AnalysisServices.AdomdClient;
 
 namespace Datagen
@@ -13,224 +15,247 @@ namespace Datagen
     /// </summary>
     public class QueryResult
     {
-        public int Index { get; set; }
         public int UserIndex { get; set; }
         public int QueryIndex { get; set; }
+        public int Iteration { get; set; }
         public int RowCount { get; set; }
         public double DurationMs { get; set; }
         public string? Error { get; set; }
     }
 
     /// <summary>
-    /// Runs DAX queries in parallel against an XMLA endpoint using ADOMD.NET.
-    /// Each virtual user gets its own connection.
+    /// Simulates Power BI report users running DAX queries.
+    /// Each user runs all queries in iterations, 4 queries at a time,
+    /// with a pause between iterations.
     /// </summary>
     public static class QueryRunner
     {
         /// <summary>
-        /// Run a batch of queries in parallel.
-        /// Each query gets its own connection (built from connectionStrings[i]).
+        /// Run a load test simulating Power BI users.
+        /// Each user gets a thread that loops:
+        ///   1. Run all queries (4 concurrent)
+        ///   2. Pause
+        ///   3. Repeat until duration expires
+        /// Returns JSON with execution statistics.
         /// </summary>
         /// <param name="queries">DAX query texts</param>
-        /// <param name="connectionStrings">Connection string per query (may repeat for same user)</param>
-        /// <param name="maxParallelism">Max concurrent queries</param>
-        /// <param name="useXmlReader">If true, use ExecuteXmlReader (faster, count rows only)</param>
-        /// <returns>Array of QueryResult</returns>
-        public static QueryResult[] RunBatch(
-            string[] queries,
-            string[] connectionStrings,
-            int maxParallelism = 8,
-            bool useXmlReader = false)
-        {
-            var results = new QueryResult[queries.Length];
-            var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
-
-            Parallel.For(0, queries.Length, options, i =>
-            {
-                results[i] = RunSingle(i, queries[i], connectionStrings[i], useXmlReader);
-            });
-
-            return results;
-        }
-
-        /// <summary>
-        /// Run a single query with its own connection, measuring duration and row count.
-        /// </summary>
-        private static QueryResult RunSingle(int index, string query, string connStr, bool useXmlReader)
-        {
-            var result = new QueryResult { Index = index };
-            try
-            {
-                using var conn = new AdomdConnection(connStr);
-                conn.Open();
-
-                var cmd = new AdomdCommand(query, conn);
-                var sw = Stopwatch.StartNew();
-
-                if (useXmlReader)
-                {
-                    result.RowCount = ExecuteWithXmlReader(cmd);
-                }
-                else
-                {
-                    result.RowCount = ExecuteWithDataReader(cmd);
-                }
-
-                sw.Stop();
-                result.DurationMs = sw.Elapsed.TotalMilliseconds;
-            }
-            catch (Exception ex)
-            {
-                result.Error = ex.Message;
-                if (result.Error.Length > 200)
-                    result.Error = result.Error.Substring(0, 200);
-            }
-            return result;
-        }
-
-        /// <summary>
-        /// Standard ExecuteReader — reads all rows, counts them.
-        /// </summary>
-        private static int ExecuteWithDataReader(AdomdCommand cmd)
-        {
-            using var reader = cmd.ExecuteReader();
-            int count = 0;
-            while (reader.Read())
-                count++;
-            return count;
-        }
-
-        /// <summary>
-        /// ExecuteXmlReader — parses the XMLA response as XML,
-        /// counts row elements without converting column values.
-        /// </summary>
-        private static int ExecuteWithXmlReader(AdomdCommand cmd)
-        {
-            using var xmlReader = cmd.ExecuteXmlReader();
-            int count = 0;
-
-            // XMLA row response: <root><row>...</row><row>...</row></root>
-            // The row element is in the urn:schemas-microsoft-com:xml-analysis:rowset namespace
-            while (xmlReader.Read())
-            {
-                if (xmlReader.NodeType == XmlNodeType.Element && xmlReader.LocalName == "row")
-                {
-                    count++;
-                    // Skip the content of this row element entirely
-                    xmlReader.Skip();
-                }
-            }
-
-            return count;
-        }
-
-        /// <summary>
-        /// Run a load test: each user runs all queries.
-        /// Total executions = users.Length × queries.Length.
-        /// </summary>
-        /// <param name="queries">DAX query texts</param>
-        /// <param name="xmlaEndpoint">XMLA endpoint URL</param>
+        /// <param name="xmlaEndpoint">XMLA endpoint</param>
         /// <param name="dataset">Semantic model name</param>
         /// <param name="token">Access token</param>
         /// <param name="userEmails">User emails for CustomData</param>
-        /// <param name="userRoles">Role names per user</param>
-        /// <param name="maxParallelism">Max concurrent queries across all users</param>
-        /// <returns>Array of QueryResult (length = users × queries)</returns>
-        public static QueryResult[] RunLoadTest(
+        /// <param name="userRoles">Role per user</param>
+        /// <param name="durationSeconds">Total test duration</param>
+        /// <param name="queriesPerBatch">Concurrent queries per user (default 4)</param>
+        /// <param name="pauseBetweenIterationsMs">Pause between iterations in ms (default 1000)</param>
+        public static string RunLoadTest(
             string[] queries,
             string xmlaEndpoint,
             string dataset,
             string token,
             string[] userEmails,
             string[] userRoles,
-            int maxParallelism = 8)
+            int durationSeconds = 60,
+            int queriesPerBatch = 4,
+            int pauseBetweenIterationsMs = 1000)
         {
-            int totalTasks = userEmails.Length * queries.Length;
-            var results = new QueryResult[totalTasks];
-            var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+            var allResults = new ConcurrentBag<QueryResult>();
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
+            var testStart = Stopwatch.StartNew();
 
-            // Build tasks: (taskIndex, userIndex, queryIndex)
-            var tasks = new (int taskIdx, int userIdx, int queryIdx)[totalTasks];
-            int t = 0;
+            // One task per user
+            var userTasks = new Task[userEmails.Length];
             for (int u = 0; u < userEmails.Length; u++)
-                for (int q = 0; q < queries.Length; q++)
-                    tasks[t++] = (t - 1, u, q);
-
-            // Shuffle to interleave users (avoid all queries for one user running together)
-            var rng = new Random(42);
-            for (int i = tasks.Length - 1; i > 0; i--)
             {
-                int j = rng.Next(i + 1);
-                (tasks[i], tasks[j]) = (tasks[j], tasks[i]);
+                int userIdx = u;
+                userTasks[u] = Task.Run(() =>
+                    SimulateUser(userIdx, queries, xmlaEndpoint, dataset, token,
+                        userEmails[userIdx], userRoles[userIdx],
+                        queriesPerBatch, pauseBetweenIterationsMs,
+                        allResults, cts.Token));
             }
 
-            Parallel.ForEach(tasks, options, task =>
-            {
-                string connStr =
-                    $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
-                    $"password={token};Timeout=7200;" +
-                    $"CustomData={userEmails[task.userIdx]};Roles={userRoles[task.userIdx]};";
+            try { Task.WaitAll(userTasks); }
+            catch (AggregateException) { }
+            testStart.Stop();
 
-                var r = RunSingle(task.queryIdx, queries[task.queryIdx], connStr, false);
-                r.Index = task.taskIdx;
-                r.UserIndex = task.userIdx;
-                r.QueryIndex = task.queryIdx;
-                results[task.taskIdx] = r;
-            });
-
-            return results;
+            // Build statistics
+            return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
+                userEmails.Length, queries.Length);
         }
 
-        /// <summary>
-        /// Benchmark: run the same query N times sequentially, then in parallel,
-        /// comparing ExecuteReader vs ExecuteXmlReader.
-        /// Returns a summary string.
-        /// </summary>
-        public static string Benchmark(string query, string connStr, int nQueries = 20, int threads = 4)
+        private static void SimulateUser(
+            int userIndex, string[] queries,
+            string xmlaEndpoint, string dataset, string token,
+            string email, string role,
+            int queriesPerBatch, int pauseMs,
+            ConcurrentBag<QueryResult> results,
+            CancellationToken ct)
         {
-            var lines = new List<string>();
+            string connStr =
+                $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
+                $"password={token};Timeout=7200;" +
+                $"CustomData={email};Roles={role};";
 
-            // Warm up
-            RunSingle(0, query, connStr, false);
+            int iteration = 0;
 
-            // Sequential - DataReader
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < nQueries; i++)
-                RunSingle(i, query, connStr, false);
-            sw.Stop();
-            double seqReaderMs = sw.Elapsed.TotalMilliseconds;
-            double seqReaderQps = nQueries / (seqReaderMs / 1000);
-            lines.Add($"Sequential DataReader: {seqReaderMs:F0}ms, {seqReaderQps:F1} QPS");
+            while (!ct.IsCancellationRequested)
+            {
+                iteration++;
 
-            // Sequential - XmlReader
-            sw.Restart();
-            for (int i = 0; i < nQueries; i++)
-                RunSingle(i, query, connStr, true);
-            sw.Stop();
-            double seqXmlMs = sw.Elapsed.TotalMilliseconds;
-            double seqXmlQps = nQueries / (seqXmlMs / 1000);
-            lines.Add($"Sequential XmlReader:  {seqXmlMs:F0}ms, {seqXmlQps:F1} QPS");
+                // Run all queries, queriesPerBatch at a time
+                RunIteration(userIndex, iteration, queries, connStr,
+                    queriesPerBatch, results, ct);
 
-            // Parallel - DataReader
-            var queries = Enumerable.Repeat(query, nQueries).ToArray();
-            var connStrs = Enumerable.Repeat(connStr, nQueries).ToArray();
+                if (ct.IsCancellationRequested) break;
 
-            sw.Restart();
-            RunBatch(queries, connStrs, threads, false);
-            sw.Stop();
-            double parReaderMs = sw.Elapsed.TotalMilliseconds;
-            double parReaderQps = nQueries / (parReaderMs / 1000);
-            lines.Add($"Parallel({threads}) DataReader: {parReaderMs:F0}ms, {parReaderQps:F1} QPS, speedup={seqReaderMs/parReaderMs:F2}x");
+                // Pause between iterations (simulates user think time)
+                try { Task.Delay(pauseMs, ct).Wait(ct); }
+                catch (OperationCanceledException) { break; }
+            }
+        }
 
-            // Parallel - XmlReader
-            sw.Restart();
-            RunBatch(queries, connStrs, threads, true);
-            sw.Stop();
-            double parXmlMs = sw.Elapsed.TotalMilliseconds;
-            double parXmlQps = nQueries / (parXmlMs / 1000);
-            lines.Add($"Parallel({threads}) XmlReader:  {parXmlMs:F0}ms, {parXmlQps:F1} QPS, speedup={seqXmlMs/parXmlMs:F2}x");
+        private static void RunIteration(
+            int userIndex, int iteration, string[] queries, string connStr,
+            int maxConcurrent, ConcurrentBag<QueryResult> results,
+            CancellationToken ct)
+        {
+            using var semaphore = new SemaphoreSlim(maxConcurrent);
+            var tasks = new List<Task>();
 
-            return string.Join("\n", lines);
+            for (int q = 0; q < queries.Length; q++)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                try { semaphore.Wait(ct); }
+                catch (OperationCanceledException) { break; }
+
+                int queryIdx = q;
+                int iter = iteration;
+
+                tasks.Add(Task.Run(() =>
+                {
+                    try
+                    {
+                        var result = ExecuteQuery(userIndex, queryIdx, iter,
+                            queries[queryIdx], connStr);
+                        results.Add(result);
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }));
+            }
+
+            try { Task.WaitAll(tasks.ToArray()); }
+            catch (AggregateException) { }
+        }
+
+        private static QueryResult ExecuteQuery(
+            int userIndex, int queryIndex, int iteration,
+            string query, string connStr)
+        {
+            var result = new QueryResult
+            {
+                UserIndex = userIndex,
+                QueryIndex = queryIndex,
+                Iteration = iteration,
+            };
+
+            try
+            {
+                using var conn = new AdomdConnection(connStr);
+                conn.Open();
+                var cmd = new AdomdCommand(query, conn);
+                var sw = Stopwatch.StartNew();
+                using var reader = cmd.ExecuteReader();
+                int count = 0;
+                while (reader.Read()) count++;
+                sw.Stop();
+                result.RowCount = count;
+                result.DurationMs = sw.Elapsed.TotalMilliseconds;
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.Message.Length > 200
+                    ? ex.Message.Substring(0, 200)
+                    : ex.Message;
+            }
+
+            return result;
+        }
+
+        private static string BuildStats(
+            List<QueryResult> results, double totalMs,
+            int nUsers, int nQueries)
+        {
+            var successful = results.Where(r => r.Error == null).ToList();
+            var failed = results.Where(r => r.Error != null).ToList();
+            var durations = successful.Select(r => r.DurationMs).OrderBy(d => d).ToList();
+
+            int maxIteration = results.Any() ? results.Max(r => r.Iteration) : 0;
+
+            var stats = new Dictionary<string, object>
+            {
+                ["totalDurationMs"] = Math.Round(totalMs),
+                ["users"] = nUsers,
+                ["queriesPerIteration"] = nQueries,
+                ["totalExecutions"] = results.Count,
+                ["successfulExecutions"] = successful.Count,
+                ["failedExecutions"] = failed.Count,
+                ["maxIteration"] = maxIteration,
+                ["qps"] = Math.Round(successful.Count / (totalMs / 1000), 1),
+            };
+
+            if (durations.Any())
+            {
+                stats["latency"] = new Dictionary<string, object>
+                {
+                    ["min"] = Math.Round(durations.First()),
+                    ["max"] = Math.Round(durations.Last()),
+                    ["mean"] = Math.Round(durations.Average()),
+                    ["median"] = Math.Round(Percentile(durations, 50)),
+                    ["p95"] = Math.Round(Percentile(durations, 95)),
+                    ["p99"] = Math.Round(Percentile(durations, 99)),
+                };
+            }
+
+            // Per-user stats
+            var perUser = new List<Dictionary<string, object>>();
+            foreach (var g in results.GroupBy(r => r.UserIndex).OrderBy(g => g.Key))
+            {
+                var uSuccess = g.Where(r => r.Error == null).ToList();
+                var uDurations = uSuccess.Select(r => r.DurationMs).OrderBy(d => d).ToList();
+                perUser.Add(new Dictionary<string, object>
+                {
+                    ["userIndex"] = g.Key,
+                    ["iterations"] = g.Any() ? g.Max(r => r.Iteration) : 0,
+                    ["executions"] = g.Count(),
+                    ["errors"] = g.Count(r => r.Error != null),
+                    ["meanLatencyMs"] = uDurations.Any() ? Math.Round(uDurations.Average()) : 0,
+                });
+            }
+            stats["perUser"] = perUser;
+
+            // Sample errors
+            if (failed.Any())
+            {
+                stats["sampleErrors"] = failed.Take(3)
+                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Error })
+                    .ToList();
+            }
+
+            return JsonSerializer.Serialize(stats, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+            });
+        }
+
+        private static double Percentile(List<double> sorted, double p)
+        {
+            if (!sorted.Any()) return 0;
+            int idx = (int)Math.Ceiling(p / 100.0 * sorted.Count) - 1;
+            return sorted[Math.Max(0, Math.Min(idx, sorted.Count - 1))];
         }
     }
 }
