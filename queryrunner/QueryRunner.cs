@@ -22,24 +22,17 @@ namespace Datagen
 
     public static class QueryRunner
     {
-        // Collect errors that happen outside individual query execution
-        private static readonly ConcurrentBag<string> _infraErrors = new();
-
         public static string RunLoadTest(
-            string[] queries,
-            string xmlaEndpoint,
-            string dataset,
-            string token,
-            string[] userEmails,
-            string[] userRoles,
-            int durationSeconds = 60,
-            int queriesPerBatch = 4,
+            string[] queries, string xmlaEndpoint, string dataset, string token,
+            string[] userEmails, string[] userRoles,
+            int durationSeconds = 60, int queriesPerBatch = 4,
             int pauseBetweenIterationsMs = 1000)
         {
-            _infraErrors.Clear();
             var allResults = new ConcurrentBag<QueryResult>();
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
             var testStart = Stopwatch.StartNew();
+
+            Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user");
 
             var userTasks = new Task[userEmails.Length];
             for (int u = 0; u < userEmails.Length; u++)
@@ -52,49 +45,31 @@ namespace Datagen
                         allResults, cts.Token));
             }
 
-            // Wait for all user tasks — they exit on cancellation or error
-            try { Task.WaitAll(userTasks); }
-            catch (AggregateException ae)
-            {
-                foreach (var ex in ae.Flatten().InnerExceptions)
-                {
-                    if (ex is not OperationCanceledException)
-                        _infraErrors.Add($"User task failed: {ex.Message}");
-                }
-            }
+            Task.WaitAll(userTasks);
             testStart.Stop();
+            Console.WriteLine($"[QueryRunner] Done: {allResults.Count} executions in {testStart.Elapsed.TotalSeconds:F1}s");
 
             return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
                 userEmails.Length, queries.Length);
         }
 
         private static void SimulateUser(
-            int userIndex, string[] queries,
-            string xmlaEndpoint, string dataset, string token,
-            string email, string role,
-            int queriesPerBatch, int pauseMs,
-            ConcurrentBag<QueryResult> results,
-            CancellationToken ct)
+            int userIndex, string[] queries, string xmlaEndpoint, string dataset,
+            string token, string email, string role, int queriesPerBatch, int pauseMs,
+            ConcurrentBag<QueryResult> results, CancellationToken ct)
         {
             string connStr =
                 $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
-                $"password={token};Timeout=7200;" +
-                $"CustomData={email};Roles={role};";
+                $"password={token};Timeout=7200;CustomData={email};Roles={role};";
 
+            Console.WriteLine($"[User {userIndex}] Connecting ({email}) ...");
             var connections = new AdomdConnection[queriesPerBatch];
-            try
+            for (int c = 0; c < queriesPerBatch; c++)
             {
-                for (int c = 0; c < queriesPerBatch; c++)
-                {
-                    connections[c] = new AdomdConnection(connStr);
-                    connections[c].Open();
-                }
+                connections[c] = new AdomdConnection(connStr);
+                connections[c].Open();
             }
-            catch (Exception ex)
-            {
-                _infraErrors.Add($"User {userIndex} connection failed: {ex.Message}");
-                return;
-            }
+            Console.WriteLine($"[User {userIndex}] {queriesPerBatch} connections open");
 
             try
             {
@@ -102,100 +77,69 @@ namespace Datagen
                 while (!ct.IsCancellationRequested)
                 {
                     iteration++;
-                    RunIteration(userIndex, iteration, queries, connections,
-                        results, ct);
-
+                    RunIteration(userIndex, iteration, queries, connections, results, ct);
                     if (ct.IsCancellationRequested) break;
-
-                    // Pause — OperationCanceledException is expected at test end
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
                 }
+                Console.WriteLine($"[User {userIndex}] Done after {iteration} iterations");
             }
             finally
             {
                 for (int c = 0; c < connections.Length; c++)
-                {
-                    if (connections[c] == null) continue;
-                    try { connections[c].Close(); connections[c].Dispose(); }
-                    catch (Exception ex)
-                    {
-                        _infraErrors.Add($"User {userIndex} conn {c} close failed: {ex.Message}");
-                    }
-                }
+                    if (connections[c] != null) { connections[c].Close(); connections[c].Dispose(); }
             }
         }
 
         private static void RunIteration(
             int userIndex, int iteration, string[] queries,
-            AdomdConnection[] connections,
-            ConcurrentBag<QueryResult> results,
+            AdomdConnection[] connections, ConcurrentBag<QueryResult> results,
             CancellationToken ct)
         {
-            int maxConcurrent = connections.Length;
-            using var semaphore = new SemaphoreSlim(maxConcurrent);
+            int max = connections.Length;
+            using var sem = new SemaphoreSlim(max);
             var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
             var tasks = new List<Task>();
 
             for (int q = 0; q < queries.Length; q++)
             {
                 if (ct.IsCancellationRequested) break;
-
-                // Semaphore wait — OperationCanceledException is expected at test end
-                try { semaphore.Wait(ct); }
+                try { sem.Wait(ct); }
                 catch (OperationCanceledException) { break; }
 
-                int queryIdx = q;
-                int iter = iteration;
-
+                int qi = q; int iter = iteration;
                 tasks.Add(Task.Run(() =>
                 {
                     AdomdConnection? conn = null;
                     try
                     {
                         if (!connSlots.TryDequeue(out conn))
+                            throw new InvalidOperationException("No connection available");
+
+                        var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn);
+                        results.Add(r);
+                        if (r.Error != null)
                         {
-                            results.Add(new QueryResult
-                            {
-                                UserIndex = userIndex, QueryIndex = queryIdx,
-                                Iteration = iter, Error = "No connection available",
-                            });
-                            return;
+                            Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
+                            throw new Exception(r.Error);
                         }
-                        var result = ExecuteQuery(userIndex, queryIdx, iter,
-                            queries[queryIdx], conn);
-                        results.Add(result);
                     }
                     finally
                     {
                         if (conn != null) connSlots.Enqueue(conn);
-                        semaphore.Release();
+                        sem.Release();
                     }
                 }));
             }
 
-            // Wait for in-flight queries to complete
-            try { Task.WaitAll(tasks.ToArray()); }
-            catch (AggregateException ae)
-            {
-                foreach (var ex in ae.Flatten().InnerExceptions)
-                {
-                    _infraErrors.Add($"User {userIndex} iter {iteration}: {ex.Message}");
-                }
-            }
+            Task.WaitAll(tasks.ToArray());
         }
 
-        private static QueryResult ExecuteQuery(
-            int userIndex, int queryIndex, int iteration,
-            string query, AdomdConnection conn)
+        private static QueryResult ExecuteQuery(int userIndex, int queryIndex,
+            int iteration, string query, AdomdConnection conn)
         {
-            var result = new QueryResult
-            {
-                UserIndex = userIndex,
-                QueryIndex = queryIndex,
-                Iteration = iteration,
-            };
-
+            var result = new QueryResult {
+                UserIndex = userIndex, QueryIndex = queryIndex, Iteration = iteration };
             try
             {
                 var cmd = new AdomdCommand(query, conn);
@@ -209,23 +153,18 @@ namespace Datagen
             }
             catch (Exception ex)
             {
-                result.Error = ex.Message.Length > 300
-                    ? ex.Message.Substring(0, 300)
-                    : ex.Message;
+                result.Error = ex.Message.Length > 500 ? ex.Message[..500] : ex.Message;
             }
-
             return result;
         }
 
-        private static string BuildStats(
-            List<QueryResult> results, double totalMs,
+        private static string BuildStats(List<QueryResult> results, double totalMs,
             int nUsers, int nQueries)
         {
-            var successful = results.Where(r => r.Error == null).ToList();
-            var failed = results.Where(r => r.Error != null).ToList();
-            var durations = successful.Select(r => r.DurationMs).OrderBy(d => d).ToList();
-
-            int maxIteration = results.Any() ? results.Max(r => r.Iteration) : 0;
+            var ok = results.Where(r => r.Error == null).ToList();
+            var fail = results.Where(r => r.Error != null).ToList();
+            var durs = ok.Select(r => r.DurationMs).OrderBy(d => d).ToList();
+            int maxIter = results.Any() ? results.Max(r => r.Iteration) : 0;
 
             var stats = new Dictionary<string, object>
             {
@@ -233,64 +172,43 @@ namespace Datagen
                 ["users"] = nUsers,
                 ["queriesPerIteration"] = nQueries,
                 ["totalExecutions"] = results.Count,
-                ["successfulExecutions"] = successful.Count,
-                ["failedExecutions"] = failed.Count,
-                ["maxIteration"] = maxIteration,
-                ["qps"] = Math.Round(successful.Count / (totalMs / 1000), 1),
+                ["successfulExecutions"] = ok.Count,
+                ["failedExecutions"] = fail.Count,
+                ["maxIteration"] = maxIter,
+                ["qps"] = Math.Round(ok.Count / (totalMs / 1000), 1),
             };
 
-            if (durations.Any())
-            {
+            if (durs.Any())
                 stats["latency"] = new Dictionary<string, object>
                 {
-                    ["min"] = Math.Round(durations.First()),
-                    ["max"] = Math.Round(durations.Last()),
-                    ["mean"] = Math.Round(durations.Average()),
-                    ["median"] = Math.Round(Percentile(durations, 50)),
-                    ["p95"] = Math.Round(Percentile(durations, 95)),
-                    ["p99"] = Math.Round(Percentile(durations, 99)),
+                    ["min"] = Math.Round(durs.First()),
+                    ["max"] = Math.Round(durs.Last()),
+                    ["mean"] = Math.Round(durs.Average()),
+                    ["median"] = Math.Round(Pct(durs, 50)),
+                    ["p95"] = Math.Round(Pct(durs, 95)),
+                    ["p99"] = Math.Round(Pct(durs, 99)),
                 };
-            }
 
-            var perUser = new List<Dictionary<string, object>>();
-            foreach (var g in results.GroupBy(r => r.UserIndex).OrderBy(g => g.Key))
-            {
-                var uSuccess = g.Where(r => r.Error == null).ToList();
-                var uDurations = uSuccess.Select(r => r.DurationMs).OrderBy(d => d).ToList();
-                perUser.Add(new Dictionary<string, object>
+            var perUser = results.GroupBy(r => r.UserIndex).OrderBy(g => g.Key)
+                .Select(g => new Dictionary<string, object>
                 {
                     ["userIndex"] = g.Key,
-                    ["iterations"] = g.Any() ? g.Max(r => r.Iteration) : 0,
+                    ["iterations"] = g.Max(r => r.Iteration),
                     ["executions"] = g.Count(),
                     ["errors"] = g.Count(r => r.Error != null),
-                    ["meanLatencyMs"] = uDurations.Any() ? Math.Round(uDurations.Average()) : 0,
-                });
-            }
+                    ["meanLatencyMs"] = g.Where(r => r.Error == null).Select(r => r.DurationMs)
+                        .DefaultIfEmpty(0).Average() is var avg ? Math.Round(avg) : 0,
+                }).ToList();
             stats["perUser"] = perUser;
 
-            if (failed.Any())
-            {
-                stats["sampleErrors"] = failed.Take(5)
-                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Iteration, r.Error })
-                    .ToList();
-            }
+            if (fail.Any())
+                stats["sampleErrors"] = fail.Take(5)
+                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Iteration, r.Error }).ToList();
 
-            if (_infraErrors.Any())
-            {
-                stats["infrastructureErrors"] = _infraErrors.Take(10).ToList();
-            }
-
-            return JsonSerializer.Serialize(stats, new JsonSerializerOptions
-            {
-                WriteIndented = true,
-            });
+            return JsonSerializer.Serialize(stats, new JsonSerializerOptions { WriteIndented = true });
         }
 
-        private static double Percentile(List<double> sorted, double p)
-        {
-            if (!sorted.Any()) return 0;
-            int idx = (int)Math.Ceiling(p / 100.0 * sorted.Count) - 1;
-            return sorted[Math.Max(0, Math.Min(idx, sorted.Count - 1))];
-        }
+        private static double Pct(List<double> s, double p) =>
+            !s.Any() ? 0 : s[Math.Clamp((int)Math.Ceiling(p / 100.0 * s.Count) - 1, 0, s.Count - 1)];
     }
 }
