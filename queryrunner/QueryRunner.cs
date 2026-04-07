@@ -119,41 +119,65 @@ namespace Datagen
             int maxConcurrent, ConcurrentBag<QueryResult> results,
             CancellationToken ct)
         {
-            using var semaphore = new SemaphoreSlim(maxConcurrent);
-            var tasks = new List<Task>();
-
-            for (int q = 0; q < queries.Length; q++)
+            // Create a pool of connections for this iteration
+            var connections = new AdomdConnection[maxConcurrent];
+            for (int c = 0; c < maxConcurrent; c++)
             {
-                if (ct.IsCancellationRequested) break;
-
-                try { semaphore.Wait(ct); }
-                catch (OperationCanceledException) { break; }
-
-                int queryIdx = q;
-                int iter = iteration;
-
-                tasks.Add(Task.Run(() =>
-                {
-                    try
-                    {
-                        var result = ExecuteQuery(userIndex, queryIdx, iter,
-                            queries[queryIdx], connStr);
-                        results.Add(result);
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                }));
+                connections[c] = new AdomdConnection(connStr);
+                connections[c].Open();
             }
 
-            try { Task.WaitAll(tasks.ToArray()); }
-            catch (AggregateException) { }
+            try
+            {
+                using var semaphore = new SemaphoreSlim(maxConcurrent);
+                var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
+                var tasks = new List<Task>();
+
+                for (int q = 0; q < queries.Length; q++)
+                {
+                    if (ct.IsCancellationRequested) break;
+
+                    try { semaphore.Wait(ct); }
+                    catch (OperationCanceledException) { break; }
+
+                    int queryIdx = q;
+                    int iter = iteration;
+
+                    tasks.Add(Task.Run(() =>
+                    {
+                        AdomdConnection conn = null!;
+                        try
+                        {
+                            connSlots.TryDequeue(out conn!);
+                            var result = ExecuteQuery(userIndex, queryIdx, iter,
+                                queries[queryIdx], conn);
+                            results.Add(result);
+                        }
+                        finally
+                        {
+                            if (conn != null) connSlots.Enqueue(conn);
+                            semaphore.Release();
+                        }
+                    }));
+                }
+
+                try { Task.WaitAll(tasks.ToArray()); }
+                catch (AggregateException) { }
+            }
+            finally
+            {
+                // Close all connections at end of iteration
+                foreach (var conn in connections)
+                {
+                    try { conn.Close(); conn.Dispose(); }
+                    catch { }
+                }
+            }
         }
 
         private static QueryResult ExecuteQuery(
             int userIndex, int queryIndex, int iteration,
-            string query, string connStr)
+            string query, AdomdConnection conn)
         {
             var result = new QueryResult
             {
@@ -164,8 +188,6 @@ namespace Datagen
 
             try
             {
-                using var conn = new AdomdConnection(connStr);
-                conn.Open();
                 var cmd = new AdomdCommand(query, conn);
                 var sw = Stopwatch.StartNew();
                 using var reader = cmd.ExecuteReader();
