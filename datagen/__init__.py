@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.8.19"
+__version__ = "0.8.20"
 
 
 def generate(
@@ -20,6 +20,7 @@ def generate(
     include_hidden=False,
     include_calculated=False,
     queries_path=None,
+    skew_recent=False,
 ):
     """One-call pipeline: .vpax → Delta tables → semantic model → comparison report.
 
@@ -119,7 +120,8 @@ def generate(
     succeeded_tables, actual_output_path = generate_all_tables(
         spark, config, output_path=output_path,
         output_format=output_format, vpax_model=vpax_model,
-        overwrite=overwrite_tables, skip_tables=tables_to_skip)
+        overwrite=overwrite_tables, skip_tables=tables_to_skip,
+        skew_recent=skew_recent)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:

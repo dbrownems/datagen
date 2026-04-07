@@ -147,7 +147,11 @@ def _col_to_dict(col):
     if isinstance(col, dict):
         return col
     from dataclasses import asdict
-    return asdict(col)
+    d = asdict(col)
+    # Carry over runtime flags (not part of the dataclass)
+    if getattr(col, "_skew_recent", False):
+        d["_skew_recent"] = True
+    return d
 
 
 def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
@@ -241,6 +245,14 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
                         # Weighted selection (fixed values with explicit frequencies)
                         w = np.array(col_weights, dtype=np.float64)
                         indices = rng.choice(cardinality, size=n, p=w)
+                    elif col.get("_skew_recent") and data_type == "datetime":
+                        # Skew towards recent dates (end of sorted pool)
+                        # Exponential: ~60% of rows in the last 2 quarters
+                        uniform = rng.random(n)
+                        indices = np.floor(
+                            cardinality * np.power(uniform, 0.3)
+                        ).astype(np.int64)
+                        indices = np.clip(indices, 0, cardinality - 1)
                     elif col.get("selection") == "zipf":
                         exponent = max(col.get("zipf_exponent", 1.0), 0.01)
                         uniform = rng.random(n)
@@ -443,7 +455,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     }
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None):
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None, skew_recent=False):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -458,6 +470,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             that already exist as Delta/parquet and only generate missing ones.
         skip_tables: Set of table names to skip entirely (e.g. measure-only,
             enter-data tables in import mode).
+        skew_recent: If True, skew fact table datetime columns towards
+            recent dates (~60% in last 2 quarters).
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -565,6 +579,17 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
                 timing = {"total_time": 0}
                 is_date = True
             else:
+                # Apply date skew to datetime columns in fact tables
+                if skew_recent:
+                    cols = table.columns if hasattr(table, "columns") else table.get("columns", [])
+                    for col in cols:
+                        dt = col.data_type if hasattr(col, "data_type") else col.get("data_type", "")
+                        if dt == "datetime":
+                            if hasattr(col, "_skew_recent"):
+                                col._skew_recent = True
+                            elif isinstance(col, dict):
+                                col["_skew_recent"] = True
+
                 timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
                 is_date = False
 
