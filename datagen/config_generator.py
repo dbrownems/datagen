@@ -39,7 +39,7 @@ _RELATIVE_TIME_VALUES = {
         "Current Quarter", "Previous Quarter", "Previous Quarter-1",
         "Previous Quarter-2", "Previous Quarter-3",
         "Current Quarter+1", "Current Quarter+2", "Current Quarter+3",
-        "Current Quarter+4",
+        "Current Quarter+4", "Previous Quarter-4",
     ],
     "dynamic_week": [
         "Current Week", "Previous Week", "Next Week",
@@ -89,7 +89,7 @@ def _is_boolean_like(col_name, cardinality):
     Returns True for names like IsActive, HasEmail, Active, New Logo Flag, etc.
     Only triggers when cardinality is ≤ 2 (true/false or yes/no).
     """
-    if cardinality > 2:
+    if cardinality > 3:
         return False
     normalized = col_name.replace(" ", "").replace("_", "").replace("-", "").lower()
     if normalized in _BOOL_EXACT:
