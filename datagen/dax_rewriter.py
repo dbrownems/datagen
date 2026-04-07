@@ -350,6 +350,85 @@ def rewrite_queries(queries, value_map, seed=42, skip_tables=None):
 
 
 # ---------------------------------------------------------------------------
+# Query-informed value extraction
+# ---------------------------------------------------------------------------
+
+def extract_query_values(config, queries_path, max_cardinality=20):
+    """Extract original filter values from captured queries and apply them
+    to low-cardinality columns in the generation config.
+
+    For columns with cardinality ≤ max_cardinality that appear in query
+    filter bindings, replace the generated values with the original values
+    from the queries. This ensures filter predicates match real data.
+
+    Args:
+        config: GenerationConfig dataclass.
+        queries_path: Path to queries.json file.
+        max_cardinality: Only apply to columns with this many or fewer distinct values.
+
+    Returns:
+        Number of columns updated.
+    """
+    # Load queries
+    with open(queries_path, "r", encoding="utf-8") as f:
+        queries = json.load(f)
+
+    # Collect all filter values per (table, column) from queries
+    query_values = defaultdict(set)
+    for q in queries:
+        text = q.get("[EventText]", "") or q.get("EventText", "")
+        if not text:
+            continue
+        for b in extract_filter_bindings(text):
+            key = (b["table"], b["column"])
+            for v in b["values"]:
+                if not _is_column_reference(v):
+                    query_values[key].add(v)
+
+    # Apply to config columns with low cardinality
+    tables = config.tables if hasattr(config, "tables") else config.get("tables", [])
+    n_updated = 0
+
+    for tc in tables:
+        tname = tc.name if hasattr(tc, "name") else tc["name"]
+        cols = tc.columns if hasattr(tc, "columns") else tc.get("columns", [])
+
+        for col in cols:
+            cname = col.name if hasattr(col, "name") else col["name"]
+            card = col.cardinality if hasattr(col, "cardinality") else col.get("cardinality", 0)
+            dtype = col.data_type if hasattr(col, "data_type") else col.get("data_type", "string")
+
+            # Skip if already has fixed values or cardinality too high
+            existing_values = col.values if hasattr(col, "values") else col.get("values")
+            if existing_values:
+                continue
+            if card > max_cardinality:
+                continue
+            if dtype != "string":
+                continue
+
+            key = (tname, cname)
+            if key not in query_values:
+                continue
+
+            vals = sorted(query_values[key])
+            if not vals:
+                continue
+
+            # Apply the query values as fixed values
+            if hasattr(col, "values"):
+                col.values = vals
+                col.cardinality = len(vals)
+            else:
+                col["values"] = vals
+                col["cardinality"] = len(vals)
+
+            n_updated += 1
+
+    return n_updated
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

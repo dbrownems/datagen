@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.8.18"
+__version__ = "0.8.19"
 
 
 def generate(
@@ -19,6 +19,7 @@ def generate(
     output_format="delta",
     include_hidden=False,
     include_calculated=False,
+    queries_path=None,
 ):
     """One-call pipeline: .vpax → Delta tables → semantic model → comparison report.
 
@@ -84,6 +85,13 @@ def generate(
         include_hidden=include_hidden,
         include_calculated=include_calculated,
     )
+
+    # Extract fixed values from captured queries for low-cardinality columns
+    if queries_path:
+        from .dax_rewriter import extract_query_values
+        n_fixed = extract_query_values(config, queries_path)
+        if n_fixed:
+            print(f"  Applied {n_fixed} column value(s) from queries", flush=True)
 
     # Cross-reference with BIM to add columns missing from VPAX stats
     # (Direct Lake needs all BIM columns in Delta; Import mode doesn't)
