@@ -26,13 +26,13 @@ namespace Datagen
             string[] queries, string xmlaEndpoint, string dataset, string token,
             string[] userEmails, string[] userRoles,
             int durationSeconds = 60, int queriesPerBatch = 4,
-            int pauseBetweenIterationsMs = 1000)
+            int pauseBetweenIterationsMs = 1000, int pauseBetweenQueriesMs = 0)
         {
             var allResults = new ConcurrentBag<QueryResult>();
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
             var testStart = Stopwatch.StartNew();
 
-            Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user");
+            Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query");
 
             var userTasks = new Task[userEmails.Length];
             for (int u = 0; u < userEmails.Length; u++)
@@ -41,7 +41,7 @@ namespace Datagen
                 userTasks[u] = Task.Run(() =>
                     SimulateUser(userIdx, queries, xmlaEndpoint, dataset, token,
                         userEmails[userIdx], userRoles[userIdx],
-                        queriesPerBatch, pauseBetweenIterationsMs,
+                        queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
                         allResults, cts.Token));
             }
 
@@ -56,6 +56,7 @@ namespace Datagen
         private static void SimulateUser(
             int userIndex, string[] queries, string xmlaEndpoint, string dataset,
             string token, string email, string role, int queriesPerBatch, int pauseMs,
+            int pauseBetweenQueriesMs,
             ConcurrentBag<QueryResult> results, CancellationToken ct)
         {
             string connStr =
@@ -77,7 +78,8 @@ namespace Datagen
                 while (!ct.IsCancellationRequested)
                 {
                     iteration++;
-                    RunIteration(userIndex, iteration, queries, connections, results, ct);
+                    RunIteration(userIndex, iteration, queries, connections,
+                        pauseBetweenQueriesMs, results, ct);
                     if (ct.IsCancellationRequested) break;
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
@@ -93,7 +95,8 @@ namespace Datagen
 
         private static void RunIteration(
             int userIndex, int iteration, string[] queries,
-            AdomdConnection[] connections, ConcurrentBag<QueryResult> results,
+            AdomdConnection[] connections, int pauseBetweenQueriesMs,
+            ConcurrentBag<QueryResult> results,
             CancellationToken ct)
         {
             int max = connections.Length;
@@ -122,6 +125,11 @@ namespace Datagen
                         {
                             Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
                             throw new Exception(r.Error);
+                        }
+                        if (pauseBetweenQueriesMs > 0)
+                        {
+                            try { Task.Delay(pauseBetweenQueriesMs, ct).Wait(ct); }
+                            catch (OperationCanceledException) { }
                         }
                     }
                     finally
