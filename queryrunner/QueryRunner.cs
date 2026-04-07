@@ -1,437 +1,236 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
-using System.Text;
-using System.Text.Json;
-using System.Threading;
 using System.Threading.Tasks;
+using System.Xml;
 using Microsoft.AnalysisServices.AdomdClient;
 
 namespace Datagen
 {
+    /// <summary>
+    /// Result of a single query execution.
+    /// </summary>
     public class QueryResult
     {
+        public int Index { get; set; }
         public int UserIndex { get; set; }
         public int QueryIndex { get; set; }
-        public int Iteration { get; set; }
         public int RowCount { get; set; }
         public double DurationMs { get; set; }
-        public double StartTimeMs { get; set; }
         public string? Error { get; set; }
     }
 
-    internal class TelemetryRecord
-    {
-        public int QueryNumber { get; set; }
-        public string UserEmail { get; set; } = "";
-        public DateTime Timestamp { get; set; }
-        public double StartTimeMs { get; set; }
-        public double DurationMs { get; set; }
-        public string Outcome { get; set; } = "";
-        public string MessageText { get; set; } = "";
-        public int ActiveUsers { get; set; }
-    }
-
+    /// <summary>
+    /// Runs DAX queries in parallel against an XMLA endpoint using ADOMD.NET.
+    /// Each virtual user gets its own connection.
+    /// </summary>
     public static class QueryRunner
     {
-
-        public static string RunLoadTest(
-            string[] queries, string xmlaEndpoint, string dataset, string token,
-            string[] userEmails, string[] userRoles,
-            int durationSeconds = 60, int queriesPerBatch = 4,
-            int pauseBetweenIterationsMs = 1000, int pauseBetweenQueriesMs = 0,
-            string? logDirectory = null, int userRampTimeSec = 0,
-            string? logFileName = null)
+        /// <summary>
+        /// Run a batch of queries in parallel.
+        /// Each query gets its own connection (built from connectionStrings[i]).
+        /// </summary>
+        /// <param name="queries">DAX query texts</param>
+        /// <param name="connectionStrings">Connection string per query (may repeat for same user)</param>
+        /// <param name="maxParallelism">Max concurrent queries</param>
+        /// <param name="useXmlReader">If true, use ExecuteXmlReader (faster, count rows only)</param>
+        /// <returns>Array of QueryResult</returns>
+        public static QueryResult[] RunBatch(
+            string[] queries,
+            string[] connectionStrings,
+            int maxParallelism = 8,
+            bool useXmlReader = false)
         {
-            var allResults = new ConcurrentBag<QueryResult>();
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
-            var testStart = Stopwatch.StartNew();
-            var testStartTime = DateTime.UtcNow;
+            var results = new QueryResult[queries.Length];
+            var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
 
-            Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query, ramp={userRampTimeSec}s");
-
-            // Set up telemetry log writer
-            BlockingCollection<TelemetryRecord>? telemetryQueue = null;
-            Task? logWriterTask = null;
-            string? logFilePath = null;
-
-            if (!string.IsNullOrEmpty(logDirectory))
+            Parallel.For(0, queries.Length, options, i =>
             {
-                Directory.CreateDirectory(logDirectory);
-                var fileName = !string.IsNullOrEmpty(logFileName)
-                    ? logFileName
-                    : $"LoadTest.{testStartTime:yyyyMMdd-HHmmss}.csv";
-                logFilePath = Path.Combine(logDirectory, fileName);
-                Console.WriteLine($"[QueryRunner] Logging to: {logFilePath}");
+                results[i] = RunSingle(i, queries[i], connectionStrings[i], useXmlReader);
+            });
 
-                // Write CSV header
-                File.WriteAllText(logFilePath, "QueryNumber,UserEmail,Timestamp,StartTimeMs,DurationMs,Outcome,MessageText,ActiveUsers\n");
-
-                telemetryQueue = new BlockingCollection<TelemetryRecord>(boundedCapacity: 10000);
-                logWriterTask = Task.Run(() => LogWriterLoop(telemetryQueue, logFilePath, cts.Token));
-            }
-
-            // Shared active user counter (array so it can be captured in lambdas)
-            var activeUsers = new int[] { 0 };
-
-            // Calculate per-user start delays for ramp-up
-            int nUsers = userEmails.Length;
-            double rampIntervalMs = nUsers > 1 && userRampTimeSec > 0
-                ? (userRampTimeSec * 1000.0) / (nUsers - 1)
-                : 0;
-
-            var totalConnectTimeMs = new long[] { 0 };
-            int progressStep = Math.Max(1, nUsers / 10);
-            int batchSize = 10;
-
-            var userTasks = new Task[nUsers];
-            for (int batchStart = 0; batchStart < nUsers; batchStart += batchSize)
-            {
-                int batchEnd = Math.Min(batchStart + batchSize, nUsers);
-                var batchSw = Stopwatch.StartNew();
-
-                // Open connections for this batch in parallel
-                var connectTasks = new Task<AdomdConnection[]>[batchEnd - batchStart];
-                for (int b = 0; b < connectTasks.Length; b++)
-                {
-                    int userIdx = batchStart + b;
-                    string connStr =
-                        $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
-                        $"password={token};Timeout=7200;CustomData={userEmails[userIdx]};Roles={userRoles[userIdx]};";
-
-                    connectTasks[b] = Task.Run(() =>
-                    {
-                        var sw = Stopwatch.StartNew();
-                        var conns = new AdomdConnection[queriesPerBatch];
-                        for (int c = 0; c < queriesPerBatch; c++)
-                        {
-                            conns[c] = new AdomdConnection(connStr);
-                            conns[c].Open();
-                        }
-                        sw.Stop();
-                        Interlocked.Add(ref totalConnectTimeMs[0], (long)sw.Elapsed.TotalMilliseconds);
-                        Interlocked.Increment(ref activeUsers[0]);
-                        return conns;
-                    });
-                }
-                Task.WaitAll(connectTasks);
-                batchSw.Stop();
-
-                // Start query loops for this batch
-                for (int b = 0; b < connectTasks.Length; b++)
-                {
-                    int userIdx = batchStart + b;
-                    var connections = connectTasks[b].Result;
-                    userTasks[userIdx] = Task.Run(() =>
-                        SimulateUserWithConnections(userIdx, queries, userEmails[userIdx],
-                            queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
-                            connections, allResults, testStart, telemetryQueue, activeUsers, cts.Token));
-                }
-
-                // Progress every 10%
-                if (batchEnd % progressStep == 0 || batchEnd == nUsers)
-                {
-                    int active = Volatile.Read(ref activeUsers[0]);
-                    double avgMs = active > 0 ? Volatile.Read(ref totalConnectTimeMs[0]) / (double)active : 0;
-                    Console.WriteLine($"[QueryRunner] Ramp: {batchEnd}/{nUsers} connected, avg connect {avgMs:F0}ms, t={testStart.Elapsed.TotalSeconds:F0}s");
-                }
-
-                // Stagger: wait before next batch
-                if (rampIntervalMs > 0 && batchEnd < nUsers)
-                {
-                    int batchDelayMs = Math.Max(0, (int)(rampIntervalMs * batchSize) - (int)batchSw.Elapsed.TotalMilliseconds);
-                    if (batchDelayMs > 0)
-                    {
-                        try { Task.Delay(batchDelayMs, cts.Token).Wait(cts.Token); }
-                        catch (OperationCanceledException) { break; }
-                    }
-                }
-            }
-
-            Task.WaitAll(userTasks);
-            testStart.Stop();
-
-            // Shut down log writer
-            if (telemetryQueue != null)
-            {
-                telemetryQueue.CompleteAdding();
-                logWriterTask?.Wait(TimeSpan.FromSeconds(10));
-                Console.WriteLine($"[QueryRunner] Log written: {logFilePath}");
-            }
-
-            Console.WriteLine($"[QueryRunner] Done: {allResults.Count} executions in {testStart.Elapsed.TotalSeconds:F1}s");
-
-            return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
-                userEmails.Length, queries.Length, logFilePath);
+            return results;
         }
 
-        private static void LogWriterLoop(BlockingCollection<TelemetryRecord> queue,
-            string logFilePath, CancellationToken ct)
+        /// <summary>
+        /// Run a single query with its own connection, measuring duration and row count.
+        /// </summary>
+        private static QueryResult RunSingle(int index, string query, string connStr, bool useXmlReader)
         {
-            var batch = new List<TelemetryRecord>();
-
-            while (!queue.IsCompleted)
-            {
-                batch.Clear();
-
-                // Block up to 10 seconds for the first item
-                try
-                {
-                    if (queue.TryTake(out var first, TimeSpan.FromSeconds(10)))
-                        batch.Add(first);
-                    else
-                        continue;
-                }
-                catch (InvalidOperationException) { break; } // CompleteAdding was called
-
-                // Drain any remaining items without blocking
-                while (queue.TryTake(out var item))
-                    batch.Add(item);
-
-                if (batch.Count == 0) continue;
-
-                // Open, append, close — blobfuse doesn't support file sharing
-                var sb = new StringBuilder();
-                foreach (var r in batch)
-                {
-                    var msg = SanitizeCsvField(r.MessageText);
-                    sb.AppendLine(
-                        $"{r.QueryNumber},{r.UserEmail},{r.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{r.StartTimeMs:F0},{r.DurationMs:F1},{r.Outcome},{msg},{r.ActiveUsers}");
-                }
-
-                try
-                {
-                    File.AppendAllText(logFilePath, sb.ToString());
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[LogWriter] Error writing: {ex.Message}");
-                }
-            }
-        }
-
-        private static string SanitizeCsvField(string value)
-        {
-            if (string.IsNullOrEmpty(value)) return "";
-            // Truncate long messages
-            if (value.Length > 500) value = value[..500];
-            // Replace problematic characters
-            value = value.Replace("\r", " ").Replace("\n", " ");
-            // Quote if contains comma, quote, or whitespace
-            if (value.Contains(',') || value.Contains('"') || value.Contains(' '))
-            {
-                value = "\"" + value.Replace("\"", "\"\"") + "\"";
-            }
-            return value;
-        }
-
-        private static void SimulateUserWithConnections(
-            int userIndex, string[] queries, string email,
-            int queriesPerBatch, int pauseMs, int pauseBetweenQueriesMs,
-            AdomdConnection[] connections,
-            ConcurrentBag<QueryResult> results, Stopwatch testStart,
-            BlockingCollection<TelemetryRecord>? telemetryQueue,
-            int[] activeUsers, CancellationToken ct)
-        {
+            var result = new QueryResult { Index = index };
             try
             {
-                int iteration = 0;
-                while (!ct.IsCancellationRequested)
-                {
-                    iteration++;
-                    RunIteration(userIndex, email, iteration, queries, connections,
-                        pauseBetweenQueriesMs, results, testStart, telemetryQueue, activeUsers, ct);
-                    if (ct.IsCancellationRequested) break;
-                    try { Task.Delay(pauseMs, ct).Wait(ct); }
-                    catch (OperationCanceledException) { break; }
-                }
-            }
-            finally
-            {
-                for (int c = 0; c < connections.Length; c++)
-                    if (connections[c] != null) { connections[c].Close(); connections[c].Dispose(); }
-            }
-        }
+                using var conn = new AdomdConnection(connStr);
+                conn.Open();
 
-        private static void RunIteration(
-            int userIndex, string email, int iteration, string[] queries,
-            AdomdConnection[] connections, int pauseBetweenQueriesMs,
-            ConcurrentBag<QueryResult> results, Stopwatch testStart,
-            BlockingCollection<TelemetryRecord>? telemetryQueue,
-            int[] activeUsers,
-            CancellationToken ct)
-        {
-            int max = connections.Length;
-            using var sem = new SemaphoreSlim(max);
-            var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
-            var tasks = new List<Task>();
-
-            for (int q = 0; q < queries.Length; q++)
-            {
-                if (ct.IsCancellationRequested) break;
-                try { sem.Wait(ct); }
-                catch (OperationCanceledException) { break; }
-
-                int qi = q; int iter = iteration;
-                tasks.Add(Task.Run(() =>
-                {
-                    AdomdConnection? conn = null;
-                    try
-                    {
-                        if (!connSlots.TryDequeue(out conn))
-                            throw new InvalidOperationException("No connection available");
-
-                        var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
-                        results.Add(r);
-
-                        // Submit telemetry
-                        if (telemetryQueue != null && !telemetryQueue.IsAddingCompleted)
-                        {
-                            var record = new TelemetryRecord
-                            {
-                                QueryNumber = qi,
-                                UserEmail = email,
-                                Timestamp = DateTime.UtcNow,
-                                StartTimeMs = r.StartTimeMs,
-                                DurationMs = r.DurationMs,
-                                Outcome = r.Error == null ? "Success" : "Error",
-                                MessageText = r.Error ?? $"{r.RowCount} rows",
-                                ActiveUsers = Volatile.Read(ref activeUsers[0]),
-                            };
-                            telemetryQueue.TryAdd(record);
-                        }
-
-                        if (r.Error != null)
-                        {
-                            Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
-                            throw new Exception(r.Error);
-                        }
-                        if (pauseBetweenQueriesMs > 0)
-                        {
-                            try { Task.Delay(pauseBetweenQueriesMs, ct).Wait(ct); }
-                            catch (OperationCanceledException) { }
-                        }
-                    }
-                    finally
-                    {
-                        if (conn != null) connSlots.Enqueue(conn);
-                        sem.Release();
-                    }
-                }));
-            }
-
-            Task.WaitAll(tasks.ToArray());
-        }
-
-        private static QueryResult ExecuteQuery(int userIndex, int queryIndex,
-            int iteration, string query, AdomdConnection conn, Stopwatch testStart)
-        {
-            var result = new QueryResult {
-                UserIndex = userIndex, QueryIndex = queryIndex, Iteration = iteration,
-                StartTimeMs = Math.Round(testStart.Elapsed.TotalMilliseconds) };
-            try
-            {
                 var cmd = new AdomdCommand(query, conn);
                 var sw = Stopwatch.StartNew();
-                using var reader = cmd.ExecuteReader();
-                int count = 0;
-                while (reader.Read()) count++;
+
+                if (useXmlReader)
+                {
+                    result.RowCount = ExecuteWithXmlReader(cmd);
+                }
+                else
+                {
+                    result.RowCount = ExecuteWithDataReader(cmd);
+                }
+
                 sw.Stop();
-                result.RowCount = count;
                 result.DurationMs = sw.Elapsed.TotalMilliseconds;
             }
             catch (Exception ex)
             {
-                result.Error = ex.Message.Length > 500 ? ex.Message[..500] : ex.Message;
+                result.Error = ex.Message;
+                if (result.Error.Length > 200)
+                    result.Error = result.Error.Substring(0, 200);
             }
             return result;
         }
 
-        private static string BuildStats(List<QueryResult> results, double totalMs,
-            int nUsers, int nQueries, string? logFilePath = null)
+        /// <summary>
+        /// Standard ExecuteReader — reads all rows, counts them.
+        /// </summary>
+        private static int ExecuteWithDataReader(AdomdCommand cmd)
         {
-            var ok = results.Where(r => r.Error == null).ToList();
-            var fail = results.Where(r => r.Error != null).ToList();
-            var durs = ok.Select(r => r.DurationMs).OrderBy(d => d).ToList();
-            int maxIter = results.Any() ? results.Max(r => r.Iteration) : 0;
-
-            var stats = new Dictionary<string, object>
-            {
-                ["totalDurationMs"] = Math.Round(totalMs),
-                ["users"] = nUsers,
-                ["queriesPerIteration"] = nQueries,
-                ["totalExecutions"] = results.Count,
-                ["successfulExecutions"] = ok.Count,
-                ["failedExecutions"] = fail.Count,
-                ["maxIteration"] = maxIter,
-                ["qps"] = Math.Round(ok.Count / (totalMs / 1000), 1),
-            };
-
-            if (logFilePath != null)
-                stats["logFile"] = logFilePath;
-
-            if (durs.Any())
-                stats["latency"] = new Dictionary<string, object>
-                {
-                    ["min"] = Math.Round(durs.First()),
-                    ["max"] = Math.Round(durs.Last()),
-                    ["mean"] = Math.Round(durs.Average()),
-                    ["median"] = Math.Round(Pct(durs, 50)),
-                    ["p95"] = Math.Round(Pct(durs, 95)),
-                    ["p99"] = Math.Round(Pct(durs, 99)),
-                };
-
-            var perUser = results.GroupBy(r => r.UserIndex).OrderBy(g => g.Key)
-                .Select(g => new Dictionary<string, object>
-                {
-                    ["userIndex"] = g.Key,
-                    ["iterations"] = g.Max(r => r.Iteration),
-                    ["executions"] = g.Count(),
-                    ["errors"] = g.Count(r => r.Error != null),
-                    ["meanLatencyMs"] = g.Where(r => r.Error == null).Select(r => r.DurationMs)
-                        .DefaultIfEmpty(0).Average() is var avg ? Math.Round(avg) : 0,
-                }).ToList();
-            stats["perUser"] = perUser;
-
-            if (fail.Any())
-                stats["sampleErrors"] = fail.Take(5)
-                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Iteration, r.Error }).ToList();
-
-            // Time-series: per-second buckets for glitch detection
-            var timeline = ok.GroupBy(r => (int)(r.StartTimeMs / 1000))
-                .OrderBy(g => g.Key)
-                .Select(g =>
-                {
-                    var d = g.Select(r => r.DurationMs).OrderBy(x => x).ToList();
-                    return new Dictionary<string, object>
-                    {
-                        ["second"] = g.Key,
-                        ["count"] = g.Count(),
-                        ["meanMs"] = Math.Round(d.Average()),
-                        ["p50Ms"] = Math.Round(Pct(d, 50)),
-                        ["p95Ms"] = Math.Round(Pct(d, 95)),
-                        ["maxMs"] = Math.Round(d.Last()),
-                    };
-                }).ToList();
-            stats["timeline"] = timeline;
-
-            // Raw executions sorted by start time (for detailed analysis)
-            stats["executions"] = ok.OrderBy(r => r.StartTimeMs)
-                .Select(r => new Dictionary<string, object>
-                {
-                    ["t"] = r.StartTimeMs,
-                    ["ms"] = Math.Round(r.DurationMs),
-                    ["u"] = r.UserIndex,
-                    ["q"] = r.QueryIndex,
-                }).ToList();
-
-            return JsonSerializer.Serialize(stats, new JsonSerializerOptions { WriteIndented = true });
+            using var reader = cmd.ExecuteReader();
+            int count = 0;
+            while (reader.Read())
+                count++;
+            return count;
         }
 
-        private static double Pct(List<double> s, double p) =>
-            !s.Any() ? 0 : s[Math.Clamp((int)Math.Ceiling(p / 100.0 * s.Count) - 1, 0, s.Count - 1)];
+        /// <summary>
+        /// ExecuteXmlReader — parses the XMLA response as XML,
+        /// counts row elements without converting column values.
+        /// </summary>
+        private static int ExecuteWithXmlReader(AdomdCommand cmd)
+        {
+            using var xmlReader = cmd.ExecuteXmlReader();
+            int count = 0;
+
+            // XMLA row response: <root><row>...</row><row>...</row></root>
+            // The row element is in the urn:schemas-microsoft-com:xml-analysis:rowset namespace
+            while (xmlReader.Read())
+            {
+                if (xmlReader.NodeType == XmlNodeType.Element && xmlReader.LocalName == "row")
+                {
+                    count++;
+                    // Skip the content of this row element entirely
+                    xmlReader.Skip();
+                }
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// Run a load test: each user runs all queries.
+        /// Total executions = users.Length × queries.Length.
+        /// </summary>
+        /// <param name="queries">DAX query texts</param>
+        /// <param name="xmlaEndpoint">XMLA endpoint URL</param>
+        /// <param name="dataset">Semantic model name</param>
+        /// <param name="token">Access token</param>
+        /// <param name="userEmails">User emails for CustomData</param>
+        /// <param name="userRoles">Role names per user</param>
+        /// <param name="maxParallelism">Max concurrent queries across all users</param>
+        /// <returns>Array of QueryResult (length = users × queries)</returns>
+        public static QueryResult[] RunLoadTest(
+            string[] queries,
+            string xmlaEndpoint,
+            string dataset,
+            string token,
+            string[] userEmails,
+            string[] userRoles,
+            int maxParallelism = 8)
+        {
+            int totalTasks = userEmails.Length * queries.Length;
+            var results = new QueryResult[totalTasks];
+            var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+
+            // Build tasks: (taskIndex, userIndex, queryIndex)
+            var tasks = new (int taskIdx, int userIdx, int queryIdx)[totalTasks];
+            int t = 0;
+            for (int u = 0; u < userEmails.Length; u++)
+                for (int q = 0; q < queries.Length; q++)
+                    tasks[t++] = (t - 1, u, q);
+
+            // Shuffle to interleave users (avoid all queries for one user running together)
+            var rng = new Random(42);
+            for (int i = tasks.Length - 1; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                (tasks[i], tasks[j]) = (tasks[j], tasks[i]);
+            }
+
+            Parallel.ForEach(tasks, options, task =>
+            {
+                string connStr =
+                    $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
+                    $"password={token};Timeout=7200;" +
+                    $"CustomData={userEmails[task.userIdx]};Roles={userRoles[task.userIdx]};";
+
+                var r = RunSingle(task.queryIdx, queries[task.queryIdx], connStr, false);
+                r.Index = task.taskIdx;
+                r.UserIndex = task.userIdx;
+                r.QueryIndex = task.queryIdx;
+                results[task.taskIdx] = r;
+            });
+
+            return results;
+        }
+
+        /// <summary>
+        /// Benchmark: run the same query N times sequentially, then in parallel,
+        /// comparing ExecuteReader vs ExecuteXmlReader.
+        /// Returns a summary string.
+        /// </summary>
+        public static string Benchmark(string query, string connStr, int nQueries = 20, int threads = 4)
+        {
+            var lines = new List<string>();
+
+            // Warm up
+            RunSingle(0, query, connStr, false);
+
+            // Sequential - DataReader
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < nQueries; i++)
+                RunSingle(i, query, connStr, false);
+            sw.Stop();
+            double seqReaderMs = sw.Elapsed.TotalMilliseconds;
+            double seqReaderQps = nQueries / (seqReaderMs / 1000);
+            lines.Add($"Sequential DataReader: {seqReaderMs:F0}ms, {seqReaderQps:F1} QPS");
+
+            // Sequential - XmlReader
+            sw.Restart();
+            for (int i = 0; i < nQueries; i++)
+                RunSingle(i, query, connStr, true);
+            sw.Stop();
+            double seqXmlMs = sw.Elapsed.TotalMilliseconds;
+            double seqXmlQps = nQueries / (seqXmlMs / 1000);
+            lines.Add($"Sequential XmlReader:  {seqXmlMs:F0}ms, {seqXmlQps:F1} QPS");
+
+            // Parallel - DataReader
+            var queries = Enumerable.Repeat(query, nQueries).ToArray();
+            var connStrs = Enumerable.Repeat(connStr, nQueries).ToArray();
+
+            sw.Restart();
+            RunBatch(queries, connStrs, threads, false);
+            sw.Stop();
+            double parReaderMs = sw.Elapsed.TotalMilliseconds;
+            double parReaderQps = nQueries / (parReaderMs / 1000);
+            lines.Add($"Parallel({threads}) DataReader: {parReaderMs:F0}ms, {parReaderQps:F1} QPS, speedup={seqReaderMs/parReaderMs:F2}x");
+
+            // Parallel - XmlReader
+            sw.Restart();
+            RunBatch(queries, connStrs, threads, true);
+            sw.Stop();
+            double parXmlMs = sw.Elapsed.TotalMilliseconds;
+            double parXmlQps = nQueries / (parXmlMs / 1000);
+            lines.Add($"Parallel({threads}) XmlReader:  {parXmlMs:F0}ms, {parXmlQps:F1} QPS, speedup={seqXmlMs/parXmlMs:F2}x");
+
+            return string.Join("\n", lines);
+        }
     }
 }

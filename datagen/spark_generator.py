@@ -23,9 +23,8 @@ if not _logger.handlers:
 
 
 def _log(msg=""):
-    """Log progress — uses stderr + print + flush for Fabric notebook visibility."""
+    """Log progress — uses print + flush for Fabric notebook visibility."""
     print(msg, flush=True)
-    _logger.info(msg)
 
 
 def _safe_table_name(name):
@@ -148,7 +147,11 @@ def _col_to_dict(col):
     if isinstance(col, dict):
         return col
     from dataclasses import asdict
-    return asdict(col)
+    d = asdict(col)
+    # Carry over runtime flags (not part of the dataclass)
+    if getattr(col, "_skew_recent", False):
+        d["_skew_recent"] = True
+    return d
 
 
 def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
@@ -242,6 +245,14 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
                         # Weighted selection (fixed values with explicit frequencies)
                         w = np.array(col_weights, dtype=np.float64)
                         indices = rng.choice(cardinality, size=n, p=w)
+                    elif col.get("_skew_recent") and data_type == "datetime":
+                        # Skew towards recent dates (end of sorted pool)
+                        # Exponential: ~60% of rows in the last 2 quarters
+                        uniform = rng.random(n)
+                        indices = np.floor(
+                            cardinality * np.power(uniform, 0.3)
+                        ).astype(np.int64)
+                        indices = np.clip(indices, 0, cardinality - 1)
                     elif col.get("selection") == "zipf":
                         exponent = max(col.get("zipf_exponent", 1.0), 0.01)
                         uniform = rng.random(n)
@@ -444,7 +455,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     }
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None):
+def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None, skew_recent=False):
     """Generate all tables defined in the configuration.
 
     Args:
@@ -459,6 +470,8 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             that already exist as Delta/parquet and only generate missing ones.
         skip_tables: Set of table names to skip entirely (e.g. measure-only,
             enter-data tables in import mode).
+        skew_recent: If True, skew fact table datetime columns towards
+            recent dates (~60% in last 2 quarters).
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -564,24 +577,39 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             if vpax_table and _is_date_table(vpax_table):
                 _generate_date_table_spark(spark, vpax_table, out_path, output_format)
                 timing = {"total_time": 0}
+                is_date = True
             else:
+                # Apply date skew to datetime columns in fact tables
+                if skew_recent:
+                    cols = table.columns if hasattr(table, "columns") else table.get("columns", [])
+                    for col in cols:
+                        dt = col.data_type if hasattr(col, "data_type") else col.get("data_type", "")
+                        if dt == "datetime":
+                            if hasattr(col, "_skew_recent"):
+                                col._skew_recent = True
+                            elif isinstance(col, dict):
+                                col["_skew_recent"] = True
+
                 timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
+                is_date = False
 
             total_time = timing.get("total_time", 0)
             rows_generated += row_count
             succeeded_tables.append(tname)
 
+            suffix = " (date table)" if is_date else ""
             if progress:
-                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)")
+                progress.write(f"  ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s){suffix}")
             else:
                 print(f"  [{i}/{n}] ✓ {tname} — {row_count:,} rows, {n_cols} cols ({total_time:.1f}s)", flush=True)
 
         except Exception as e:
-            errors.append((tname, str(e)))
             if progress:
                 progress.write(f"  ✗ {tname} — {e}")
+                progress.close()
             else:
                 print(f"  [{i}/{n}] ✗ {tname} — {e}", flush=True)
+            raise RuntimeError(f"Failed to generate table '{tname}': {e}") from e
 
         if progress:
             progress.update(1)
@@ -621,29 +649,37 @@ def _is_date_table(vpax_table):
 def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     """Generate a date table from VPAX metadata and write it."""
     from .date_table import generate_date_table
+    from pyspark.sql.types import StructType, StructField
 
     tname = vpax_table["name"]
     row_count = vpax_table.get("row_count", 365)
 
-    _log(f"  Date table detected — generating {row_count:,} days with derived columns")
-
     rows = generate_date_table(vpax_table)
-
     pdf = pd.DataFrame(rows)
 
-    # Convert datetime columns
+    # Build explicit schema from VPAX column types
+    fields = []
     for col in vpax_table.get("columns", []):
         cname = col["name"]
         if cname not in pdf.columns:
             continue
-        if col.get("data_type") == "datetime":
-            pdf[cname] = pd.to_datetime(pdf[cname])
-        elif col.get("data_type") == "int64":
-            pdf[cname] = pdf[cname].astype("int64")
-        elif col.get("data_type") == "boolean":
-            pdf[cname] = pdf[cname].astype("bool")
+        dtype = col.get("data_type", "string")
+        fields.append(StructField(cname, _spark_type(dtype), True))
 
-    sdf = spark.createDataFrame(pdf)
+        # Ensure Python types match the schema
+        if dtype == "datetime":
+            pdf[cname] = pd.to_datetime(pdf[cname])
+        elif dtype == "int64":
+            pdf[cname] = pdf[cname].astype("int64")
+        elif dtype == "double":
+            pdf[cname] = pdf[cname].astype("float64")
+        elif dtype == "boolean":
+            pdf[cname] = pdf[cname].astype("bool")
+        else:
+            pdf[cname] = pdf[cname].astype("str")
+
+    schema = StructType(fields)
+    sdf = spark.createDataFrame(pdf, schema=schema)
 
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(tname)}"
     fmt = output_format.lower()
