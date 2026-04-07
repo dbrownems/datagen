@@ -27,9 +27,38 @@ _KEY_EXACT = {"id", "key", "sku", "code"}
 # Boolean-like column name patterns (case-insensitive)
 _BOOL_PREFIXES = ("is", "has", "can", "should", "allow", "enable", "disable",
                   "show", "hide", "include", "exclude", "use", "need")
+_BOOL_SUFFIXES = ("flag", "indicator", "yn")
 _BOOL_EXACT = {"active", "inactive", "enabled", "disabled", "visible", "hidden",
                "deleted", "archived", "approved", "verified", "locked",
                "published", "completed", "required", "optional", "flag"}
+
+# Relative time period values — columns with these values are semantic
+# and should use fixed values, not random generation
+_RELATIVE_TIME_VALUES = {
+    "dynamic_quarter": [
+        "Current Quarter", "Previous Quarter", "Previous Quarter-1",
+        "Previous Quarter-2", "Previous Quarter-3",
+        "Current Quarter+1", "Current Quarter+2", "Current Quarter+3",
+        "Current Quarter+4",
+    ],
+    "dynamic_week": [
+        "Current Week", "Previous Week", "Next Week",
+    ],
+    "dynamic_day": [
+        "Today", "Yesterday", "Tomorrow",
+    ],
+    "dynamic_month": [
+        "Current Month", "Previous Month", "Next Month",
+    ],
+}
+
+# Column name patterns that suggest relative time period values
+_RELATIVE_TIME_PATTERNS = {
+    "dynamic_quarter": {"dynamicquarter", "dynamic_quarter", "dynamicqtr"},
+    "dynamic_week": {"closedinweek", "closed_in_week", "dynamicweek", "dynamic_week"},
+    "dynamic_day": {"closedinday", "closed_in_day", "dynamicday", "dynamic_day"},
+    "dynamic_month": {"dynamicmonth", "dynamic_month"},
+}
 
 
 def _is_key_name(col_name):
@@ -57,19 +86,40 @@ def _is_guid_column(col_name, avg_length):
 def _is_boolean_like(col_name, cardinality):
     """Detect columns that represent boolean/flag values by name and cardinality.
 
-    Returns True for names like IsActive, HasEmail, Active, Enabled, etc.
+    Returns True for names like IsActive, HasEmail, Active, New Logo Flag, etc.
     Only triggers when cardinality is ≤ 2 (true/false or yes/no).
     """
     if cardinality > 2:
         return False
-    # Normalize: strip spaces, lowercase, split on common separators
     normalized = col_name.replace(" ", "").replace("_", "").replace("-", "").lower()
     if normalized in _BOOL_EXACT:
         return True
     for prefix in _BOOL_PREFIXES:
         if normalized.startswith(prefix) and len(normalized) > len(prefix):
             return True
+    for suffix in _BOOL_SUFFIXES:
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            return True
     return False
+
+
+def _detect_relative_time(col_name, cardinality):
+    """Detect columns that hold relative time period values.
+
+    Returns a list of fixed values if the column name matches a known
+    relative time pattern, otherwise None.
+    """
+    if cardinality > 15:
+        return None
+    normalized = col_name.replace(" ", "").replace("_", "").replace("-", "").lower()
+    for category, patterns in _RELATIVE_TIME_PATTERNS.items():
+        if normalized in patterns:
+            return _RELATIVE_TIME_VALUES[category]
+        # Also check if the pattern is a substring (e.g. "Opty Closed in Week")
+        for pat in patterns:
+            if pat in normalized:
+                return _RELATIVE_TIME_VALUES[category]
+    return None
 
 
 def _derive_prefix(col_name):
@@ -377,6 +427,17 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None, table_n
             selection="uniform", zipf_exponent=1.0,
             distribution=dist,
             values=[{"value": "Yes", "frequency": 0.5}, {"value": "No", "frequency": 0.5}],
+        )
+
+    # Detect relative time period columns (Dynamic Quarter, Closed in Week, etc.)
+    rel_time_vals = _detect_relative_time(name, cardinality)
+    if rel_time_vals and data_type == "string":
+        dist = DistributionConfig(avg_length=max(len(v) for v in rel_time_vals))
+        return ColumnConfig(
+            name=name, data_type=data_type, cardinality=len(rel_time_vals),
+            selection="uniform", zipf_exponent=1.0,
+            distribution=dist,
+            values=rel_time_vals,
         )
 
     # Detect geography columns by name or data category
