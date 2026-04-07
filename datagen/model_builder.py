@@ -172,10 +172,19 @@ def _is_measure_only_table(bim_table):
     return has_measures and not has_data_cols
 
 
+def _is_calculated_table(bim_table):
+    """Check if a BIM table is a calculated table (DAX-defined partition)."""
+    for part in bim_table.get("partitions", []):
+        if part.get("source", {}).get("type") == "calculated":
+            return True
+    return False
+
+
 def get_tables_to_skip(vpax_path, mode="direct_lake"):
     """Return set of table names that should NOT get Delta tables generated.
 
-    For import mode: skip measure-only tables and enter-data tables.
+    For import mode: skip measure-only tables, enter-data tables,
+    and calculated tables (they keep their DAX definitions).
     For direct_lake mode: returns empty set (generate everything).
     """
     if mode == "direct_lake":
@@ -189,6 +198,8 @@ def get_tables_to_skip(vpax_path, mode="direct_lake"):
         if _is_enter_data_table(table):
             skip.add(tname)
         elif _is_measure_only_table(table):
+            skip.add(tname)
+        elif _is_calculated_table(table):
             skip.add(tname)
     return skip
 
@@ -319,11 +330,22 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
     filter_set = set(table_filter) if table_filter is not None else None
 
     n_rewritten = 0
+    n_calc_kept = 0
     for table in model.get("tables", []):
         tname = table["name"]
         has_delta = filter_set is None or tname in filter_set
 
         if not has_delta:
+            continue
+
+        # Don't rewrite calculated tables — they have DAX partition expressions
+        # that must be preserved in import mode
+        is_calc_table = any(
+            p.get("source", {}).get("type") == "calculated"
+            for p in table.get("partitions", [])
+        )
+        if is_calc_table:
+            n_calc_kept += 1
             continue
 
         safe_name = _safe_folder_name(tname)
@@ -349,7 +371,7 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         n_rewritten += 1
 
     print(f"    Source: {source_url}", flush=True)
-    print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
+    print(f"    Rewrote {n_rewritten} partition(s), kept {n_calc_kept} calculated table(s)", flush=True)
     return bim
 
 
