@@ -180,3 +180,218 @@ def build_notebook(output_dir=None):
 
     print(f"Notebook built: {nb_dir}")
     return nb_dir
+
+
+def build_load_notebook(output_dir=None):
+    """Build the 'Datagen Load Test.Notebook' artifact."""
+    if output_dir is None:
+        output_dir = os.path.join(os.getcwd(), "dist")
+
+    nb_dir = os.path.join(output_dir, "Datagen Load Test.Notebook")
+    if os.path.exists(nb_dir):
+        shutil.rmtree(nb_dir)
+    os.makedirs(nb_dir)
+
+    cells = [
+        {
+            "cell_type": "markdown",
+            "source": [
+                "# Datagen Load Test\n",
+                "\n",
+                "Runs DAX queries against a semantic model simulating concurrent Power BI users.\n",
+                "\n",
+                "## Prerequisites\n",
+                "\n",
+                "1. Upload `queries.json` and `users.json` to `Files/datagen/` in the attached lakehouse\n",
+                "2. `queries.json`: array of DAX query strings\n",
+                "3. `users.json`: array of `{\"email\": \"...\", \"role\": \"...\"}` objects\n",
+                "4. The semantic model must have RLS rules using `CUSTOMDATA()`\n",
+            ],
+            "metadata": {},
+        },
+        # ── Cell 1: Setup ──
+        {
+            "cell_type": "code",
+            "source": [
+                "# Install datagen and build the .NET query runner\n",
+                "import subprocess, sys, os, glob, urllib.request, json\n",
+                "\n",
+                'DATAGEN_DIR = "/lakehouse/default/Files/datagen"\n',
+                "\n",
+                "# Download and install latest datagen\n",
+                "def _get_latest_whl():\n",
+                '    api_url = "https://api.github.com/repos/dbrownems/datagen/releases/latest"\n',
+                "    with urllib.request.urlopen(api_url) as resp:\n",
+                "        release = json.loads(resp.read())\n",
+                '    asset = next(a for a in release["assets"] if a["name"].endswith(".whl"))\n',
+                '    local = f"{DATAGEN_DIR}/{asset[\'name\']}"\n',
+                "    if not os.path.exists(local):\n",
+                '        urllib.request.urlretrieve(asset["browser_download_url"], local)\n',
+                "    return local\n",
+                "\n",
+                "whl = _get_latest_whl()\n",
+                'print(f"Installing {os.path.basename(whl)}")\n',
+                "subprocess.check_call([\n",
+                '    sys.executable, "-m", "pip", "install", whl,\n',
+                '    "-q", "--disable-pip-version-check", "--force-reinstall", "--no-deps",\n',
+                "])\n",
+                'import datagen; print(f"datagen v{datagen.__version__}")\n',
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+        # ── Cell 2: Build .NET QueryRunner ──
+        {
+            "cell_type": "code",
+            "source": [
+                "# Build the .NET QueryRunner DLL\n",
+                "import subprocess, os, shutil\n",
+                "\n",
+                'RUNNER_DIR = f"{DATAGEN_DIR}/queryrunner"\n',
+                "os.makedirs(RUNNER_DIR, exist_ok=True)\n",
+                "\n",
+                "# Download QueryRunner source from GitHub\n",
+                "import urllib.request, json\n",
+                'api_url = "https://api.github.com/repos/dbrownems/datagen/contents/queryrunner"\n',
+                "with urllib.request.urlopen(api_url) as resp:\n",
+                "    files = json.loads(resp.read())\n",
+                "\n",
+                "for f in files:\n",
+                '    if f["name"].endswith((".cs", ".csproj")):\n',
+                '        local = os.path.join(RUNNER_DIR, f["name"])\n',
+                "        if not os.path.exists(local):\n",
+                '            urllib.request.urlretrieve(f["download_url"], local)\n',
+                '            print(f"  Downloaded {f[\'name\']}")\n',
+                "\n",
+                "# Build\n",
+                "subprocess.check_call(\n",
+                '    ["dotnet", "build", "-c", "Release", RUNNER_DIR],\n',
+                "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n",
+                ")\n",
+                'dll_path = os.path.join(RUNNER_DIR, "bin", "Release", "net8.0", "DatagenQueryRunner.dll")\n',
+                'print(f"QueryRunner built: {dll_path}")\n',
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+        # ── Cell 3: Configure and Run ──
+        {
+            "cell_type": "code",
+            "source": [
+                "# ── Configuration ──\n",
+                'XMLA_ENDPOINT = "powerbi://api.powerbi.com/v1.0/myorg/dbrowne_sld"\n',
+                'DATASET = "Sales Leader Dataset"\n',
+                "DURATION_SECONDS = 60      # total test duration\n",
+                "QUERIES_PER_BATCH = 4      # concurrent queries per user\n",
+                "PAUSE_BETWEEN_MS = 1000    # pause between iterations (ms)\n",
+                "\n",
+                "# Load queries and users\n",
+                "import json\n",
+                'with open(f"{DATAGEN_DIR}/queries.json", "r") as f:\n',
+                "    queries = json.load(f)\n",
+                'with open(f"{DATAGEN_DIR}/users.json", "r") as f:\n',
+                "    users = json.load(f)\n",
+                "\n",
+                'print(f"Queries: {len(queries)}")\n',
+                'print(f"Users: {len(users)}")\n',
+                'print(f"Duration: {DURATION_SECONDS}s")\n',
+                'print(f"Concurrency: {QUERIES_PER_BATCH} queries/user")\n',
+                "\n",
+                "# Get access token\n",
+                "import notebookutils\n",
+                'token = notebookutils.credentials.getToken("pbi")\n',
+                'print(f"Token acquired ({len(token)} chars)")\n',
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+        # ── Cell 4: Run Load Test ──
+        {
+            "cell_type": "code",
+            "source": [
+                "# Run the load test\n",
+                "from pythonnet import load\n",
+                "load('coreclr')\n",
+                "import clr, os, json, time\n",
+                "\n",
+                'dll_path = os.path.join(DATAGEN_DIR, "queryrunner", "bin", "Release", "net8.0", "DatagenQueryRunner.dll")\n',
+                "clr.AddReference(dll_path)\n",
+                "from Datagen import QueryRunner\n",
+                "from System import Array, String\n",
+                "\n",
+                "# Prepare .NET arrays\n",
+                "q_arr = Array[String]([q if isinstance(q, str) else q['query'] for q in queries])\n",
+                "email_arr = Array[String]([u['email'] for u in users])\n",
+                "role_arr = Array[String]([u['role'] for u in users])\n",
+                "\n",
+                'print(f"Starting load test: {len(users)} users × {len(queries)} queries, {DURATION_SECONDS}s...")\n',
+                "print(flush=True)\n",
+                "\n",
+                "t0 = time.time()\n",
+                "result_json = QueryRunner.RunLoadTest(\n",
+                "    q_arr, XMLA_ENDPOINT, DATASET, token,\n",
+                "    email_arr, role_arr,\n",
+                "    DURATION_SECONDS,\n",
+                "    QUERIES_PER_BATCH,\n",
+                "    PAUSE_BETWEEN_MS,\n",
+                ")\n",
+                "elapsed = time.time() - t0\n",
+                "\n",
+                "stats = json.loads(result_json)\n",
+                'print(f"\\n=== Load Test Results ({elapsed:.0f}s) ===")\n',
+                'print(f"Total executions: {stats[\'totalExecutions\']}")\n',
+                'print(f"Successful:       {stats[\'successfulExecutions\']}")\n',
+                'print(f"Failed:           {stats[\'failedExecutions\']}")\n',
+                'print(f"QPS:              {stats[\'qps\']}")\n',
+                'print(f"Max iteration:    {stats[\'maxIteration\']}")\n',
+                "\n",
+                "if 'latency' in stats:\n",
+                "    lat = stats['latency']\n",
+                '    print(f"\\nLatency:")\n',
+                '    print(f"  Min:    {lat[\'min\']}ms")\n',
+                '    print(f"  Median: {lat[\'median\']}ms")\n',
+                '    print(f"  Mean:   {lat[\'mean\']}ms")\n',
+                '    print(f"  P95:    {lat[\'p95\']}ms")\n',
+                '    print(f"  P99:    {lat[\'p99\']}ms")\n',
+                '    print(f"  Max:    {lat[\'max\']}ms")\n',
+                "\n",
+                'print(f"\\nPer-user:")\n',
+                "for u in stats.get('perUser', []):\n",
+                "    user = users[u['userIndex']]\n",
+                '    print(f"  {user[\'email\'][:30]:30s} iters={u[\'iterations\']} execs={u[\'executions\']} errs={u[\'errors\']} avg={u[\'meanLatencyMs\']}ms")\n',
+                "\n",
+                "if 'sampleErrors' in stats:\n",
+                '    print(f"\\nSample errors:")\n',
+                "    for e in stats['sampleErrors']:\n",
+                '        print(f"  User {e[\'UserIndex\']}, Q{e[\'QueryIndex\']}: {str(e[\'Error\'])[:100]}")\n',
+                "\n",
+                "# Save full results\n",
+                'with open(f"{DATAGEN_DIR}/load_test_results.json", "w") as f:\n',
+                "    json.dump(stats, f, indent=2)\n",
+                'print(f"\\nFull results saved to Files/datagen/load_test_results.json")\n',
+            ],
+            "execution_count": None, "outputs": [], "metadata": {},
+        },
+    ]
+
+    notebook = {
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {
+            "language_info": {"name": "python"},
+            "kernel_info": {"name": "synapse_pyspark"},
+            "kernelspec": {"display_name": "synapse_pyspark", "name": "synapse_pyspark"},
+            "microsoft": {"language": "python", "language_group": "synapse_pyspark"},
+        },
+        "cells": cells,
+    }
+
+    platform = {
+        "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+        "metadata": {"type": "Notebook", "displayName": "Datagen Load Test"},
+        "config": {"version": "2.0", "logicalId": "11111111-1111-1111-1111-111111111111"},
+    }
+
+    with open(os.path.join(nb_dir, "notebook-content.ipynb"), "w", encoding="utf-8") as f:
+        json.dump(notebook, f, indent=2)
+    with open(os.path.join(nb_dir, ".platform"), "w", encoding="utf-8") as f:
+        json.dump(platform, f, indent=2)
+
+    print(f"Notebook built: {nb_dir}")
+    return nb_dir

@@ -79,9 +79,10 @@ def cmd_model(args):
 
 
 def cmd_build_notebook(args):
-    """Build the Fabric notebook artifact."""
-    from .build_notebook import build_notebook
+    """Build the Fabric notebook artifacts."""
+    from .build_notebook import build_notebook, build_load_notebook
     build_notebook(output_dir=args.output_dir)
+    build_load_notebook(output_dir=args.output_dir)
 
 
 def main():
