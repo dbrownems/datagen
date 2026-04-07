@@ -10,9 +10,6 @@ using Microsoft.AnalysisServices.AdomdClient;
 
 namespace Datagen
 {
-    /// <summary>
-    /// Result of a single query execution.
-    /// </summary>
     public class QueryResult
     {
         public int UserIndex { get; set; }
@@ -23,30 +20,11 @@ namespace Datagen
         public string? Error { get; set; }
     }
 
-    /// <summary>
-    /// Simulates Power BI report users running DAX queries.
-    /// Each user runs all queries in iterations, 4 queries at a time,
-    /// with a pause between iterations.
-    /// </summary>
     public static class QueryRunner
     {
-        /// <summary>
-        /// Run a load test simulating Power BI users.
-        /// Each user gets a thread that loops:
-        ///   1. Run all queries (4 concurrent)
-        ///   2. Pause
-        ///   3. Repeat until duration expires
-        /// Returns JSON with execution statistics.
-        /// </summary>
-        /// <param name="queries">DAX query texts</param>
-        /// <param name="xmlaEndpoint">XMLA endpoint</param>
-        /// <param name="dataset">Semantic model name</param>
-        /// <param name="token">Access token</param>
-        /// <param name="userEmails">User emails for CustomData</param>
-        /// <param name="userRoles">Role per user</param>
-        /// <param name="durationSeconds">Total test duration</param>
-        /// <param name="queriesPerBatch">Concurrent queries per user (default 4)</param>
-        /// <param name="pauseBetweenIterationsMs">Pause between iterations in ms (default 1000)</param>
+        // Collect errors that happen outside individual query execution
+        private static readonly ConcurrentBag<string> _infraErrors = new();
+
         public static string RunLoadTest(
             string[] queries,
             string xmlaEndpoint,
@@ -58,11 +36,11 @@ namespace Datagen
             int queriesPerBatch = 4,
             int pauseBetweenIterationsMs = 1000)
         {
+            _infraErrors.Clear();
             var allResults = new ConcurrentBag<QueryResult>();
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
             var testStart = Stopwatch.StartNew();
 
-            // One task per user
             var userTasks = new Task[userEmails.Length];
             for (int u = 0; u < userEmails.Length; u++)
             {
@@ -74,11 +52,18 @@ namespace Datagen
                         allResults, cts.Token));
             }
 
+            // Wait for all user tasks — they exit on cancellation or error
             try { Task.WaitAll(userTasks); }
-            catch (AggregateException) { }
+            catch (AggregateException ae)
+            {
+                foreach (var ex in ae.Flatten().InnerExceptions)
+                {
+                    if (ex is not OperationCanceledException)
+                        _infraErrors.Add($"User task failed: {ex.Message}");
+                }
+            }
             testStart.Stop();
 
-            // Build statistics
             return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
                 userEmails.Length, queries.Length);
         }
@@ -96,81 +81,106 @@ namespace Datagen
                 $"password={token};Timeout=7200;" +
                 $"CustomData={email};Roles={role};";
 
-            int iteration = 0;
-
-            while (!ct.IsCancellationRequested)
+            var connections = new AdomdConnection[queriesPerBatch];
+            try
             {
-                iteration++;
-
-                // Run all queries, queriesPerBatch at a time
-                RunIteration(userIndex, iteration, queries, connStr,
-                    queriesPerBatch, results, ct);
-
-                if (ct.IsCancellationRequested) break;
-
-                // Pause between iterations (simulates user think time)
-                try { Task.Delay(pauseMs, ct).Wait(ct); }
-                catch (OperationCanceledException) { break; }
+                for (int c = 0; c < queriesPerBatch; c++)
+                {
+                    connections[c] = new AdomdConnection(connStr);
+                    connections[c].Open();
+                }
             }
-        }
-
-        private static void RunIteration(
-            int userIndex, int iteration, string[] queries, string connStr,
-            int maxConcurrent, ConcurrentBag<QueryResult> results,
-            CancellationToken ct)
-        {
-            // Create a pool of connections for this iteration
-            var connections = new AdomdConnection[maxConcurrent];
-            for (int c = 0; c < maxConcurrent; c++)
+            catch (Exception ex)
             {
-                connections[c] = new AdomdConnection(connStr);
-                connections[c].Open();
+                _infraErrors.Add($"User {userIndex} connection failed: {ex.Message}");
+                return;
             }
 
             try
             {
-                using var semaphore = new SemaphoreSlim(maxConcurrent);
-                var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
-                var tasks = new List<Task>();
-
-                for (int q = 0; q < queries.Length; q++)
+                int iteration = 0;
+                while (!ct.IsCancellationRequested)
                 {
+                    iteration++;
+                    RunIteration(userIndex, iteration, queries, connections,
+                        results, ct);
+
                     if (ct.IsCancellationRequested) break;
 
-                    try { semaphore.Wait(ct); }
+                    // Pause — OperationCanceledException is expected at test end
+                    try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
-
-                    int queryIdx = q;
-                    int iter = iteration;
-
-                    tasks.Add(Task.Run(() =>
-                    {
-                        AdomdConnection conn = null!;
-                        try
-                        {
-                            connSlots.TryDequeue(out conn!);
-                            var result = ExecuteQuery(userIndex, queryIdx, iter,
-                                queries[queryIdx], conn);
-                            results.Add(result);
-                        }
-                        finally
-                        {
-                            if (conn != null) connSlots.Enqueue(conn);
-                            semaphore.Release();
-                        }
-                    }));
                 }
-
-                try { Task.WaitAll(tasks.ToArray()); }
-                catch (AggregateException) { }
             }
             finally
             {
-                // Close all connections at end of iteration
-                foreach (var conn in connections)
+                for (int c = 0; c < connections.Length; c++)
                 {
-                    try { conn.Close(); conn.Dispose(); }
-                    catch { }
+                    if (connections[c] == null) continue;
+                    try { connections[c].Close(); connections[c].Dispose(); }
+                    catch (Exception ex)
+                    {
+                        _infraErrors.Add($"User {userIndex} conn {c} close failed: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        private static void RunIteration(
+            int userIndex, int iteration, string[] queries,
+            AdomdConnection[] connections,
+            ConcurrentBag<QueryResult> results,
+            CancellationToken ct)
+        {
+            int maxConcurrent = connections.Length;
+            using var semaphore = new SemaphoreSlim(maxConcurrent);
+            var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
+            var tasks = new List<Task>();
+
+            for (int q = 0; q < queries.Length; q++)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                // Semaphore wait — OperationCanceledException is expected at test end
+                try { semaphore.Wait(ct); }
+                catch (OperationCanceledException) { break; }
+
+                int queryIdx = q;
+                int iter = iteration;
+
+                tasks.Add(Task.Run(() =>
+                {
+                    AdomdConnection? conn = null;
+                    try
+                    {
+                        if (!connSlots.TryDequeue(out conn))
+                        {
+                            results.Add(new QueryResult
+                            {
+                                UserIndex = userIndex, QueryIndex = queryIdx,
+                                Iteration = iter, Error = "No connection available",
+                            });
+                            return;
+                        }
+                        var result = ExecuteQuery(userIndex, queryIdx, iter,
+                            queries[queryIdx], conn);
+                        results.Add(result);
+                    }
+                    finally
+                    {
+                        if (conn != null) connSlots.Enqueue(conn);
+                        semaphore.Release();
+                    }
+                }));
+            }
+
+            // Wait for in-flight queries to complete
+            try { Task.WaitAll(tasks.ToArray()); }
+            catch (AggregateException ae)
+            {
+                foreach (var ex in ae.Flatten().InnerExceptions)
+                {
+                    _infraErrors.Add($"User {userIndex} iter {iteration}: {ex.Message}");
                 }
             }
         }
@@ -199,8 +209,8 @@ namespace Datagen
             }
             catch (Exception ex)
             {
-                result.Error = ex.Message.Length > 200
-                    ? ex.Message.Substring(0, 200)
+                result.Error = ex.Message.Length > 300
+                    ? ex.Message.Substring(0, 300)
                     : ex.Message;
             }
 
@@ -242,7 +252,6 @@ namespace Datagen
                 };
             }
 
-            // Per-user stats
             var perUser = new List<Dictionary<string, object>>();
             foreach (var g in results.GroupBy(r => r.UserIndex).OrderBy(g => g.Key))
             {
@@ -259,12 +268,16 @@ namespace Datagen
             }
             stats["perUser"] = perUser;
 
-            // Sample errors
             if (failed.Any())
             {
-                stats["sampleErrors"] = failed.Take(3)
-                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Error })
+                stats["sampleErrors"] = failed.Take(5)
+                    .Select(r => new { r.UserIndex, r.QueryIndex, r.Iteration, r.Error })
                     .ToList();
+            }
+
+            if (_infraErrors.Any())
+            {
+                stats["infrastructureErrors"] = _infraErrors.Take(10).ToList();
             }
 
             return JsonSerializer.Serialize(stats, new JsonSerializerOptions
