@@ -19,3 +19,7 @@ test_output/
 test_*.yaml
 test_*.vpax
 *.tmdl.bak
+.token
+*.json
+scripts/
+*.dax

@@ -193,6 +193,20 @@ def get_tables_to_skip(vpax_path, mode="direct_lake"):
     return skip
 
 
+def get_enter_data_tables(vpax_path):
+    """Return set of table names that are enter-data tables.
+
+    These tables have inline data in their M expressions and should
+    not have their filter values replaced in DAX queries.
+    """
+    bim = _extract_bim(vpax_path)
+    model = bim.get("model", bim)
+    return {
+        table["name"] for table in model.get("tables", [])
+        if _is_enter_data_table(table)
+    }
+
+
     """Add columns from Model.bim that are missing from the generation config.
 
     The VPAX DaxModel.json stats may not include all columns (e.g. some
@@ -281,17 +295,27 @@ def _modify_bim_for_direct_lake(bim, lh_info, table_filter=None):
 def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=False):
     """Modify a model.bim for Import mode reading from OneLake Delta tables.
 
-    Keeps the original model structure (calculated columns, etc.) but rewrites
-    partition M queries to read from OneLake instead of the original source.
+    Uses a single shared data source pointing at the Tables folder, with
+    each table referenced by folder name. This ensures Power BI sees one
+    data source for all queries.
 
-    Args:
-        bim: The model.bim dict.
-        lh_info: Lakehouse connection info.
-        table_filter: Tables that have Delta backing (from generation).
-        use_sql_endpoint: If True, use SQL Analytics Endpoint instead of OneLake direct.
+    M query pattern:
+        let
+            Source = AzureStorage.DataLake("https://{host}/{ws}/{lh}/Tables/dbo/", ...),
+            Table = Source{[Name="TableName"]}[Content],
+            Data = DeltaLake.Table(Table)
+        in
+            Data
     """
     model = bim.get("model", bim)
-    onelake_url = f"https://{lh_info['onelake_host']}/{lh_info['ws_id']}/{lh_info['lh_id']}"
+    onelake_host = lh_info["onelake_host"]
+    ws_id = lh_info["ws_id"]
+    lh_id = lh_info["lh_id"]
+    schema = lh_info.get("default_schema", "dbo")
+
+    # Build the shared source URL (includes schema folder if present)
+    source_url = f"https://{onelake_host}/{ws_id}/{lh_id}/Tables/{schema}/"
+
     filter_set = set(table_filter) if table_filter is not None else None
 
     n_rewritten = 0
@@ -300,19 +324,17 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         has_delta = filter_set is None or tname in filter_set
 
         if not has_delta:
-            # Keep original partitions (enter-data, measure-only, etc.)
             continue
 
         safe_name = _safe_folder_name(tname)
-        table_url = f"{onelake_url}/Tables/{safe_name}/"
 
-        # Rewrite partition to read from OneLake Delta
         m_expr = (
             "let\n"
-            f'    Source = AzureStorage.DataLake("{table_url}", [HierarchicalNavigation=true]),\n'
-            "    ToDelta = DeltaLake.Table(Source)\n"
+            f'    Source = AzureStorage.DataLake("{source_url}", [HierarchicalNavigation=true]),\n'
+            f'    Table = Source{{[Name="{safe_name}"]}}[Content],\n'
+            "    Data = DeltaLake.Table(Table)\n"
             "in\n"
-            "    ToDelta"
+            "    Data"
         )
 
         table["partitions"] = [
@@ -326,16 +348,20 @@ def _modify_bim_for_import(bim, lh_info, table_filter=None, use_sql_endpoint=Fal
         ]
         n_rewritten += 1
 
+    print(f"    Source: {source_url}", flush=True)
     print(f"    Rewrote {n_rewritten} table partition(s) to read from OneLake", flush=True)
     return bim
 
 
-def _strip_unknown_bim_properties(bim):
+def _strip_unknown_bim_properties(bim, table_filter=None, convert_calc=True):
     """Clean BIM JSON for TOM deserialization and Fabric import.
 
-    Converts calculated columns to data columns (Direct Lake doesn't
-    support them — we generate the values in the Delta tables).
-    Strips unknown column properties.
+    When convert_calc=True (Direct Lake): converts calculated columns to data
+    columns since Direct Lake doesn't support them.
+    When convert_calc=False (Import): leaves calculated columns untouched.
+
+    Strips unknown column properties in either mode.
+    If table_filter is provided, only modifies tables in the filter set.
     """
     _KNOWN_COL_PROPS = {
         "name", "type", "dataType", "sourceColumn", "description", "isHidden",
@@ -345,24 +371,39 @@ def _strip_unknown_bim_properties(bim):
         "isDefaultImage", "alignment", "tableDetailPosition",
         "isAvailableInMDX", "groupByColumns", "alternateOf", "encodingHint",
     }
+    # Calc columns have additional valid props
+    _CALC_COL_PROPS = _KNOWN_COL_PROPS | {"expression", "type"}
     _ROWNUM_PROPS = {"name", "type", "dataType", "isHidden", "annotations",
                      "isUnique", "isNullable", "lineageTag"}
     _CALC_TYPES = {"calculated", "calculatedTableColumn"}
+    filter_set = set(table_filter) if table_filter is not None else None
 
     model = bim.get("model", bim)
     n_converted = 0
     for table in model.get("tables", []):
+        tname = table.get("name", "")
+
+        # Skip tables not in filter (e.g. enter-data tables in import mode)
+        if filter_set is not None and tname not in filter_set:
+            continue
+
         for col in table.get("columns", []):
             col_type = col.get("type")
 
             if col_type in _CALC_TYPES:
-                # Convert to data column — keep only valid data column props
-                clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
-                clean.pop("type", None)
-                clean["sourceColumn"] = col["name"]
-                col.clear()
-                col.update(clean)
-                n_converted += 1
+                if convert_calc:
+                    # Convert to data column — keep only valid data column props
+                    clean = {k: v for k, v in col.items() if k in _KNOWN_COL_PROPS}
+                    clean.pop("type", None)
+                    clean["sourceColumn"] = col["name"]
+                    col.clear()
+                    col.update(clean)
+                    n_converted += 1
+                else:
+                    # Import mode: keep calc columns, just strip unknown props
+                    unknown = [k for k in col if k not in _CALC_COL_PROPS]
+                    for k in unknown:
+                        col.pop(k)
 
             elif col_type == "rowNumber":
                 unknown = [k for k in col if k not in _ROWNUM_PROPS]
@@ -553,7 +594,7 @@ def deploy_semantic_model(
     # Modify the BIM based on mode
     if mode == "import":
         print("  Converting model to Import from OneLake ...", flush=True)
-        _strip_unknown_bim_properties(bim)
+        _strip_unknown_bim_properties(bim, table_filter=table_filter, convert_calc=False)
         bim = _modify_bim_for_import(bim, lh_info, table_filter)
     else:
         print("  Converting model to Direct Lake on OneLake ...", flush=True)
@@ -616,23 +657,26 @@ def deploy_semantic_model(
 
 
 def _print_refresh_errors(dataset, workspace=None):
-    """Fetch and display detailed refresh errors from the REST API."""
+    """Fetch and display detailed refresh errors from the Power BI REST API."""
     import sempy.fabric as fabric
     from sempy_labs._helper_functions import resolve_workspace_name_and_id
 
     (ws_name, ws_id) = resolve_workspace_name_and_id(workspace)
-    client = fabric.FabricRestClient()
 
-    # Find the semantic model ID
+    # Find the semantic model ID via Fabric API
+    client = fabric.FabricRestClient()
     items = client.get(f"/v1/workspaces/{ws_id}/semanticModels").json().get("value", [])
     model = next((i for i in items if i["displayName"] == dataset), None)
     if not model:
         return
 
-    # Get refresh history via XMLA-compatible endpoint
     model_id = model["id"]
-    resp = client.get(f"/v1/workspaces/{ws_id}/semanticModels/{model_id}/refreshes")
+
+    # Get refresh history via Power BI API (not Fabric Items API)
+    pbi_client = fabric.PowerBIRestClient()
+    resp = pbi_client.get(f"/v1.0/myorg/groups/{ws_id}/datasets/{model_id}/refreshes?$top=1")
     if resp.status_code != 200:
+        print(f"    ⚠ Refresh history API returned {resp.status_code}: {resp.text[:200]}", flush=True)
         return
 
     refreshes = resp.json().get("value", [])

@@ -1,6 +1,6 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.8.2"
+__version__ = "0.8.20"
 
 
 def generate(
@@ -19,6 +19,8 @@ def generate(
     output_format="delta",
     include_hidden=False,
     include_calculated=False,
+    queries_path=None,
+    skew_recent=False,
 ):
     """One-call pipeline: .vpax → Delta tables → semantic model → comparison report.
 
@@ -85,6 +87,13 @@ def generate(
         include_calculated=include_calculated,
     )
 
+    # Extract fixed values from captured queries for low-cardinality columns
+    if queries_path:
+        from .dax_rewriter import extract_query_values
+        n_fixed = extract_query_values(config, queries_path)
+        if n_fixed:
+            print(f"  Applied {n_fixed} column value(s) from queries", flush=True)
+
     # Cross-reference with BIM to add columns missing from VPAX stats
     # (Direct Lake needs all BIM columns in Delta; Import mode doesn't)
     if deploy_model and mode == "direct_lake":
@@ -111,7 +120,8 @@ def generate(
     succeeded_tables, actual_output_path = generate_all_tables(
         spark, config, output_path=output_path,
         output_format=output_format, vpax_model=vpax_model,
-        overwrite=overwrite_tables, skip_tables=tables_to_skip)
+        overwrite=overwrite_tables, skip_tables=tables_to_skip,
+        skew_recent=skew_recent)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:
