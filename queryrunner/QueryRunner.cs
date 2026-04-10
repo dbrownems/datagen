@@ -17,6 +17,7 @@ namespace Datagen
         public int Iteration { get; set; }
         public int RowCount { get; set; }
         public double DurationMs { get; set; }
+        public double StartTimeMs { get; set; }
         public string? Error { get; set; }
     }
 
@@ -42,7 +43,7 @@ namespace Datagen
                     SimulateUser(userIdx, queries, xmlaEndpoint, dataset, token,
                         userEmails[userIdx], userRoles[userIdx],
                         queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
-                        allResults, cts.Token));
+                        allResults, testStart, cts.Token));
             }
 
             Task.WaitAll(userTasks);
@@ -57,7 +58,7 @@ namespace Datagen
             int userIndex, string[] queries, string xmlaEndpoint, string dataset,
             string token, string email, string role, int queriesPerBatch, int pauseMs,
             int pauseBetweenQueriesMs,
-            ConcurrentBag<QueryResult> results, CancellationToken ct)
+            ConcurrentBag<QueryResult> results, Stopwatch testStart, CancellationToken ct)
         {
             string connStr =
                 $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
@@ -79,7 +80,7 @@ namespace Datagen
                 {
                     iteration++;
                     RunIteration(userIndex, iteration, queries, connections,
-                        pauseBetweenQueriesMs, results, ct);
+                        pauseBetweenQueriesMs, results, testStart, ct);
                     if (ct.IsCancellationRequested) break;
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
@@ -96,7 +97,7 @@ namespace Datagen
         private static void RunIteration(
             int userIndex, int iteration, string[] queries,
             AdomdConnection[] connections, int pauseBetweenQueriesMs,
-            ConcurrentBag<QueryResult> results,
+            ConcurrentBag<QueryResult> results, Stopwatch testStart,
             CancellationToken ct)
         {
             int max = connections.Length;
@@ -119,7 +120,7 @@ namespace Datagen
                         if (!connSlots.TryDequeue(out conn))
                             throw new InvalidOperationException("No connection available");
 
-                        var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn);
+                        var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
                         results.Add(r);
                         if (r.Error != null)
                         {
@@ -144,10 +145,11 @@ namespace Datagen
         }
 
         private static QueryResult ExecuteQuery(int userIndex, int queryIndex,
-            int iteration, string query, AdomdConnection conn)
+            int iteration, string query, AdomdConnection conn, Stopwatch testStart)
         {
             var result = new QueryResult {
-                UserIndex = userIndex, QueryIndex = queryIndex, Iteration = iteration };
+                UserIndex = userIndex, QueryIndex = queryIndex, Iteration = iteration,
+                StartTimeMs = Math.Round(testStart.Elapsed.TotalMilliseconds) };
             try
             {
                 var cmd = new AdomdCommand(query, conn);
@@ -212,6 +214,34 @@ namespace Datagen
             if (fail.Any())
                 stats["sampleErrors"] = fail.Take(5)
                     .Select(r => new { r.UserIndex, r.QueryIndex, r.Iteration, r.Error }).ToList();
+
+            // Time-series: per-second buckets for glitch detection
+            var timeline = ok.GroupBy(r => (int)(r.StartTimeMs / 1000))
+                .OrderBy(g => g.Key)
+                .Select(g =>
+                {
+                    var d = g.Select(r => r.DurationMs).OrderBy(x => x).ToList();
+                    return new Dictionary<string, object>
+                    {
+                        ["second"] = g.Key,
+                        ["count"] = g.Count(),
+                        ["meanMs"] = Math.Round(d.Average()),
+                        ["p50Ms"] = Math.Round(Pct(d, 50)),
+                        ["p95Ms"] = Math.Round(Pct(d, 95)),
+                        ["maxMs"] = Math.Round(d.Last()),
+                    };
+                }).ToList();
+            stats["timeline"] = timeline;
+
+            // Raw executions sorted by start time (for detailed analysis)
+            stats["executions"] = ok.OrderBy(r => r.StartTimeMs)
+                .Select(r => new Dictionary<string, object>
+                {
+                    ["t"] = r.StartTimeMs,
+                    ["ms"] = Math.Round(r.DurationMs),
+                    ["u"] = r.UserIndex,
+                    ["q"] = r.QueryIndex,
+                }).ToList();
 
             return JsonSerializer.Serialize(stats, new JsonSerializerOptions { WriteIndented = true });
         }
