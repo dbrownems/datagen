@@ -6,22 +6,28 @@ dist/
 build/
 *.egg
 
+# .NET
+queryrunner/bin/
+queryrunner/obj/
+
 # IDE
 .vscode/
+.vs/
 .idea/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Test artifacts
+# Non-source files
+.token
+*.json
+*.dax
+scripts/
+notebooks/
+requirements.txt
+generate_interactive_token.py
 test_output/
 test_*.yaml
 test_*.vpax
 *.tmdl.bak
-.token
-*.json
-scripts/
-*.dax
-
-.vs/
