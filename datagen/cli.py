@@ -78,14 +78,6 @@ def cmd_model(args):
     )
 
 
-def cmd_build_notebook(args):
-    """Build the Fabric notebook artifacts."""
-    from .build_notebook import build_notebook, build_load_notebook, build_scaleout_notebook
-    build_notebook(output_dir=args.output_dir)
-    build_load_notebook(output_dir=args.output_dir)
-    build_scaleout_notebook(output_dir=args.output_dir)
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="datagen",
@@ -122,11 +114,6 @@ def main():
     p_model.add_argument("--include-hidden", action="store_true", help="Include hidden objects")
     p_model.add_argument("--include-calculated", action="store_true", help="Include calculated columns")
     p_model.set_defaults(func=cmd_model)
-
-    # -- build-notebook --
-    p_nb = subparsers.add_parser("build-notebook", help="Build the Fabric notebook artifact")
-    p_nb.add_argument("-o", "--output-dir", help="Output directory (default: dist/)")
-    p_nb.set_defaults(func=cmd_build_notebook)
 
     args = parser.parse_args()
     args.func(args)
