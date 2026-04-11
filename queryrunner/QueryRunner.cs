@@ -86,6 +86,7 @@ namespace Datagen
             var totalConnectTimeMs = new long[] { 0 };
             int progressStep = Math.Max(1, nUsers / 10);
             int batchSize = 10;
+            var connStrings = new string[nUsers];
 
             var userTasks = new Task[nUsers];
             for (int batchStart = 0; batchStart < nUsers; batchStart += batchSize)
@@ -100,8 +101,9 @@ namespace Datagen
                     int userIdx = batchStart + b;
                     string connStr =
                         $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
-                        $"password={token};Timeout=7200;CustomData={userEmails[userIdx]};Roles={userRoles[userIdx]};";
-
+                        $"password={token};Timeout=7200;ConnectTimeout=300;" +
+                        $"CustomData={userEmails[userIdx]};Roles={userRoles[userIdx]};";
+                    connStrings[userIdx] = connStr;
                     connectTasks[b] = Task.Run(() =>
                     {
                         var sw = Stopwatch.StartNew();
@@ -128,7 +130,7 @@ namespace Datagen
                     userTasks[userIdx] = Task.Run(() =>
                         SimulateUserWithConnections(userIdx, queries, userEmails[userIdx],
                             queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
-                            connections, allResults, testStart, telemetryQueue, activeUsers, cts.Token));
+                            connections, connStrings[userIdx], allResults, testStart, telemetryQueue, activeUsers, cts.Token));
                 }
 
                 // Progress every 10%
@@ -231,7 +233,7 @@ namespace Datagen
         private static void SimulateUserWithConnections(
             int userIndex, string[] queries, string email,
             int queriesPerBatch, int pauseMs, int pauseBetweenQueriesMs,
-            AdomdConnection[] connections,
+            AdomdConnection[] connections, string connStr,
             ConcurrentBag<QueryResult> results, Stopwatch testStart,
             BlockingCollection<TelemetryRecord>? telemetryQueue,
             int[] activeUsers, CancellationToken ct)
@@ -242,7 +244,7 @@ namespace Datagen
                 while (!ct.IsCancellationRequested)
                 {
                     iteration++;
-                    RunIteration(userIndex, email, iteration, queries, connections,
+                    RunIteration(userIndex, email, iteration, queries, connections, connStr,
                         pauseBetweenQueriesMs, results, testStart, telemetryQueue, activeUsers, ct);
                     if (ct.IsCancellationRequested) break;
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
@@ -258,7 +260,7 @@ namespace Datagen
 
         private static void RunIteration(
             int userIndex, string email, int iteration, string[] queries,
-            AdomdConnection[] connections, int pauseBetweenQueriesMs,
+            AdomdConnection[] connections, string connStr, int pauseBetweenQueriesMs,
             ConcurrentBag<QueryResult> results, Stopwatch testStart,
             BlockingCollection<TelemetryRecord>? telemetryQueue,
             int[] activeUsers,
@@ -285,24 +287,33 @@ namespace Datagen
                             throw new InvalidOperationException("No connection available");
 
                         var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
-                        results.Add(r);
 
-                        // Submit telemetry
-                        if (telemetryQueue != null && !telemetryQueue.IsAddingCompleted)
+                        // On connection error, log failure, reconnect, and retry once
+                        if (r.Error != null && r.Error.Contains("timed out or was lost"))
                         {
-                            var record = new TelemetryRecord
+                            results.Add(r);
+                            SubmitTelemetry(telemetryQueue, qi, email, r, activeUsers);
+
+                            Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} connection lost, reconnecting...");
+                            try
                             {
-                                QueryNumber = qi,
-                                UserEmail = email,
-                                Timestamp = DateTime.UtcNow,
-                                StartTimeMs = r.StartTimeMs,
-                                DurationMs = r.DurationMs,
-                                Outcome = r.Error == null ? "Success" : "Error",
-                                MessageText = r.Error ?? $"{r.RowCount} rows",
-                                ActiveUsers = Volatile.Read(ref activeUsers[0]),
-                            };
-                            telemetryQueue.TryAdd(record);
+                                conn.Close();
+                                conn.Dispose();
+                                conn = new AdomdConnection(connStr);
+                                conn.Open();
+                            }
+                            catch (Exception reconEx)
+                            {
+                                Console.WriteLine($"[User {userIndex}] Reconnect failed: {reconEx.Message}");
+                                throw;
+                            }
+
+                            // Retry the query once on the new connection
+                            r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
                         }
+
+                        results.Add(r);
+                        SubmitTelemetry(telemetryQueue, qi, email, r, activeUsers);
 
                         if (r.Error != null)
                         {
@@ -324,6 +335,26 @@ namespace Datagen
             }
 
             Task.WaitAll(tasks.ToArray());
+        }
+
+        private static void SubmitTelemetry(BlockingCollection<TelemetryRecord>? telemetryQueue,
+            int qi, string email, QueryResult r, int[] activeUsers)
+        {
+            if (telemetryQueue != null && !telemetryQueue.IsAddingCompleted)
+            {
+                var record = new TelemetryRecord
+                {
+                    QueryNumber = qi,
+                    UserEmail = email,
+                    Timestamp = DateTime.UtcNow,
+                    StartTimeMs = r.StartTimeMs,
+                    DurationMs = r.DurationMs,
+                    Outcome = r.Error == null ? "Success" : "Error",
+                    MessageText = r.Error ?? $"{r.RowCount} rows",
+                    ActiveUsers = Volatile.Read(ref activeUsers[0]),
+                };
+                telemetryQueue.TryAdd(record);
+            }
         }
 
         private static QueryResult ExecuteQuery(int userIndex, int queryIndex,
