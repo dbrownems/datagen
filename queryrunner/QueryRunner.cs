@@ -2,7 +2,9 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,19 +23,53 @@ namespace Datagen
         public string? Error { get; set; }
     }
 
+    internal class TelemetryRecord
+    {
+        public int QueryIndex { get; set; }
+        public DateTime Timestamp { get; set; }
+        public double StartTimeMs { get; set; }
+        public double DurationMs { get; set; }
+        public string Outcome { get; set; } = "";
+        public string MessageText { get; set; } = "";
+    }
+
     public static class QueryRunner
     {
+        private static readonly TimeZoneInfo CdtZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+
         public static string RunLoadTest(
             string[] queries, string xmlaEndpoint, string dataset, string token,
             string[] userEmails, string[] userRoles,
             int durationSeconds = 60, int queriesPerBatch = 4,
-            int pauseBetweenIterationsMs = 1000, int pauseBetweenQueriesMs = 0)
+            int pauseBetweenIterationsMs = 1000, int pauseBetweenQueriesMs = 0,
+            string? logDirectory = null)
         {
             var allResults = new ConcurrentBag<QueryResult>();
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
             var testStart = Stopwatch.StartNew();
+            var testStartTime = DateTime.UtcNow;
 
             Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query");
+
+            // Set up telemetry log writer
+            BlockingCollection<TelemetryRecord>? telemetryQueue = null;
+            Task? logWriterTask = null;
+            string? logFilePath = null;
+
+            if (!string.IsNullOrEmpty(logDirectory))
+            {
+                Directory.CreateDirectory(logDirectory);
+                var cdtStart = TimeZoneInfo.ConvertTimeFromUtc(testStartTime, CdtZone);
+                var fileName = $"LoadTest.{cdtStart:yyyyMMdd-HHmmss}.csv";
+                logFilePath = Path.Combine(logDirectory, fileName);
+                Console.WriteLine($"[QueryRunner] Logging to: {logFilePath}");
+
+                // Write CSV header
+                File.WriteAllText(logFilePath, "QueryIndex,Timestamp,StartTimeMs,DurationMs,Outcome,MessageText\n");
+
+                telemetryQueue = new BlockingCollection<TelemetryRecord>(boundedCapacity: 10000);
+                logWriterTask = Task.Run(() => LogWriterLoop(telemetryQueue, logFilePath, cts.Token));
+            }
 
             var userTasks = new Task[userEmails.Length];
             for (int u = 0; u < userEmails.Length; u++)
@@ -43,22 +79,92 @@ namespace Datagen
                     SimulateUser(userIdx, queries, xmlaEndpoint, dataset, token,
                         userEmails[userIdx], userRoles[userIdx],
                         queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
-                        allResults, testStart, cts.Token));
+                        allResults, testStart, telemetryQueue, cts.Token));
             }
 
             Task.WaitAll(userTasks);
             testStart.Stop();
+
+            // Shut down log writer
+            if (telemetryQueue != null)
+            {
+                telemetryQueue.CompleteAdding();
+                logWriterTask?.Wait(TimeSpan.FromSeconds(10));
+                Console.WriteLine($"[QueryRunner] Log written: {logFilePath}");
+            }
+
             Console.WriteLine($"[QueryRunner] Done: {allResults.Count} executions in {testStart.Elapsed.TotalSeconds:F1}s");
 
             return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
-                userEmails.Length, queries.Length);
+                userEmails.Length, queries.Length, logFilePath);
+        }
+
+        private static void LogWriterLoop(BlockingCollection<TelemetryRecord> queue,
+            string logFilePath, CancellationToken ct)
+        {
+            var batch = new List<TelemetryRecord>();
+
+            while (!queue.IsCompleted)
+            {
+                batch.Clear();
+
+                // Block up to 10 seconds for the first item
+                try
+                {
+                    if (queue.TryTake(out var first, TimeSpan.FromSeconds(10)))
+                        batch.Add(first);
+                    else
+                        continue;
+                }
+                catch (InvalidOperationException) { break; } // CompleteAdding was called
+
+                // Drain any remaining items without blocking
+                while (queue.TryTake(out var item))
+                    batch.Add(item);
+
+                if (batch.Count == 0) continue;
+
+                // Open, append, close — blobfuse doesn't support file sharing
+                var sb = new StringBuilder();
+                foreach (var r in batch)
+                {
+                    var msg = SanitizeCsvField(r.MessageText);
+                    sb.AppendLine(
+                        $"{r.QueryIndex},{r.Timestamp:yyyy-MM-dd HH:mm:ss.fff},{r.StartTimeMs:F0},{r.DurationMs:F1},{r.Outcome},{msg}");
+                }
+
+                try
+                {
+                    File.AppendAllText(logFilePath, sb.ToString());
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[LogWriter] Error writing: {ex.Message}");
+                }
+            }
+        }
+
+        private static string SanitizeCsvField(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            // Truncate long messages
+            if (value.Length > 500) value = value[..500];
+            // Replace problematic characters
+            value = value.Replace("\r", " ").Replace("\n", " ");
+            // Quote if contains comma, quote, or whitespace
+            if (value.Contains(',') || value.Contains('"') || value.Contains(' '))
+            {
+                value = "\"" + value.Replace("\"", "\"\"") + "\"";
+            }
+            return value;
         }
 
         private static void SimulateUser(
             int userIndex, string[] queries, string xmlaEndpoint, string dataset,
             string token, string email, string role, int queriesPerBatch, int pauseMs,
             int pauseBetweenQueriesMs,
-            ConcurrentBag<QueryResult> results, Stopwatch testStart, CancellationToken ct)
+            ConcurrentBag<QueryResult> results, Stopwatch testStart,
+            BlockingCollection<TelemetryRecord>? telemetryQueue, CancellationToken ct)
         {
             string connStr =
                 $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
@@ -80,7 +186,7 @@ namespace Datagen
                 {
                     iteration++;
                     RunIteration(userIndex, iteration, queries, connections,
-                        pauseBetweenQueriesMs, results, testStart, ct);
+                        pauseBetweenQueriesMs, results, testStart, telemetryQueue, ct);
                     if (ct.IsCancellationRequested) break;
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
@@ -98,6 +204,7 @@ namespace Datagen
             int userIndex, int iteration, string[] queries,
             AdomdConnection[] connections, int pauseBetweenQueriesMs,
             ConcurrentBag<QueryResult> results, Stopwatch testStart,
+            BlockingCollection<TelemetryRecord>? telemetryQueue,
             CancellationToken ct)
         {
             int max = connections.Length;
@@ -122,6 +229,22 @@ namespace Datagen
 
                         var r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
                         results.Add(r);
+
+                        // Submit telemetry
+                        if (telemetryQueue != null && !telemetryQueue.IsAddingCompleted)
+                        {
+                            var record = new TelemetryRecord
+                            {
+                                QueryIndex = qi,
+                                Timestamp = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, CdtZone),
+                                StartTimeMs = r.StartTimeMs,
+                                DurationMs = r.DurationMs,
+                                Outcome = r.Error == null ? "Success" : "Error",
+                                MessageText = r.Error ?? $"{r.RowCount} rows",
+                            };
+                            telemetryQueue.TryAdd(record);
+                        }
+
                         if (r.Error != null)
                         {
                             Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
@@ -169,7 +292,7 @@ namespace Datagen
         }
 
         private static string BuildStats(List<QueryResult> results, double totalMs,
-            int nUsers, int nQueries)
+            int nUsers, int nQueries, string? logFilePath = null)
         {
             var ok = results.Where(r => r.Error == null).ToList();
             var fail = results.Where(r => r.Error != null).ToList();
@@ -187,6 +310,9 @@ namespace Datagen
                 ["maxIteration"] = maxIter,
                 ["qps"] = Math.Round(ok.Count / (totalMs / 1000), 1),
             };
+
+            if (logFilePath != null)
+                stats["logFile"] = logFilePath;
 
             if (durs.Any())
                 stats["latency"] = new Dictionary<string, object>
