@@ -101,7 +101,7 @@ namespace Datagen
                     int userIdx = batchStart + b;
                     string connStr =
                         $"Data Source={xmlaEndpoint};Initial Catalog={dataset};" +
-                        $"password={token};Timeout=7200;ConnectTimeout=300;" +
+                        $"password={token};Timeout=7200;Connect Timeout=300;" +
                         $"CustomData={userEmails[userIdx]};Roles={userRoles[userIdx]};";
                     connStrings[userIdx] = connStr;
                     connectTasks[b] = Task.Run(() =>
