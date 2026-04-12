@@ -4,6 +4,9 @@ using System.CommandLine.Invocation;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
+using Azure.Core;
+using Azure.Identity;
 using Datagen;
 
 namespace LoadGen;
@@ -25,15 +28,17 @@ class Program
         var usersFileOption = new Option<FileInfo>("--users-file", "Path to users.json") { IsRequired = true };
         var logDirOption = new Option<string>("--log-dir", () => "./logs", "Directory for telemetry CSV logs");
         var logFileOption = new Option<string>("--log-file", () => "", "Log filename (auto-generated if empty)");
-        var tokenOption = new Option<string?>("--token", "Access token (prefer --token-file or PBI_TOKEN env var)");
+        var tokenOption = new Option<string?>("--token", "Access token (prefer --token-file or --auth)");
         var tokenFileOption = new Option<FileInfo?>("--token-file", "Path to file containing access token");
+        var authOption = new Option<string?>("--auth",
+            "Azure auth method: 'default', 'browser', 'devicecode', 'cli', 'env', or 'managedidentity'");
 
         var rootCommand = new RootCommand("LoadGen — Power BI load test runner using DatagenQueryRunner")
         {
             xmlaOption, datasetOption, durationOption, usersOption,
             queriesPerBatchOption, pauseIterOption, pauseQueryOption,
             rampOption, replicaOption, queriesFileOption, usersFileOption,
-            logDirOption, logFileOption, tokenOption, tokenFileOption,
+            logDirOption, logFileOption, tokenOption, tokenFileOption, authOption,
         };
 
         rootCommand.SetHandler((InvocationContext ctx) =>
@@ -53,10 +58,11 @@ class Program
             var logFile = ctx.ParseResult.GetValueForOption(logFileOption)!;
             var tokenDirect = ctx.ParseResult.GetValueForOption(tokenOption);
             var tokenFile = ctx.ParseResult.GetValueForOption(tokenFileOption);
+            var auth = ctx.ParseResult.GetValueForOption(authOption);
 
             ctx.ExitCode = Run(xmla, dataset, duration, userCount, queriesPerBatch,
                 pauseIter, pauseQuery, rampTime, replica, queriesFile, usersFile,
-                logDir, logFile, tokenDirect, tokenFile);
+                logDir, logFile, tokenDirect, tokenFile, auth);
         });
 
         return rootCommand.Invoke(args);
@@ -65,14 +71,16 @@ class Program
     static int Run(string xmla, string dataset, int duration, int userCount,
         int queriesPerBatch, int pauseIter, int pauseQuery, int rampTime,
         string replica, FileInfo queriesFile, FileInfo usersFile,
-        string logDir, string logFile, string? tokenDirect, FileInfo? tokenFile)
+        string logDir, string logFile, string? tokenDirect, FileInfo? tokenFile,
+        string? auth)
     {
         // ── Resolve token ──
-        var token = ResolveToken(tokenDirect, tokenFile);
+        var token = ResolveToken(tokenDirect, tokenFile, auth);
         if (token == null)
         {
             Console.Error.WriteLine("Error: No access token provided.");
-            Console.Error.WriteLine("  Use --token-file <path>, --token <value>, or set the PBI_TOKEN environment variable.");
+            Console.Error.WriteLine("  Use --auth <method>, --token-file <path>, --token <value>, or set PBI_TOKEN env var.");
+            Console.Error.WriteLine("  Auth methods: default, browser, devicecode, cli, env, managedidentity");
             return 1;
         }
 
@@ -181,9 +189,9 @@ class Program
         return 0;
     }
 
-    static string? ResolveToken(string? direct, FileInfo? file)
+    static string? ResolveToken(string? direct, FileInfo? file, string? auth)
     {
-        // Priority: --token > --token-file > PBI_TOKEN env var
+        // Priority: --token > --token-file > PBI_TOKEN env var > --auth
         if (!string.IsNullOrWhiteSpace(direct))
             return direct.Trim();
 
@@ -194,7 +202,40 @@ class Program
         if (!string.IsNullOrWhiteSpace(envToken))
             return envToken.Trim();
 
+        if (!string.IsNullOrWhiteSpace(auth))
+            return AcquireToken(auth.Trim().ToLowerInvariant());
+
         return null;
+    }
+
+    static string AcquireToken(string method)
+    {
+        var scope = "https://analysis.windows.net/powerbi/api/.default";
+        Console.WriteLine($"Acquiring token via Azure {method} credential...");
+
+        TokenCredential credential = method switch
+        {
+            "default" => new DefaultAzureCredential(),
+            "browser" => new InteractiveBrowserCredential(),
+            "devicecode" => new DeviceCodeCredential(new DeviceCodeCredentialOptions
+            {
+                DeviceCodeCallback = (info, cancel) =>
+                {
+                    Console.WriteLine(info.Message);
+                    return System.Threading.Tasks.Task.CompletedTask;
+                }
+            }),
+            "cli" => new AzureCliCredential(),
+            "env" => new EnvironmentCredential(),
+            "managedidentity" => new ManagedIdentityCredential(),
+            _ => throw new ArgumentException(
+                $"Unknown auth method '{method}'. Use: default, browser, devicecode, cli, env, managedidentity")
+        };
+
+        var tokenResult = credential.GetToken(
+            new TokenRequestContext(new[] { scope }), CancellationToken.None);
+        Console.WriteLine($"Token acquired, expires {tokenResult.ExpiresOn:HH:mm:ss UTC}");
+        return tokenResult.Token;
     }
 
     static string[] ParseQueries(string json)
