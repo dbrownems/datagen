@@ -40,7 +40,7 @@ namespace Datagen
             _queue.TryAdd(line);
         }
 
-        private void WriteLoop()
+        private async Task WriteLoop()
         {
             StreamWriter? fileWriter = null;
             try
@@ -66,11 +66,17 @@ namespace Datagen
 
                     foreach (var line in batch)
                     {
+                        Task? ft = null;
+                        try { ft = fileWriter?.WriteLineAsync(line); }
+                        catch { }
                         Console.WriteLine(line);
-                        try { fileWriter?.WriteLine(line); }
-                        catch { /* don't let file I/O kill the test */ }
+                        if (ft != null)
+                        {
+                            try { await ft; }
+                            catch { }
+                        }
                     }
-                    try { fileWriter?.Flush(); }
+                    try { if (fileWriter != null) await fileWriter.FlushAsync(); }
                     catch { }
                 }
             }
