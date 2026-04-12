@@ -13,12 +13,13 @@ using Microsoft.AnalysisServices.AdomdClient;
 namespace Datagen
 {
     /// <summary>
-    /// Simple logger that writes timestamped messages to console and optionally to a file.
+    /// Lock-free logger that writes timestamped messages to console immediately
+    /// and enqueues file writes to a background consumer thread.
     /// </summary>
     public sealed class QueryRunnerLogger : IDisposable
     {
-        private readonly StreamWriter? _fileWriter;
-        private readonly object _lock = new();
+        private readonly BlockingCollection<string>? _queue;
+        private readonly Task? _writerTask;
 
         public QueryRunnerLogger(string? logFilePath = null)
         {
@@ -27,10 +28,9 @@ namespace Datagen
                 var dir = Path.GetDirectoryName(logFilePath);
                 if (!string.IsNullOrEmpty(dir))
                     Directory.CreateDirectory(dir);
-                _fileWriter = new StreamWriter(logFilePath, append: false, Encoding.UTF8)
-                {
-                    AutoFlush = true
-                };
+
+                _queue = new BlockingCollection<string>(boundedCapacity: 4096);
+                _writerTask = Task.Run(() => WriteLoop(logFilePath));
             }
         }
 
@@ -38,22 +38,45 @@ namespace Datagen
         {
             var line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}";
             Console.WriteLine(line);
-            if (_fileWriter != null)
+            _queue?.TryAdd(line);
+        }
+
+        private void WriteLoop(string path)
+        {
+            using var writer = new StreamWriter(path, append: false, Encoding.UTF8);
+            var batch = new List<string>();
+
+            while (!_queue!.IsCompleted)
             {
-                lock (_lock)
+                batch.Clear();
+                try
                 {
-                    try { _fileWriter.WriteLine(line); }
-                    catch { /* don't let log I/O kill the test */ }
+                    if (_queue.TryTake(out var first, TimeSpan.FromSeconds(5)))
+                        batch.Add(first);
+                    else
+                        continue;
                 }
+                catch (InvalidOperationException) { break; }
+
+                while (_queue.TryTake(out var item))
+                    batch.Add(item);
+
+                try
+                {
+                    foreach (var line in batch)
+                        writer.WriteLine(line);
+                    writer.Flush();
+                }
+                catch { /* don't let log I/O kill the test */ }
             }
         }
 
         public void Dispose()
         {
-            lock (_lock)
+            if (_queue != null)
             {
-                _fileWriter?.Flush();
-                _fileWriter?.Dispose();
+                _queue.CompleteAdding();
+                _writerTask?.Wait(TimeSpan.FromSeconds(5));
             }
         }
     }
