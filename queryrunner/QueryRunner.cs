@@ -12,6 +12,52 @@ using Microsoft.AnalysisServices.AdomdClient;
 
 namespace Datagen
 {
+    /// <summary>
+    /// Simple logger that writes timestamped messages to console and optionally to a file.
+    /// </summary>
+    public sealed class QueryRunnerLogger : IDisposable
+    {
+        private readonly StreamWriter? _fileWriter;
+        private readonly object _lock = new();
+
+        public QueryRunnerLogger(string? logFilePath = null)
+        {
+            if (!string.IsNullOrEmpty(logFilePath))
+            {
+                var dir = Path.GetDirectoryName(logFilePath);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                _fileWriter = new StreamWriter(logFilePath, append: false, Encoding.UTF8)
+                {
+                    AutoFlush = true
+                };
+            }
+        }
+
+        public void Log(string message)
+        {
+            var line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}";
+            Console.WriteLine(line);
+            if (_fileWriter != null)
+            {
+                lock (_lock)
+                {
+                    try { _fileWriter.WriteLine(line); }
+                    catch { /* don't let log I/O kill the test */ }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                _fileWriter?.Flush();
+                _fileWriter?.Dispose();
+            }
+        }
+    }
+
     public class QueryResult
     {
         public int UserIndex { get; set; }
@@ -177,8 +223,9 @@ namespace Datagen
 
     public static class QueryRunner
     {
-        private static void Log(string message) =>
-            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}");
+        private static QueryRunnerLogger _logger = new();
+
+        private static void Log(string message) => _logger.Log(message);
 
         public static string RunLoadTest(
             string[] queries, string xmlaEndpoint, string dataset, string token,
@@ -195,20 +242,33 @@ namespace Datagen
             var testStart = Stopwatch.StartNew();
             var testStartTime = DateTime.UtcNow;
 
-            Log($"Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query, ramp={userRampTimeSec}s");
+            // Set up text logger — derives .log path from CSV path
+            string? textLogPath = null;
+            if (!string.IsNullOrEmpty(logDirectory))
+            {
+                Directory.CreateDirectory(logDirectory);
+                var baseName = !string.IsNullOrEmpty(logFileName)
+                    ? Path.GetFileNameWithoutExtension(logFileName)
+                    : $"LoadTest.{testStartTime:yyyyMMdd-HHmmss}";
+                textLogPath = Path.Combine(logDirectory, baseName + ".log");
+            }
+            _logger = new QueryRunnerLogger(textLogPath);
 
-            // Set up telemetry log writer
+            Log($"Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query, ramp={userRampTimeSec}s");
+            if (textLogPath != null)
+                Log($"Text log: {textLogPath}");
+
+            // Set up telemetry CSV writer
             BlockingCollection<TelemetryRecord>? telemetryQueue = null;
             Task? logWriterTask = null;
             string? logFilePath = null;
 
             if (!string.IsNullOrEmpty(logDirectory))
             {
-                Directory.CreateDirectory(logDirectory);
-                var fileName = !string.IsNullOrEmpty(logFileName)
+                var csvName = !string.IsNullOrEmpty(logFileName)
                     ? logFileName
                     : $"LoadTest.{testStartTime:yyyyMMdd-HHmmss}.csv";
-                logFilePath = Path.Combine(logDirectory, fileName);
+                logFilePath = Path.Combine(logDirectory, csvName);
                 Log($"Logging to: {logFilePath}");
 
                 // Write CSV header
@@ -301,17 +361,17 @@ namespace Datagen
             status.SetConnectionInfo(totalConns, distinctEmails);
             double avgConnMs = nUsers > 0 ? Volatile.Read(ref totalConnectTimeMs[0]) / (double)nUsers : 0;
             Log("Ramp-up complete");
-            Console.WriteLine("┌──────────────────────────────────────────┐");
-            Console.WriteLine("│         Connection Summary               │");
-            Console.WriteLine("├──────────────────────────────────────────┤");
-            Console.WriteLine($"│  Users:             {nUsers,-20}│");
-            Console.WriteLine($"│  Distinct emails:   {distinctEmails,-20}│");
-            Console.WriteLine($"│  Distinct roles:    {distinctRoles,-20}│");
-            Console.WriteLine($"│  Connections/user:  {queriesPerBatch,-20}│");
-            Console.WriteLine($"│  Total connections: {totalConns,-20}│");
-            Console.WriteLine($"│  Avg connect time:  {avgConnMs:F0}ms{new string(' ', Math.Max(0, 17 - avgConnMs.ToString("F0").Length))}│");
-            Console.WriteLine($"│  Ramp-up time:      {testStart.Elapsed.TotalSeconds:F1}s{new string(' ', Math.Max(0, 17 - testStart.Elapsed.TotalSeconds.ToString("F1").Length))}│");
-            Console.WriteLine("└──────────────────────────────────────────┘");
+            Log("┌──────────────────────────────────────────┐");
+            Log("│         Connection Summary               │");
+            Log("├──────────────────────────────────────────┤");
+            Log($"│  Users:             {nUsers,-20}│");
+            Log($"│  Distinct emails:   {distinctEmails,-20}│");
+            Log($"│  Distinct roles:    {distinctRoles,-20}│");
+            Log($"│  Connections/user:  {queriesPerBatch,-20}│");
+            Log($"│  Total connections: {totalConns,-20}│");
+            Log($"│  Avg connect time:  {avgConnMs:F0}ms{new string(' ', Math.Max(0, 17 - avgConnMs.ToString("F0").Length))}│");
+            Log($"│  Ramp-up time:      {testStart.Elapsed.TotalSeconds:F1}s{new string(' ', Math.Max(0, 17 - testStart.Elapsed.TotalSeconds.ToString("F1").Length))}│");
+            Log("└──────────────────────────────────────────┘");
 
             // ── Periodic stats reporter (every 60s) ──
             var periodicReporter = Task.Run(() =>
@@ -345,8 +405,11 @@ namespace Datagen
 
             Log($"Done: {status.TotalQueries} executions in {testStart.Elapsed.TotalSeconds:F1}s");
 
-            return BuildStats(status.AllResults, testStart.Elapsed.TotalMilliseconds,
+            var result = BuildStats(status.AllResults, testStart.Elapsed.TotalMilliseconds,
                 userEmails.Length, queries.Length, logFilePath);
+
+            _logger.Dispose();
+            return result;
         }
 
         private static void LogWriterLoop(BlockingCollection<TelemetryRecord> queue,
