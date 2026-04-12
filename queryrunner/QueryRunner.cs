@@ -13,71 +13,77 @@ using Microsoft.AnalysisServices.AdomdClient;
 namespace Datagen
 {
     /// <summary>
-    /// Lock-free logger that writes timestamped messages to console immediately
-    /// and enqueues file writes to a background consumer thread.
+    /// Lock-free logger that enqueues all output (console + file) to a single
+    /// background consumer thread via BlockingCollection.
     /// </summary>
     public sealed class QueryRunnerLogger : IDisposable
     {
-        private readonly BlockingCollection<string>? _queue;
-        private readonly Task? _writerTask;
+        private readonly BlockingCollection<string> _queue = new(boundedCapacity: 4096);
+        private readonly Task _writerTask;
+        private readonly string? _logFilePath;
 
         public QueryRunnerLogger(string? logFilePath = null)
         {
+            _logFilePath = logFilePath;
             if (!string.IsNullOrEmpty(logFilePath))
             {
                 var dir = Path.GetDirectoryName(logFilePath);
                 if (!string.IsNullOrEmpty(dir))
                     Directory.CreateDirectory(dir);
-
-                _queue = new BlockingCollection<string>(boundedCapacity: 4096);
-                _writerTask = Task.Run(() => WriteLoop(logFilePath));
             }
+            _writerTask = Task.Run(WriteLoop);
         }
 
         public void Log(string message)
         {
             var line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}";
-            Console.WriteLine(line);
-            _queue?.TryAdd(line);
+            _queue.TryAdd(line);
         }
 
-        private void WriteLoop(string path)
+        private void WriteLoop()
         {
-            using var writer = new StreamWriter(path, append: false, Encoding.UTF8);
-            var batch = new List<string>();
-
-            while (!_queue!.IsCompleted)
+            StreamWriter? fileWriter = null;
+            try
             {
-                batch.Clear();
-                try
-                {
-                    if (_queue.TryTake(out var first, TimeSpan.FromSeconds(5)))
-                        batch.Add(first);
-                    else
-                        continue;
-                }
-                catch (InvalidOperationException) { break; }
+                if (!string.IsNullOrEmpty(_logFilePath))
+                    fileWriter = new StreamWriter(_logFilePath, append: false, Encoding.UTF8);
 
-                while (_queue.TryTake(out var item))
-                    batch.Add(item);
-
-                try
+                var batch = new List<string>();
+                while (!_queue.IsCompleted)
                 {
+                    batch.Clear();
+                    try
+                    {
+                        if (_queue.TryTake(out var first, TimeSpan.FromSeconds(5)))
+                            batch.Add(first);
+                        else
+                            continue;
+                    }
+                    catch (InvalidOperationException) { break; }
+
+                    while (_queue.TryTake(out var item))
+                        batch.Add(item);
+
                     foreach (var line in batch)
-                        writer.WriteLine(line);
-                    writer.Flush();
+                    {
+                        Console.WriteLine(line);
+                        try { fileWriter?.WriteLine(line); }
+                        catch { /* don't let file I/O kill the test */ }
+                    }
+                    try { fileWriter?.Flush(); }
+                    catch { }
                 }
-                catch { /* don't let log I/O kill the test */ }
+            }
+            finally
+            {
+                fileWriter?.Dispose();
             }
         }
 
         public void Dispose()
         {
-            if (_queue != null)
-            {
-                _queue.CompleteAdding();
-                _writerTask?.Wait(TimeSpan.FromSeconds(5));
-            }
+            _queue.CompleteAdding();
+            _writerTask.Wait(TimeSpan.FromSeconds(5));
         }
     }
 
