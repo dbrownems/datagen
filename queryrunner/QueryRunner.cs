@@ -35,8 +35,150 @@ namespace Datagen
         public int ActiveUsers { get; set; }
     }
 
+    /// <summary>
+    /// Thread-safe singleton that accumulates live query execution stats.
+    /// All user threads call RecordQuery() after each execution; the periodic
+    /// reporter reads the window and resets it via SnapshotAndReset().
+    /// </summary>
+    public class QueryRunnerStatus
+    {
+        public static readonly QueryRunnerStatus Instance = new();
+
+        // Cumulative totals
+        private long _totalQueries;
+        private long _totalErrors;
+        private int _activeUsers;
+        private int _totalConnections;
+        private int _distinctUsers;
+
+        // All results (kept for BuildStats at the end)
+        private readonly ConcurrentBag<QueryResult> _allResults = new();
+
+        // Current reporting window — reset every snapshot
+        private long _windowQueries;
+        private long _windowErrors;
+        private long _windowMinTicks = long.MaxValue;
+        private long _windowMaxTicks;
+        private long _windowSumTicks;
+        // Track which user indices ran queries in this window
+        private readonly ConcurrentDictionary<int, byte> _windowActiveUsers = new();
+        // Track which query indices ran in this window
+        private readonly ConcurrentDictionary<int, byte> _windowActiveQueries = new();
+
+        public void Reset()
+        {
+            _totalQueries = 0;
+            _totalErrors = 0;
+            _activeUsers = 0;
+            _totalConnections = 0;
+            _distinctUsers = 0;
+            ResetWindow();
+            while (_allResults.TryTake(out _)) { }
+        }
+
+        private void ResetWindow()
+        {
+            Interlocked.Exchange(ref _windowQueries, 0);
+            Interlocked.Exchange(ref _windowErrors, 0);
+            Interlocked.Exchange(ref _windowMinTicks, long.MaxValue);
+            Interlocked.Exchange(ref _windowMaxTicks, 0);
+            Interlocked.Exchange(ref _windowSumTicks, 0);
+            _windowActiveUsers.Clear();
+            _windowActiveQueries.Clear();
+        }
+
+        public void SetConnectionInfo(int totalConnections, int distinctUsers)
+        {
+            _totalConnections = totalConnections;
+            _distinctUsers = distinctUsers;
+        }
+
+        public void IncrementActiveUsers() => Interlocked.Increment(ref _activeUsers);
+
+        public int ActiveUsers => Volatile.Read(ref _activeUsers);
+
+        public void RecordQuery(QueryResult result)
+        {
+            _allResults.Add(result);
+            Interlocked.Increment(ref _totalQueries);
+
+            if (result.Error != null)
+            {
+                Interlocked.Increment(ref _windowErrors);
+                Interlocked.Increment(ref _totalErrors);
+            }
+            else
+            {
+                long ticks = (long)(result.DurationMs * TimeSpan.TicksPerMillisecond);
+                Interlocked.Increment(ref _windowQueries);
+                Interlocked.Add(ref _windowSumTicks, ticks);
+                _windowActiveUsers.TryAdd(result.UserIndex, 0);
+                _windowActiveQueries.TryAdd(result.QueryIndex, 0);
+
+                // Lock-free min
+                long curMin;
+                do { curMin = Volatile.Read(ref _windowMinTicks); }
+                while (ticks < curMin && Interlocked.CompareExchange(ref _windowMinTicks, ticks, curMin) != curMin);
+
+                // Lock-free max
+                long curMax;
+                do { curMax = Volatile.Read(ref _windowMaxTicks); }
+                while (ticks > curMax && Interlocked.CompareExchange(ref _windowMaxTicks, ticks, curMax) != curMax);
+            }
+        }
+
+        public List<QueryResult> AllResults => _allResults.ToList();
+        public long TotalQueries => Volatile.Read(ref _totalQueries);
+        public long TotalErrors => Volatile.Read(ref _totalErrors);
+
+        /// <summary>
+        /// Returns a snapshot of the current window stats and resets the window.
+        /// </summary>
+        public WindowSnapshot SnapshotAndReset()
+        {
+            long queries = Interlocked.Exchange(ref _windowQueries, 0);
+            long errors = Interlocked.Exchange(ref _windowErrors, 0);
+            long sumTicks = Interlocked.Exchange(ref _windowSumTicks, 0);
+            long minTicks = Interlocked.Exchange(ref _windowMinTicks, long.MaxValue);
+            long maxTicks = Interlocked.Exchange(ref _windowMaxTicks, 0);
+
+            var userCount = _windowActiveUsers.Count;
+            var queryCount = _windowActiveQueries.Count;
+            _windowActiveUsers.Clear();
+            _windowActiveQueries.Clear();
+
+            return new WindowSnapshot
+            {
+                Queries = queries,
+                Errors = errors,
+                ActiveUserCount = userCount,
+                ActiveQueryCount = queryCount,
+                MinMs = queries > 0 ? minTicks / (double)TimeSpan.TicksPerMillisecond : 0,
+                MaxMs = queries > 0 ? maxTicks / (double)TimeSpan.TicksPerMillisecond : 0,
+                AvgMs = queries > 0 ? sumTicks / (double)TimeSpan.TicksPerMillisecond / queries : 0,
+                TotalQueries = Volatile.Read(ref _totalQueries),
+                TotalErrors = Volatile.Read(ref _totalErrors),
+            };
+        }
+
+        public class WindowSnapshot
+        {
+            public long Queries { get; set; }
+            public long Errors { get; set; }
+            public int ActiveUserCount { get; set; }
+            public int ActiveQueryCount { get; set; }
+            public double MinMs { get; set; }
+            public double MaxMs { get; set; }
+            public double AvgMs { get; set; }
+            public long TotalQueries { get; set; }
+            public long TotalErrors { get; set; }
+        }
+    }
+
     public static class QueryRunner
     {
+        private static void Log(string message) =>
+            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss.fff}] {message}");
 
         public static string RunLoadTest(
             string[] queries, string xmlaEndpoint, string dataset, string token,
@@ -46,12 +188,14 @@ namespace Datagen
             string? logDirectory = null, int userRampTimeSec = 0,
             string? logFileName = null)
         {
-            var allResults = new ConcurrentBag<QueryResult>();
+            var status = QueryRunnerStatus.Instance;
+            status.Reset();
+
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
             var testStart = Stopwatch.StartNew();
             var testStartTime = DateTime.UtcNow;
 
-            Console.WriteLine($"[QueryRunner] Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query, ramp={userRampTimeSec}s");
+            Log($"Starting: {userEmails.Length} users, {queries.Length} queries, {durationSeconds}s, {queriesPerBatch} concurrent/user, pause={pauseBetweenIterationsMs}ms/iter, {pauseBetweenQueriesMs}ms/query, ramp={userRampTimeSec}s");
 
             // Set up telemetry log writer
             BlockingCollection<TelemetryRecord>? telemetryQueue = null;
@@ -65,7 +209,7 @@ namespace Datagen
                     ? logFileName
                     : $"LoadTest.{testStartTime:yyyyMMdd-HHmmss}.csv";
                 logFilePath = Path.Combine(logDirectory, fileName);
-                Console.WriteLine($"[QueryRunner] Logging to: {logFilePath}");
+                Log($"Logging to: {logFilePath}");
 
                 // Write CSV header
                 File.WriteAllText(logFilePath, "QueryNumber,UserEmail,Timestamp,StartTimeMs,DurationMs,Outcome,MessageText,ActiveUsers\n");
@@ -73,9 +217,6 @@ namespace Datagen
                 telemetryQueue = new BlockingCollection<TelemetryRecord>(boundedCapacity: 10000);
                 logWriterTask = Task.Run(() => LogWriterLoop(telemetryQueue, logFilePath, cts.Token));
             }
-
-            // Shared active user counter (array so it can be captured in lambdas)
-            var activeUsers = new int[] { 0 };
 
             // Calculate per-user start delays for ramp-up
             int nUsers = userEmails.Length;
@@ -115,7 +256,7 @@ namespace Datagen
                         }
                         sw.Stop();
                         Interlocked.Add(ref totalConnectTimeMs[0], (long)sw.Elapsed.TotalMilliseconds);
-                        Interlocked.Increment(ref activeUsers[0]);
+                        status.IncrementActiveUsers();
                         return conns;
                     });
                 }
@@ -130,15 +271,15 @@ namespace Datagen
                     userTasks[userIdx] = Task.Run(() =>
                         SimulateUserWithConnections(userIdx, queries, userEmails[userIdx],
                             queriesPerBatch, pauseBetweenIterationsMs, pauseBetweenQueriesMs,
-                            connections, connStrings[userIdx], allResults, testStart, telemetryQueue, activeUsers, cts.Token));
+                            connections, connStrings[userIdx], testStart, telemetryQueue, cts.Token));
                 }
 
                 // Progress every 10%
                 if (batchEnd % progressStep == 0 || batchEnd == nUsers)
                 {
-                    int active = Volatile.Read(ref activeUsers[0]);
+                    int active = status.ActiveUsers;
                     double avgMs = active > 0 ? Volatile.Read(ref totalConnectTimeMs[0]) / (double)active : 0;
-                    Console.WriteLine($"[QueryRunner] Ramp: {batchEnd}/{nUsers} connected, avg connect {avgMs:F0}ms, t={testStart.Elapsed.TotalSeconds:F0}s");
+                    Log($"Ramp: {batchEnd}/{nUsers} connected, avg connect {avgMs:F0}ms, t={testStart.Elapsed.TotalSeconds:F0}s");
                 }
 
                 // Stagger: wait before next batch
@@ -153,20 +294,58 @@ namespace Datagen
                 }
             }
 
+            // ── Connection summary after ramp-up ──
+            int totalConns = nUsers * queriesPerBatch;
+            var distinctEmails = userEmails.Distinct().Count();
+            var distinctRoles = userRoles.Distinct().Count();
+            status.SetConnectionInfo(totalConns, distinctEmails);
+            double avgConnMs = nUsers > 0 ? Volatile.Read(ref totalConnectTimeMs[0]) / (double)nUsers : 0;
+            Log("Ramp-up complete");
+            Console.WriteLine("┌──────────────────────────────────────────┐");
+            Console.WriteLine("│         Connection Summary               │");
+            Console.WriteLine("├──────────────────────────────────────────┤");
+            Console.WriteLine($"│  Users:             {nUsers,-20}│");
+            Console.WriteLine($"│  Distinct emails:   {distinctEmails,-20}│");
+            Console.WriteLine($"│  Distinct roles:    {distinctRoles,-20}│");
+            Console.WriteLine($"│  Connections/user:  {queriesPerBatch,-20}│");
+            Console.WriteLine($"│  Total connections: {totalConns,-20}│");
+            Console.WriteLine($"│  Avg connect time:  {avgConnMs:F0}ms{new string(' ', Math.Max(0, 17 - avgConnMs.ToString("F0").Length))}│");
+            Console.WriteLine($"│  Ramp-up time:      {testStart.Elapsed.TotalSeconds:F1}s{new string(' ', Math.Max(0, 17 - testStart.Elapsed.TotalSeconds.ToString("F1").Length))}│");
+            Console.WriteLine("└──────────────────────────────────────────┘");
+
+            // ── Periodic stats reporter (every 60s) ──
+            var periodicReporter = Task.Run(() =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    try { Task.Delay(60_000, cts.Token).Wait(cts.Token); }
+                    catch (OperationCanceledException) { break; }
+
+                    var snap = status.SnapshotAndReset();
+                    Log($"Progress: queries={snap.Queries} users={snap.ActiveUserCount} qIdx={snap.ActiveQueryCount} " +
+                        $"min={snap.MinMs:F0}ms avg={snap.AvgMs:F0}ms max={snap.MaxMs:F0}ms " +
+                        $"errors={snap.Errors} total={snap.TotalQueries} totalErr={snap.TotalErrors} " +
+                        $"t={testStart.Elapsed.TotalSeconds:F0}s");
+                }
+            });
+
             Task.WaitAll(userTasks);
             testStart.Stop();
+
+            // Shut down periodic reporter
+            try { periodicReporter.Wait(TimeSpan.FromSeconds(2)); } catch { }
 
             // Shut down log writer
             if (telemetryQueue != null)
             {
                 telemetryQueue.CompleteAdding();
                 logWriterTask?.Wait(TimeSpan.FromSeconds(10));
-                Console.WriteLine($"[QueryRunner] Log written: {logFilePath}");
+                Log($"Log written: {logFilePath}");
             }
 
-            Console.WriteLine($"[QueryRunner] Done: {allResults.Count} executions in {testStart.Elapsed.TotalSeconds:F1}s");
+            Log($"Done: {status.TotalQueries} executions in {testStart.Elapsed.TotalSeconds:F1}s");
 
-            return BuildStats(allResults.ToList(), testStart.Elapsed.TotalMilliseconds,
+            return BuildStats(status.AllResults, testStart.Elapsed.TotalMilliseconds,
                 userEmails.Length, queries.Length, logFilePath);
         }
 
@@ -210,7 +389,7 @@ namespace Datagen
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[LogWriter] Error writing: {ex.Message}");
+                    Log($"[LogWriter] Error writing: {ex.Message}");
                 }
             }
         }
@@ -234,9 +413,9 @@ namespace Datagen
             int userIndex, string[] queries, string email,
             int queriesPerBatch, int pauseMs, int pauseBetweenQueriesMs,
             AdomdConnection[] connections, string connStr,
-            ConcurrentBag<QueryResult> results, Stopwatch testStart,
+            Stopwatch testStart,
             BlockingCollection<TelemetryRecord>? telemetryQueue,
-            int[] activeUsers, CancellationToken ct)
+            CancellationToken ct)
         {
             try
             {
@@ -245,7 +424,7 @@ namespace Datagen
                 {
                     iteration++;
                     RunIteration(userIndex, email, iteration, queries, connections, connStr,
-                        pauseBetweenQueriesMs, results, testStart, telemetryQueue, activeUsers, ct);
+                        pauseBetweenQueriesMs, testStart, telemetryQueue, ct);
                     if (ct.IsCancellationRequested) break;
                     try { Task.Delay(pauseMs, ct).Wait(ct); }
                     catch (OperationCanceledException) { break; }
@@ -261,11 +440,11 @@ namespace Datagen
         private static void RunIteration(
             int userIndex, string email, int iteration, string[] queries,
             AdomdConnection[] connections, string connStr, int pauseBetweenQueriesMs,
-            ConcurrentBag<QueryResult> results, Stopwatch testStart,
+            Stopwatch testStart,
             BlockingCollection<TelemetryRecord>? telemetryQueue,
-            int[] activeUsers,
             CancellationToken ct)
         {
+            var status = QueryRunnerStatus.Instance;
             int max = connections.Length;
             using var sem = new SemaphoreSlim(max);
             var connSlots = new ConcurrentQueue<AdomdConnection>(connections);
@@ -291,10 +470,10 @@ namespace Datagen
                         // On connection error, log failure, reconnect, and retry once
                         if (r.Error != null && r.Error.Contains("timed out or was lost"))
                         {
-                            results.Add(r);
-                            SubmitTelemetry(telemetryQueue, qi, email, r, activeUsers);
+                            status.RecordQuery(r);
+                            SubmitTelemetry(telemetryQueue, qi, email, r);
 
-                            Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} connection lost, reconnecting...");
+                            Log($"[User {userIndex}] Q{qi} iter {iter} connection lost, reconnecting...");
                             try
                             {
                                 conn.Close();
@@ -304,7 +483,7 @@ namespace Datagen
                             }
                             catch (Exception reconEx)
                             {
-                                Console.WriteLine($"[User {userIndex}] Reconnect failed: {reconEx.Message}");
+                                Log($"[User {userIndex}] Reconnect failed: {reconEx.Message}");
                                 throw;
                             }
 
@@ -312,12 +491,12 @@ namespace Datagen
                             r = ExecuteQuery(userIndex, qi, iter, queries[qi], conn, testStart);
                         }
 
-                        results.Add(r);
-                        SubmitTelemetry(telemetryQueue, qi, email, r, activeUsers);
+                        status.RecordQuery(r);
+                        SubmitTelemetry(telemetryQueue, qi, email, r);
 
                         if (r.Error != null)
                         {
-                            Console.WriteLine($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
+                            Log($"[User {userIndex}] Q{qi} iter {iter} FAILED: {r.Error}");
                             throw new Exception(r.Error);
                         }
                         if (pauseBetweenQueriesMs > 0)
@@ -338,7 +517,7 @@ namespace Datagen
         }
 
         private static void SubmitTelemetry(BlockingCollection<TelemetryRecord>? telemetryQueue,
-            int qi, string email, QueryResult r, int[] activeUsers)
+            int qi, string email, QueryResult r)
         {
             if (telemetryQueue != null && !telemetryQueue.IsAddingCompleted)
             {
@@ -351,7 +530,7 @@ namespace Datagen
                     DurationMs = r.DurationMs,
                     Outcome = r.Error == null ? "Success" : "Error",
                     MessageText = r.Error ?? $"{r.RowCount} rows",
-                    ActiveUsers = Volatile.Read(ref activeUsers[0]),
+                    ActiveUsers = QueryRunnerStatus.Instance.ActiveUsers,
                 };
                 telemetryQueue.TryAdd(record);
             }
