@@ -46,7 +46,10 @@ namespace Datagen
             try
             {
                 if (!string.IsNullOrEmpty(_logFilePath))
-                    fileWriter = new StreamWriter(_logFilePath, append: false, Encoding.UTF8);
+                {
+                    var fs = new FileStream(_logFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    fileWriter = new StreamWriter(fs, Encoding.UTF8);
+                }
 
                 var batch = new List<string>();
                 while (!_queue.IsCompleted)
