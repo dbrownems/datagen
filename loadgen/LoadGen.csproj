@@ -4,6 +4,10 @@
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>LoadGen</AssemblyName>
     <Nullable>enable</Nullable>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\queryrunner\DatagenQueryRunner.csproj" />
