@@ -366,6 +366,7 @@ namespace Datagen
             try
             {
                 var cmd = new AdomdCommand(query, conn);
+                cmd.CommandTimeout = 0;
                 var sw = Stopwatch.StartNew();
                 using var reader = cmd.ExecuteReader();
                 int count = 0;
