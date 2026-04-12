@@ -12,15 +12,15 @@ class Program
 {
     static int Main(string[] args)
     {
-        var xmlaOption = new Option<string>("--xmla", () => "powerbi://api.powerbi.com/v1.0/myorg/dbrowne_sld", "XMLA endpoint");
-        var datasetOption = new Option<string>("--dataset", () => "Sales Leader Dataset", "Semantic model name");
+        var xmlaOption = new Option<string>("--xmla", "XMLA endpoint") { IsRequired = true };
+        var datasetOption = new Option<string>("--dataset", "Semantic model name") { IsRequired = true };
         var durationOption = new Option<int>("--duration", () => 60, "Test duration in seconds");
         var usersOption = new Option<int>("--users", () => 100, "Number of concurrent simulated users");
         var queriesPerBatchOption = new Option<int>("--queries-per-batch", () => 1, "Concurrent queries per user");
         var pauseIterOption = new Option<int>("--pause-iterations", () => 1000, "Pause between iterations (ms)");
         var pauseQueryOption = new Option<int>("--pause-queries", () => 0, "Pause between queries (ms)");
         var rampOption = new Option<int>("--ramp-time", () => 30, "User ramp-up time (seconds)");
-        var replicaOption = new Option<string>("--replica", () => "readonly", "Target replica ('readonly' or '')");
+        var replicaOption = new Option<string>("--replica", () => "", "Target replica ('readonly' or '')");
         var queriesFileOption = new Option<FileInfo>("--queries-file", "Path to queries.json") { IsRequired = true };
         var usersFileOption = new Option<FileInfo>("--users-file", "Path to users.json") { IsRequired = true };
         var logDirOption = new Option<string>("--log-dir", () => "./logs", "Directory for telemetry CSV logs");
