@@ -9,6 +9,8 @@ build/
 # .NET
 queryrunner/bin/
 queryrunner/obj/
+loadgen/bin/
+loadgen/obj/
 
 # IDE
 .vscode/
