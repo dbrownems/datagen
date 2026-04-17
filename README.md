@@ -4,21 +4,32 @@ Generate realistic test data and semantic models from Power BI `.vpax` files in 
 
 Datagen reads a `.vpax` export (from [DAX Studio](https://daxstudio.org/) or [VertiPaq Analyzer](https://www.sqlbi.com/tools/vertipaq-analyzer/)), generates Delta tables in a Fabric Lakehouse that match the original model's table sizes, column cardinality, and data distributions, then deploys a semantic model (Direct Lake or Import) with all the measures, relationships, format strings, and display folders from the original model.
 
+## Requirements
+
+- A Microsoft Fabric workspace on a capacity that supports Spark notebooks (F2+ or trial).
+- A Lakehouse attached to the notebook for table output.
+- A `.vpax` file describing the source model (see step 4 below).
+
 ## Quick Start
 
-### 1. Download the notebook
+### 1. Get the notebook
 
-Download `Datagen Main.Notebook` from the [latest release](https://github.com/dbrownems/datagen/releases/latest).
+Either:
+
+- **Clone this repo** — the notebook lives at [`notebook/Datagen Main.Notebook/`](notebook/Datagen%20Main.Notebook/), or
+- **Download** `Datagen Main.Notebook` from the [latest release](https://github.com/dbrownems/datagen/releases/latest).
+
+Cell 1 of the notebook auto-downloads the latest `datagen` wheel from GitHub, so no Python packaging is required.
 
 ### 2. Deploy the notebook to Fabric
 
 Using the [Fabric CLI](https://learn.microsoft.com/fabric/cicd/fabric-cli/fabric-cli-overview):
 
 ```bash
-fab import "YourWorkspace.Workspace/Datagen Main.Notebook" -i "Datagen Main.Notebook" -f
+fab import "YourWorkspace.Workspace/Datagen Main.Notebook" -i "notebook/Datagen Main.Notebook" -f
 ```
 
-Or import manually: in your Fabric workspace, click **New → Import notebook** and select the `notebook-content.ipynb` file from inside the downloaded folder.
+Or import manually: in your Fabric workspace, click **New → Import notebook** and select `notebook/Datagen Main.Notebook/notebook-content.ipynb`.
 
 ### 3. Attach a Lakehouse
 
@@ -172,13 +183,14 @@ python -m build --wheel
 # Output: dist/datagen_fabric-*.whl
 ```
 
-Deploy to Fabric:
+Deploy the wheel and notebook to Fabric:
 
 ```bash
-python scripts/build_notebook.py
 fab copy dist/datagen_fabric-*.whl "MyWorkspace.Workspace/MyLakehouse.Lakehouse/Files/datagen/" -f
-fab import "MyWorkspace.Workspace/Datagen Main.Notebook" -i "dist/Datagen Main.Notebook" -f
+fab import "MyWorkspace.Workspace/Datagen Main.Notebook" -i "notebook/Datagen Main.Notebook" -f
 ```
+
+> **Releases** include the wheel and `Datagen Main.Notebook.zip`. Cell 1 of the notebook downloads the latest wheel automatically, so end users don't normally need to build from source.
 
 ## API Reference
 
@@ -204,3 +216,11 @@ python -m datagen generate config.yaml [-o Tables/]
 # Generate a TMDL semantic model definition
 python -m datagen model model.vpax [--mode direct_lake|import] [--lakehouse MyLakehouse] [--endpoint <sql-endpoint>] [--model-name MyModel] [-o MyModel.SemanticModel] [--include-hidden] [--include-calculated]
 ```
+
+## Companion: Load Testing
+
+For DAX load testing against the generated semantic models, see the separate [DaxLoadGen](https://github.com/dbrownems/DaxLoadGen) repo (.NET tool that drives concurrent XMLA queries with optional RLS user impersonation and read-only replica routing).
+
+## License
+
+[MIT](LICENSE)
