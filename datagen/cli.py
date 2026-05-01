@@ -31,9 +31,36 @@ def cmd_parse(args):
         include_calculated=args.include_calculated,
     )
 
+    if args.dax_trace:
+        from .dax_literal_extractor import seed_config_from_trace
+        n = seed_config_from_trace(
+            config, args.dax_trace, vpax_model=model,
+            top_n=args.top_n, observed_share=args.observed_share,
+            verbose=args.verbose,
+        )
+        print(f"\nSeeded {n} columns from DAX trace: {args.dax_trace}")
+
     out_file = args.output or args.vpax_file.rsplit(".", 1)[0] + "_config.yaml"
     save_config(config, out_file)
     print(f"\nConfig written to: {out_file}")
+
+
+def cmd_seed_literals(args):
+    """Re-apply DAX-literal seeding to an existing YAML config."""
+    from .config import load_config, save_config
+    from .vpax_parser import parse_vpax
+    from .dax_literal_extractor import seed_config_from_trace
+
+    config = load_config(args.config_file)
+    model = parse_vpax(args.vpax_file) if args.vpax_file else None
+    n = seed_config_from_trace(
+        config, args.jsonl_file, vpax_model=model,
+        top_n=args.top_n, observed_share=args.observed_share,
+        verbose=args.verbose,
+    )
+    out_file = args.output or args.config_file
+    save_config(config, out_file)
+    print(f"Seeded {n} columns; config written to: {out_file}")
 
 
 def cmd_generate(args):
@@ -93,7 +120,27 @@ def main():
     p_parse.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     p_parse.add_argument("--include-hidden", action="store_true", help="Include hidden columns")
     p_parse.add_argument("--include-calculated", action="store_true", help="Include calculated columns")
+    p_parse.add_argument("--dax-trace", help="Optional XEvents JSONL trace; literal column "
+                         "values from QueryEnd events seed the config.")
+    p_parse.add_argument("--top-n", type=int, default=200,
+                         help="Cap on observed values per column (default: 200)")
+    p_parse.add_argument("--observed-share", type=float, default=0.7,
+                         help="Frequency budget share (0-1) for observed values (default: 0.7)")
+    p_parse.add_argument("--verbose", action="store_true", help="Verbose seeding output")
     p_parse.set_defaults(func=cmd_parse)
+
+    # -- seed-literals --
+    p_seed = subparsers.add_parser(
+        "seed-literals",
+        help="Re-apply DAX literal seeding to an existing YAML config")
+    p_seed.add_argument("config_file", help="Existing YAML config to update")
+    p_seed.add_argument("jsonl_file", help="DAX trace JSONL file")
+    p_seed.add_argument("--vpax-file", help="Optional VPAX for name normalisation")
+    p_seed.add_argument("-o", "--output", help="Output path (default: overwrite input)")
+    p_seed.add_argument("--top-n", type=int, default=200)
+    p_seed.add_argument("--observed-share", type=float, default=0.7)
+    p_seed.add_argument("--verbose", action="store_true")
+    p_seed.set_defaults(func=cmd_seed_literals)
 
     # -- generate --
     p_gen = subparsers.add_parser("generate", help="Generate Delta tables from YAML config")
