@@ -578,6 +578,69 @@ def _strip_unknown_bim_properties(bim, table_filter=None, convert_calc=True):
     return bim
 
 
+def _align_relationship_types_in_bim(bim, log=print):
+    """Directly enforce PK-wins type alignment on every BIM relationship.
+
+    For each relationship the FK side (``fromColumn``) is updated to match
+    the PK side (``toColumn``)'s ``dataType`` if they differ. Operates on
+    the raw BIM JSON so it works regardless of:
+
+      * whether the GenerationConfig contained both columns
+      * whether ``_apply_config_column_types_to_bim`` flowed the change
+      * whether either side is a calculated column (their dataType is now
+        authoritative because Direct Lake will materialise them)
+
+    Returns a list of ``(table, column, old, new)`` changes for logging.
+
+    This is the single source of truth for relationship type alignment in
+    the Direct Lake path. The downstream TOM check should never need to
+    drop a relationship after this runs.
+    """
+    model = bim.get("model", bim)
+    cols_by_table = {}
+    for t in model.get("tables", []):
+        tname = t.get("name")
+        if not tname:
+            continue
+        cols_by_table[tname] = {
+            c.get("name"): c for c in t.get("columns", []) if c.get("name")
+        }
+
+    _SKIP_TYPES = {"rowNumber"}
+    changes = []
+    for rel in model.get("relationships", []):
+        if not rel.get("isActive", True):
+            continue
+        ft, fc = rel.get("fromTable"), rel.get("fromColumn")
+        tt, tc = rel.get("toTable"), rel.get("toColumn")
+        if not (ft and fc and tt and tc):
+            continue
+        from_col = cols_by_table.get(ft, {}).get(fc)
+        to_col = cols_by_table.get(tt, {}).get(tc)
+        if from_col is None or to_col is None:
+            continue
+        if from_col.get("type") in _SKIP_TYPES or to_col.get("type") in _SKIP_TYPES:
+            continue
+        from_dt = from_col.get("dataType")
+        to_dt = to_col.get("dataType")
+        if not from_dt or not to_dt or from_dt == to_dt:
+            continue
+
+        # PK-wins: change FK (from) to match PK (to)
+        old = from_dt
+        from_col["dataType"] = to_dt
+        # Stale provider type would be re-checked against the new dataType
+        from_col.pop("sourceProviderType", None)
+        changes.append((ft, fc, old, to_dt))
+
+    if changes:
+        log(f"  Aligned {len(changes)} relationship FK column dataType(s) "
+            f"in BIM (PK-wins; required by Direct Lake):")
+        for ft, fc, old, new in changes:
+            log(f"      {ft}[{fc}]: {old}  →  {new}")
+    return changes
+
+
 def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     """Modify model.bim using .NET TOM (Tabular Object Model).
 
@@ -600,6 +663,10 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     )
 
     _strip_unknown_bim_properties(bim)
+    # Align relationship endpoint dataTypes BEFORE TOM reads the BIM.
+    # This guarantees the engine's strict FromColumn/ToColumn type check
+    # passes — no relationships should ever need to be dropped downstream.
+    _align_relationship_types_in_bim(bim)
     bim_json = json.dumps(bim, indent=2)
     db = JsonSerializer.DeserializeDatabase(bim_json)
     model = db.Model
@@ -674,29 +741,31 @@ def _modify_bim_via_tom(bim, lh_info, table_filter=None):
     # Set Direct Lake compatible options
     model.DefaultPowerBIDataSourceVersion = PowerBIDataSourceVersion.PowerBI_V3
 
-    # Remove relationships with incompatible data types (Direct Lake is strict)
+    # Sanity check: alignment in _align_relationship_types_in_bim should have
+    # eliminated every type mismatch before TOM read. If TOM still sees one,
+    # it's a bug in alignment (e.g. column referenced by relationship is
+    # missing from the BIM). Fail loudly rather than silently dropping —
+    # silent drops produced the "missing relationship" bug farm we just fixed.
     incompatible_rels = []
     for rel in model.Relationships:
         try:
             from_dt = rel.FromColumn.DataType
             to_dt = rel.ToColumn.DataType
             if from_dt != to_dt:
-                incompatible_rels.append((
-                    rel.Name,
-                    rel.FromTable.Name, rel.FromColumn.Name, str(from_dt),
-                    rel.ToTable.Name, rel.ToColumn.Name, str(to_dt),
-                ))
+                incompatible_rels.append(
+                    f"{rel.FromTable.Name}[{rel.FromColumn.Name}] ({from_dt})"
+                    f"  →  {rel.ToTable.Name}[{rel.ToColumn.Name}] ({to_dt})"
+                )
         except Exception:
             pass
     if incompatible_rels:
-        print(f"    ⚠ Dropping {len(incompatible_rels)} relationship(s) with mismatched data types "
-              f"(Direct Lake requires identical FromColumn/ToColumn types):", flush=True)
-        for rname, ft, fc, fdt, tt, tc, tdt in incompatible_rels:
-            print(f"        {ft}[{fc}] ({fdt})  →  {tt}[{tc}] ({tdt})", flush=True)
-        print(f"      Fix: align the `data_type` of these columns in the YAML config "
-              f"(both sides of each relationship must match), then re-run.", flush=True)
-        for rname, *_ in incompatible_rels:
-            model.Relationships.Remove(rname)
+        msg = (
+            f"Direct Lake type alignment failed: {len(incompatible_rels)} "
+            f"relationship(s) still mismatched after _align_relationship_types_in_bim. "
+            f"This is a bug. Mismatches:\n"
+            + "\n".join(f"  {m}" for m in incompatible_rels)
+        )
+        raise RuntimeError(msg)
 
     n_tables = model.Tables.Count
     n_rels = model.Relationships.Count
@@ -893,10 +962,12 @@ def deploy_semantic_model(
 
     # Modify the BIM based on mode
     if mode == "import":
+        mode_label = "Import"
         print("  Converting model to Import from OneLake ...", flush=True)
         _strip_unknown_bim_properties(bim, table_filter=table_filter, convert_calc=False)
         bim = _modify_bim_for_import(bim, lh_info, table_filter)
-    else:
+    elif mode == "direct_lake":
+        mode_label = "Direct Lake"
         print("  Converting model to Direct Lake on OneLake ...", flush=True)
         # Patch BIM column dataTypes from the (possibly auto-aligned) config
         # BEFORE the conversion, so the relationship type check inside
@@ -907,6 +978,11 @@ def deploy_semantic_model(
         if config is not None:
             _apply_config_column_types_to_bim(bim, config, include_calculated=True)
         bim, expr_name = _modify_bim_for_direct_lake(bim, lh_info, table_filter)
+    else:
+        raise ValueError(
+            f"deploy_semantic_model: unknown mode={mode!r}. "
+            f"Expected 'import' or 'direct_lake'."
+        )
 
     # Update model name
     bim["name"] = name
@@ -968,7 +1044,6 @@ def deploy_semantic_model(
         except Exception as re:
             print(f"    ⚠ Could not fetch refresh details: {re}", flush=True)
 
-    mode_label = "Direct Lake" if mode == "direct_lake" else "Import"
     print(flush=True)
     if refresh_ok:
         print(f"✓ Semantic model '{actual_name}' deployed ({mode_label} on OneLake)")

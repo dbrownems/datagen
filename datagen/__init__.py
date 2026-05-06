@@ -63,6 +63,66 @@ def generate(
         # Import mode:
         report = generate(spark, "model.vpax", mode="import")
     """
+    # --- Strict argument validation ---
+    # Catches typos like mode="direclake" that would otherwise silently
+    # take a wrong code path (the old code's mode == "direct_lake" guards
+    # would all evaluate False, skipping the relationship type fixer and
+    # producing a broken model labeled with the wrong mode).
+    _MODE_ALIASES = {
+        "import": "import",
+        "directlake": "direct_lake",
+        "direct_lake": "direct_lake",
+        "direct-lake": "direct_lake",
+        "direct lake": "direct_lake",
+        "directlakeononelake": "direct_lake",
+        "dl": "direct_lake",
+    }
+
+    def _require_type(name, value, types, allow_none=False):
+        if value is None and allow_none:
+            return
+        if not isinstance(value, types):
+            type_names = ", ".join(t.__name__ for t in (
+                types if isinstance(types, tuple) else (types,)))
+            raise TypeError(
+                f"generate(): argument {name!r} must be {type_names}, "
+                f"got {type(value).__name__}={value!r}"
+            )
+
+    _require_type("vpax_path", vpax_path, str)
+    _require_type("output_path", output_path, str, allow_none=True)
+    _require_type("seed", seed, int, allow_none=True)
+    _require_type("deploy_model", deploy_model, bool)
+    _require_type("compare", compare, bool)
+    _require_type("dataset", dataset, str, allow_none=True)
+    _require_type("workspace", workspace, str, allow_none=True)
+    _require_type("lakehouse", lakehouse, str, allow_none=True)
+    _require_type("overwrite_tables", overwrite_tables, bool)
+    _require_type("overwrite_model", overwrite_model, bool)
+    _require_type("mode", mode, str)
+    _require_type("queries_path", queries_path, str, allow_none=True)
+    _require_type("skew_recent", skew_recent, bool)
+    _require_type("replace_username_with_customdata",
+                  replace_username_with_customdata, bool)
+    _require_type("auto_fix_relationship_types",
+                  auto_fix_relationship_types, bool)
+
+    mode_key = mode.strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+    # Re-derive a canonical form for the alias lookup, accepting common variants.
+    canonical_mode = None
+    for alias, target in _MODE_ALIASES.items():
+        if alias.replace("_", "").replace("-", "").replace(" ", "") == mode_key:
+            canonical_mode = target
+            break
+    if canonical_mode is None:
+        valid = sorted({"import", "direct_lake"})
+        raise ValueError(
+            f"generate(): mode={mode!r} is not recognised. "
+            f"Valid values: {valid} (case-insensitive; "
+            f"'directlake', 'direct-lake', 'direct lake' also accepted)."
+        )
+    mode = canonical_mode
+
     from .vpax_parser import parse_vpax
     from .config_generator import generate_config
     from .config import save_config, load_config
