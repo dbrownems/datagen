@@ -100,27 +100,16 @@ def _record_literals(body: str, table: str, column: str, sink) -> None:
         sink[(table, column)][v] += 1
 
 
-def extract_literals(jsonl_path, vpax_model=None, *, max_events=None):
-    """Stream a DAX trace JSONL and return literal observations per column.
+def iter_dax_texts_from_jsonl(path):
+    """Yield DAX query text from each ``QueryEnd`` event in a JSONL trace.
 
-    Args:
-        jsonl_path: Path to an XEvents-style JSONL trace.
-        vpax_model: Optional parsed VPAX (from ``vpax_parser.parse_vpax``).
-            When provided, observed (table, column) names are mapped back
-            to canonical VPAX names; observations with no VPAX match are
-            dropped.
-        max_events: Optional cap on the number of events parsed (useful
-            for tests / sampling).
-
-    Returns:
-        Dict ``{(table, column): Counter[value]}``.  Values are stored as
-        their original string form (numbers are kept as strings so the
-        merge step can decide based on column data type).
+    The trace is an XEvents-style capture where each line is a JSON object
+    with at least ``eventClass == "QueryEnd"`` and ``cols.TextData`` set
+    to the DAX query text. Other fields are ignored. Lines that don't
+    match (wrong eventClass, missing TextData, malformed JSON) are
+    silently skipped.
     """
-    raw: dict = defaultdict(Counter)
-    n = 0
-    path = Path(jsonl_path)
-    with path.open("r", encoding="utf-8") as fh:
+    with Path(path).open("r", encoding="utf-8") as fh:
         for line in fh:
             try:
                 event = json.loads(line)
@@ -129,21 +118,46 @@ def extract_literals(jsonl_path, vpax_model=None, *, max_events=None):
             if event.get("eventClass") != "QueryEnd":
                 continue
             text = (event.get("cols") or {}).get("TextData") or ""
-            if not text:
-                continue
-            n += 1
+            if text:
+                yield text
 
-            for m in _P_IN.finditer(text):
-                _record_literals(m.group(3), m.group(1), m.group(2), raw)
-            for m in _P_TREATAS.finditer(text):
-                _record_literals(m.group(1), m.group(2), m.group(3), raw)
-            for m in _P_EQ_STR.finditer(text):
-                raw[(m.group(1), m.group(2))][m.group(3)] += 1
-            for m in _P_EQ_NUM.finditer(text):
-                raw[(m.group(1), m.group(2))][m.group(3)] += 1
 
-            if max_events and n >= max_events:
-                break
+def _record_text_literals(text, raw):
+    for m in _P_IN.finditer(text):
+        _record_literals(m.group(3), m.group(1), m.group(2), raw)
+    for m in _P_TREATAS.finditer(text):
+        _record_literals(m.group(1), m.group(2), m.group(3), raw)
+    for m in _P_EQ_STR.finditer(text):
+        raw[(m.group(1), m.group(2))][m.group(3)] += 1
+    for m in _P_EQ_NUM.finditer(text):
+        raw[(m.group(1), m.group(2))][m.group(3)] += 1
+
+
+def extract_literals(dax_texts, vpax_model=None, *, max_events=None):
+    """Return literal observations per column from an iterable of DAX queries.
+
+    Args:
+        dax_texts: Iterable of DAX query strings. Use
+            :func:`iter_dax_texts_from_jsonl` to convert a JSONL trace
+            into such an iterable.
+        vpax_model: Optional parsed VPAX (from ``vpax_parser.parse_vpax``).
+            When provided, observed (table, column) names are mapped back
+            to canonical VPAX names; observations with no VPAX match are
+            dropped.
+        max_events: Optional cap on the number of DAX queries parsed.
+
+    Returns:
+        Dict ``{(table, column): Counter[value]}``.
+    """
+    raw: dict = defaultdict(Counter)
+    n = 0
+    for text in dax_texts:
+        if not text:
+            continue
+        n += 1
+        _record_text_literals(text, raw)
+        if max_events and n >= max_events:
+            break
 
     if not vpax_model:
         return dict(raw)
@@ -386,10 +400,10 @@ def merge_literals_into_config(config, literals, *, top_n=200,
 # Convenience
 # ---------------------------------------------------------------------------
 
-def seed_config_from_trace(config, jsonl_path, vpax_model=None, **kwargs):
-    """Extract literals from a trace and merge them into ``config``.
+def seed_config_from_trace(config, dax_texts, vpax_model=None, **kwargs):
+    """Extract literals from an iterable of DAX queries and merge into ``config``.
 
     Returns the number of columns updated.
     """
-    literals = extract_literals(jsonl_path, vpax_model=vpax_model)
+    literals = extract_literals(dax_texts, vpax_model=vpax_model)
     return merge_literals_into_config(config, literals, **kwargs)

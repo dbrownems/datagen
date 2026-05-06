@@ -30,9 +30,11 @@ def cmd_parse(args):
     )
 
     if args.dax_trace:
-        from .dax_literal_extractor import seed_config_from_trace
+        from .dax_literal_extractor import (
+            iter_dax_texts_from_jsonl, seed_config_from_trace,
+        )
         n = seed_config_from_trace(
-            config, args.dax_trace, vpax_model=model,
+            config, iter_dax_texts_from_jsonl(args.dax_trace), vpax_model=model,
             top_n=args.top_n, observed_share=args.observed_share,
             verbose=args.verbose,
         )
@@ -47,12 +49,14 @@ def cmd_seed_literals(args):
     """Re-apply DAX-literal seeding to an existing YAML config."""
     from .config import load_config, save_config
     from .vpax_parser import parse_vpax
-    from .dax_literal_extractor import seed_config_from_trace
+    from .dax_literal_extractor import (
+        iter_dax_texts_from_jsonl, seed_config_from_trace,
+    )
 
     config = load_config(args.config_file)
     model = parse_vpax(args.vpax_file) if args.vpax_file else None
     n = seed_config_from_trace(
-        config, args.jsonl_file, vpax_model=model,
+        config, iter_dax_texts_from_jsonl(args.jsonl_file), vpax_model=model,
         top_n=args.top_n, observed_share=args.observed_share,
         verbose=args.verbose,
     )

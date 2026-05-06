@@ -100,7 +100,14 @@ def generate(
     _require_type("overwrite_tables", overwrite_tables, bool)
     _require_type("overwrite_model", overwrite_model, bool)
     _require_type("mode", mode, str)
-    _require_type("queries_path", queries_path, str, allow_none=True)
+    _require_type("queries_path", queries_path, (str, list, tuple), allow_none=True)
+    if isinstance(queries_path, (list, tuple)):
+        bad = [i for i, q in enumerate(queries_path) if not isinstance(q, str)]
+        if bad:
+            raise TypeError(
+                f"generate(): when 'queries_path' is a list/tuple, every item "
+                f"must be a DAX query string. Non-string items at indices: {bad}"
+            )
     _require_type("skew_recent", skew_recent, bool)
     _require_type("replace_username_with_customdata",
                   replace_username_with_customdata, bool)
@@ -163,11 +170,19 @@ def generate(
     # Query seeding and BIM cross-ref only apply when freshly generating;
     # loaded YAML is treated as the source of truth.
     if not loaded_from_yaml and queries_path:
-        # Detect format: .jsonl (DAX trace) → use new literal extractor;
-        # .json (legacy structured queries) → use old extract_query_values.
-        if str(queries_path).lower().endswith(".jsonl"):
+        # Normalise queries_path → iterable of DAX query strings, then
+        # everything downstream just consumes that iterable.
+        if isinstance(queries_path, (list, tuple)):
             from .dax_literal_extractor import seed_config_from_trace
             n_fixed = seed_config_from_trace(config, queries_path, vpax_model=vpax_model)
+        elif str(queries_path).lower().endswith(".jsonl"):
+            from .dax_literal_extractor import (
+                iter_dax_texts_from_jsonl, seed_config_from_trace,
+            )
+            n_fixed = seed_config_from_trace(
+                config, iter_dax_texts_from_jsonl(queries_path),
+                vpax_model=vpax_model,
+            )
         else:
             from .dax_rewriter import extract_query_values
             n_fixed = extract_query_values(config, queries_path)

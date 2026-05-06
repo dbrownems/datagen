@@ -69,8 +69,38 @@ generate(spark, f"{DATAGEN_DIR}/model.vpax",
     workspace=None,                      # target Fabric workspace (default: current)
     lakehouse=None,                      # lakehouse name (default: attached)
     auto_fix_relationship_types=True,    # PK-wins: align FK column type to PK (DL only)
+    queries_path=None,                   # seed column values from real DAX queries — see below
 )
 ```
+
+### Seeding column values from real DAX queries
+
+Pass `queries_path` to make the generator pin the literal values it sees in actual DAX queries (e.g. `'Region'[Country] = "France"` → "France" gets pinned into the `Country` column's value pool). Useful when you want generated tables to return non-empty results for a captured workload.
+
+Two input formats:
+
+1. **List/tuple of DAX query strings** — convenient for a small set of queries from code:
+
+   ```python
+   generate(spark, "model.vpax", queries_path=[
+       "EVALUATE FILTER('Sales', 'Region'[Country] = \"France\")",
+       "EVALUATE CALCULATETABLE('Customer', 'Customer'[Segment] IN {\"SMB\", \"Enterprise\"})",
+   ])
+   ```
+
+2. **Path to an XEvents JSONL trace** (e.g. captured from DAX Studio's All Queries tracer or Profiler) — one JSON object per line. Only the DAX query text is read; everything else is ignored. Lines must look like:
+
+   ```jsonc
+   {"eventClass": "QueryEnd", "cols": {"TextData": "EVALUATE ..."}}
+   ```
+
+   Other fields (timestamps, durations, user names, etc.) may be present but are not used. Lines whose `eventClass` is not `"QueryEnd"`, or whose `cols.TextData` is missing/empty, are skipped silently.
+
+   ```python
+   generate(spark, "model.vpax", queries_path="/lakehouse/default/Files/datagen/trace.jsonl")
+   ```
+
+Seeding is only applied on a fresh run (no sibling YAML present) — once the YAML exists it's the source of truth and `queries_path` is ignored.
 
 ## Tweaking the Generated Data
 
