@@ -2,59 +2,35 @@
 
 Generate realistic test data and semantic models from Power BI `.vpax` files in Microsoft Fabric.
 
-Datagen reads a `.vpax` export (from [DAX Studio](https://daxstudio.org/) or [VertiPaq Analyzer](https://www.sqlbi.com/tools/vertipaq-analyzer/)), generates Delta tables in a Fabric Lakehouse that match the original model's table sizes, column cardinality, and data distributions, then deploys a semantic model (Direct Lake or Import) with all the measures, relationships, format strings, and display folders from the original model.
+Datagen reads a `.vpax` export (from [DAX Studio](https://daxstudio.org/) or [VertiPaq Analyzer](https://www.sqlbi.com/tools/vertipaq-analyzer/)), generates Delta tables in a Fabric Lakehouse that match the original model's table sizes, column cardinality, and data distributions, then deploys a semantic model (Direct Lake on OneLake or Import) with all the measures, relationships, format strings, and display folders from the original model.
 
 ## Requirements
 
 - A Microsoft Fabric workspace on a capacity that supports Spark notebooks (F2+ or trial).
 - A Lakehouse attached to the notebook for table output.
-- A `.vpax` file describing the source model (see step 4 below).
+- A `.vpax` file describing the source model.
 
 ## Quick Start
 
-### 1. Get the notebook
+1. **Get the notebook** — clone this repo (`notebook/Datagen Main.Notebook/`) or download `Datagen Main.Notebook.zip` from the [latest release](https://github.com/dbrownems/datagen/releases/latest). The first cell auto-downloads the latest `datagen` wheel from GitHub, so no Python packaging is required.
 
-Either:
+2. **Deploy the notebook to Fabric** — using the [Fabric CLI](https://learn.microsoft.com/fabric/cicd/fabric-cli/fabric-cli-overview):
 
-- **Clone this repo** — the notebook lives at [`notebook/Datagen Main.Notebook/`](notebook/Datagen%20Main.Notebook/), or
-- **Download** `Datagen Main.Notebook` from the [latest release](https://github.com/dbrownems/datagen/releases/latest).
+   ```bash
+   fab import "YourWorkspace.Workspace/Datagen Main.Notebook" -i "notebook/Datagen Main.Notebook" -f
+   ```
 
-The first code cell auto-downloads the latest `datagen` wheel from GitHub, so no Python packaging is required.
+   Or import manually: **New → Import notebook** → select `notebook-content.ipynb`.
 
-### 2. Deploy the notebook to Fabric
+3. **Attach a Lakehouse** in Fabric (left sidebar).
 
-Using the [Fabric CLI](https://learn.microsoft.com/fabric/cicd/fabric-cli/fabric-cli-overview):
+4. **Upload your `.vpax`** to `Files/datagen/` in the attached Lakehouse.
 
-```bash
-fab import "YourWorkspace.Workspace/Datagen Main.Notebook" -i "notebook/Datagen Main.Notebook" -f
-```
+   > **How to get a `.vpax`:** in [DAX Studio](https://daxstudio.org/), connect to your model, then **Advanced → Export Metrics**.
 
-Or import manually: in your Fabric workspace, click **New → Import notebook** and select `notebook/Datagen Main.Notebook/notebook-content.ipynb`.
+5. **Run the notebook.** It installs `datagen`, parses the `.vpax`, generates tables, deploys the semantic model, and prints a comparison report.
 
-### 3. Attach a Lakehouse
-
-Open the notebook in Fabric. In the left sidebar, click the Lakehouse icon and attach (or create) a Lakehouse.
-
-### 4. Upload your `.vpax` file
-
-Upload your `.vpax` file to `Files/datagen/` in the attached Lakehouse.
-
-> **How to get a `.vpax` file:** Open [DAX Studio](https://daxstudio.org/), connect to your model, then go to **Advanced → Export Metrics**.
-
-### 5. Run the notebook
-
-The notebook walks through:
-
-1. Install `datagen` (auto-downloads the latest release wheel)
-2. Parse the `.vpax` and write a companion YAML config beside it
-3. Generate Delta tables matching the original sizes and cardinality
-4. Deploy a semantic model with all measures and relationships
-5. Print a comparison report showing accuracy
-
-The first run produces `<your-model>.yaml` next to the `.vpax`. Edit
-that file to tweak distributions, then re-run — the YAML is reused as
-the source of truth on subsequent runs. Delete the YAML to start over
-from the `.vpax`.
+The first run produces `<your-model>.yaml` next to the `.vpax`. Edit that file to tweak distributions, then re-run — the YAML is reused as the source of truth on subsequent runs. Delete it to start over from the `.vpax`.
 
 ## Semantic Model Modes
 
@@ -66,25 +42,17 @@ Tables use Power Query (M) expressions to read from the Lakehouse SQL endpoint. 
 generate(spark, f"{DATAGEN_DIR}/model.vpax")               # mode="import"
 ```
 
-### Direct Lake
+### Direct Lake on OneLake
 
-Tables reference Delta files directly — no data import. Queries read from OneLake at query time.
+Tables reference Delta files in OneLake directly — no data import, no SQL endpoint. Queries read from OneLake at query time.
 
 ```python
 generate(spark, f"{DATAGEN_DIR}/model.vpax", mode="direct_lake")
 ```
 
-> Direct Lake refuses any relationship whose two columns have different
-> data types. Datagen auto-aligns these by **PK-wins** — the FK side
-> (the "many" column) is converted to match the PK side (the "one"
-> column) — and logs a warning with the exact YAML override applied,
-> plus the alternative "FK wins" override you can paste if you want
-> the opposite conversion. PK-wins minimises cascading changes since
-> a single PK is usually referenced by many FKs. The same `data_type`
-> values are used to build the Spark schema, so the generated Delta
-> tables match what the BIM expects at deploy time. Pass
-> `auto_fix_relationship_types=False` to disable and just log
-> mismatches.
+> Direct Lake refuses any relationship whose two columns have different data types. Datagen aligns these directly in the BIM using **PK-wins** (the FK column's data type is changed to match the PK), so all original relationships survive deployment. Pass `auto_fix_relationship_types=False` to disable.
+
+`mode` is validated strictly. Common aliases (`"directlake"`, `"direct-lake"`, `"dl"`) are accepted; anything else raises `ValueError` immediately so typos surface at the top of the run.
 
 ## Options
 
@@ -104,161 +72,66 @@ generate(spark, f"{DATAGEN_DIR}/model.vpax",
 )
 ```
 
-## Advanced Workflows
+## Tweaking the Generated Data
 
-### Tweak distributions before generating
+`generate()` always parses the `.vpax` (it's the source of measures, relationships, and BIM metadata for the semantic model), then looks for a sibling `<vpax-name>.yaml`:
 
-`generate()` always parses the `.vpax` (it's the source of measures,
-relationships, and BIM metadata for the semantic model), then looks
-for a sibling `<vpax-name>.yaml` in the same folder:
+- **No sibling YAML** → infer the config from the `.vpax` and write it.
+- **Sibling YAML present** → load it as the source of truth. Inferred values, query-seeding, and BIM cross-referencing are skipped so your edits aren't clobbered.
 
-- **No sibling YAML** → infer the config from the `.vpax` column
-  statistics, save it as `<vpax-name>.yaml`, and use it.
-- **Sibling YAML present** → load it as the source of truth for table
-  sizes, cardinality, distributions, fixed values, and histograms.
-  Inferred values, query-seeding, and BIM cross-referencing are
-  **skipped** so your edits aren't clobbered.
+Workflow: drop the `.vpax`, run, edit the `.yaml`, re-run. Delete the YAML to start over.
 
-The natural workflow:
+See [`datagen.example.yaml`](datagen.example.yaml) for a fully commented sample.
 
-1. Drop a `.vpax` into `Files/datagen/` and run the notebook —
-   datagen writes `<your-model>.yaml` beside it.
-2. Edit the YAML to tweak row counts, cardinality, distributions,
-   `values:` overrides, or `histogram:` entries.
-3. Re-run the notebook — your edits are picked up.
-4. To start over from the `.vpax`, delete the `.yaml`.
-
-See [`datagen.example.yaml`](datagen.example.yaml) for a fully
-commented sample.
-
-From the CLI:
-
-```bash
-python -m datagen parse model.vpax -o config.yaml
-# edit config.yaml — change row counts, cardinality, distributions, histograms, etc.
-python -m datagen generate config.yaml
-```
-
-Then deploy the semantic model in a notebook:
-
-```python
-from datagen.model_builder import deploy_semantic_model
-deploy_semantic_model("/lakehouse/default/Files/datagen/model.vpax", overwrite=True)
-```
-
-### Specify fixed values
-
-Pin specific values in a column with optional frequency control:
+### Fixed values
 
 ```yaml
 columns:
-  - name: "Priority"
-    data_type: "string"
+  - name: Priority
+    data_type: string
     cardinality: 4
     values:
-      - value: "Critical"
-        frequency: 5          # 5% of rows
-      - value: "High"
-        frequency: 15         # 15% of rows
-      - value: "Medium"
-        frequency: 50         # 50% of rows
-      - "Low"                 # gets remaining 30%
+      - {value: Critical, frequency: 5}    # 5% of rows
+      - {value: High,     frequency: 15}
+      - {value: Medium,   frequency: 50}
+      - Low                                # remaining 30%
 ```
 
 ### Histograms (table-level value pinning)
 
-Pin specific column-value tuples to a target row count or fraction
-of the table. Useful for shaping fact tables to match an observed
-slicer/filter distribution, or for guaranteeing that specific
-combinations exist in the generated data.
+Pin specific column-value tuples to a target row count or fraction of the table. Useful for shaping fact tables to match an observed slicer/filter distribution.
 
 ```yaml
 - name: Sales
   row_count: 100000
   histogram:
     - values: {ProductId: 1, RegionId: 5}
-      rows: 0.15            # 15% of row_count
+      rows: 0.15            # 15% of row_count (or use an integer like 15000)
     - values: {ProductId: 2, RegionId: 5}
-      rows: 0.05            # 5% of row_count
-```
-
-Or as absolute counts:
-
-```yaml
-- name: Sales
-  row_count: 100000
-  histogram:
-    - values: {ProductId: 1, RegionId: 5}
-      rows: 15000
-    - values: {ProductId: 2, RegionId: 5}
-      rows: 5000
+      rows: 0.05
 ```
 
 Rules:
 
-- All `rows` values in one table's histogram must be either fractions
-  in `[0, 1)` or integer counts `>= 1`. Mixing is an error.
-- Sum of fractions must be `<= 1.0`; sum of counts must be
-  `<= row_count`. Remaining rows are generated by the normal
-  distribution.
-- Pinned values override the column's normal value pool only for
-  the rows in that histogram entry; other columns in those rows are
-  still generated normally.
-- If a pinned column is a foreign key, the referenced parent table's
-  primary-key column is automatically seeded with those values, so
-  the FK references always resolve.
-- Multiple child tables may have histograms that reference the same
-  parent; the required PK values from each child are accumulated
-  and de-duplicated on the parent.
+- All `rows` values in one histogram must be either fractions in `[0, 1)` or integer counts `>= 1` (no mixing).
+- Sum of fractions must be `<= 1.0`; sum of counts must be `<= row_count`. Remaining rows fall back to the normal distribution.
+- If a pinned column is a foreign key, the parent table's PK is automatically seeded with those values so the FK always resolves.
 
-**Limitation:** if a parent table has its *own* histogram on the same
-PK column being seeded by a child, the parent's pins may displace the
-child's seeded values at low row IDs. Avoid this combination for now.
+## How Generation Works
 
-### Generate TMDL offline
+**Key columns** are detected by name pattern (`Key`, `Id`, `Code`, …), relationship membership, and cardinality ratio. Integer keys are sequential (`1, 2, …`); string keys are prefixed (`PROD-001, …`); GUID-shaped string keys generate random GUIDs.
 
-```bash
-python -m datagen model model.vpax --mode import --lakehouse MyLakehouse
-```
+**Date dimensions** are auto-detected and built from a contiguous spine with derived columns (Year, Quarter, MonthName, DayOfWeek, …) and an integer-format `DateKey` (`20260101`).
 
-## How Data Generation Works
+**Geography columns** (Country/State/City/PostalCode) are populated from a hierarchy of real places so cities appear in the right state and country.
 
-### Key Column Detection
+**String values** use Docker-style human-readable names (`bold_raven`, `ancient_ivory_cascade`) with length varying around the column average.
 
-Columns are automatically identified as keys using name patterns (Key, ID, Code, etc.), relationship membership, and cardinality ratio. Key styles:
+**Email/username columns** are detected by name and populated with `@contoso.com` (internal) or `@adventureworks.com` / `@wideworldimporters.com` (external).
 
-| Data Type | Style | Example |
-|---|---|---|
-| `int64` | `sequential` | 1, 2, 3, … |
-| `string` | `prefixed` | PROD-001, PROD-002, … |
-| `string` (GUID) | `guid` | `550e8400-e29b-…` |
+**Numeric distributions** are skew-normal (configurable mean / std_dev / skewness). Value-frequency selection uses Zipf for realistic heavy tails.
 
-### Date Tables
-
-Date dimensions are auto-detected and generated with derived columns (Year, Quarter, MonthName, DayOfWeek, etc.) from a contiguous date spine. DateKey uses smart integer format (`20260101`).
-
-### Geography Columns
-
-Country, State, City, and PostalCode columns are auto-detected and generated with valid hierarchies — cities appear in their correct states and countries. Uses real places (60 cities across US, Canada, Mexico, UK, France, Germany).
-
-### String Values
-
-Docker-style human-readable names: `bold_raven`, `ancient_ivory_cascade`. Length varies naturally around the target average.
-
-### Email Columns
-
-Email and username columns are auto-detected by name (e.g. `Email`, `UserPrincipalName`, `Login`) and populated with realistic addresses. Internal/employee tables use Marvel hero names at `@contoso.com`; external tables (customers, suppliers) use DC hero names at `@adventureworks.com` or `@wideworldimporters.com`.
-
-### Numeric Distributions
-
-Skew-normal distributions with configurable mean, std_dev, and skewness. Value frequency uses Zipf power-law selection for realistic skew.
-
-### Spark Performance
-
-- `mapInPandas` single-pass generation (no N-way joins)
-- Broadcast value pools to executors
-- Vectorized numpy operations
-- Deterministic — same seed produces identical data
+**Spark execution** uses `mapInPandas` single-pass generation, broadcast value pools, and vectorised numpy. Same seed produces identical data.
 
 ## Building from Source
 
@@ -273,23 +146,11 @@ python -m build --wheel
 Deploy the wheel and notebook to Fabric:
 
 ```bash
-fab copy dist/datagen_fabric-*.whl "MyWorkspace.Workspace/MyLakehouse.Lakehouse/Files/datagen/" -f
+fab cp dist/datagen_fabric-*.whl "MyWorkspace.Workspace/MyLakehouse.Lakehouse/Files/datagen/" -f
 fab import "MyWorkspace.Workspace/Datagen Main.Notebook" -i "notebook/Datagen Main.Notebook" -f
 ```
 
-> **Releases** include the wheel and `Datagen Main.Notebook.zip`. Cell 1 of the notebook downloads the latest wheel automatically, so end users don't normally need to build from source.
-
-## API Reference
-
-```python
-from datagen import generate
-from datagen.model_builder import deploy_semantic_model, build_tmdl
-from datagen.compare import compare_tables
-from datagen.vpax_parser import parse_vpax
-from datagen.config_generator import generate_config
-from datagen.config import save_config, load_config
-from datagen.spark_generator import generate_all_tables
-```
+Releases include the wheel and `Datagen Main.Notebook.zip`. Cell 1 of the notebook downloads the latest wheel automatically, so end users don't normally need to build from source.
 
 ## CLI Reference
 
@@ -311,7 +172,7 @@ python -m datagen seed-literals config.yaml --dax-trace trace.jsonl
 
 ## Companion: Load Testing
 
-For DAX load testing against the generated semantic models, see the separate [DaxLoadGen](https://github.com/dbrownems/DaxLoadGen) repo (.NET tool that drives concurrent XMLA queries with optional RLS user impersonation and read-only replica routing).
+For DAX load testing against the generated semantic models, see the separate [DaxLoadGen](https://github.com/dbrownems/DaxLoadGen) repo.
 
 ## License
 
