@@ -71,12 +71,28 @@ class ColumnConfig:
 
 
 @dataclass
+class HistogramEntry:
+    """A single row-bucket constraint for a table.
+
+    ``values`` pins specific columns to specific values. ``rows`` says
+    how many rows fall in this bucket — either a fraction in ``[0, 1)``
+    of the table's ``row_count``, or an integer count ``>= 1``.
+    Mixing fractions and counts within a single table's histogram is
+    an error (validated by ``histogram_validator``).
+    """
+
+    values: dict = field(default_factory=dict)
+    rows: float = 0
+
+
+@dataclass
 class TableConfig:
     """Configuration for a single table."""
 
     name: str
     row_count: int = 1000
     columns: list = field(default_factory=list)  # List[ColumnConfig]
+    histogram: list = field(default_factory=list)  # List[HistogramEntry]
 
 
 @dataclass
@@ -175,6 +191,9 @@ def config_to_dict(config):
     # Apply per-column cleaning
     for table in d.get("tables", []):
         table["columns"] = [_clean_column(col) for col in table.get("columns", [])]
+        # Drop empty histogram lists from YAML
+        if not table.get("histogram"):
+            table.pop("histogram", None)
 
     return d
 
@@ -190,6 +209,19 @@ def dict_to_config(d):
             col = ColumnConfig(distribution=dist, **col_data)
             columns.append(col)
         table_data["columns"] = columns
+
+        # Histogram: list of {values: dict, rows: number}
+        hist_data = table_data.pop("histogram", None) or []
+        histogram = []
+        for entry in hist_data:
+            if isinstance(entry, HistogramEntry):
+                histogram.append(entry)
+            else:
+                histogram.append(HistogramEntry(
+                    values=dict(entry.get("values", {})),
+                    rows=entry.get("rows", 0),
+                ))
+        table_data["histogram"] = histogram
         tables.append(TableConfig(**table_data))
 
     return GenerationConfig(

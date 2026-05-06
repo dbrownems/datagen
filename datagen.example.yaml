@@ -1,0 +1,217 @@
+# =============================================================================
+# Sample datagen configuration
+# =============================================================================
+#
+# This file is the "source of truth" companion to a .vpax. On the first run,
+# `generate(spark, "<model>.vpax")` will infer a config like this from the
+# .vpax column statistics and write it as "<model>.yaml" next to the .vpax.
+#
+# Edit it to tweak distributions, then re-run — the YAML is loaded as-is on
+# subsequent runs (inferred values, query-seeding, and BIM cross-referencing
+# are skipped so your edits aren't clobbered). Delete the YAML to start over
+# from the .vpax.
+#
+# Only fields you want to override need to be present. Anything omitted falls
+# back to a sensible default (see datagen/config.py).
+# =============================================================================
+
+model_name: SalesDemo
+output_path: Tables/
+seed: 42
+
+tables:
+
+  # ---------------------------------------------------------------------------
+  # Dimension table with a sequential integer key and a few categorical columns
+  # ---------------------------------------------------------------------------
+  - name: Product
+    row_count: 1000
+    columns:
+      - name: ProductId
+        data_type: int64
+        cardinality: 1000
+        is_key: true
+        key_style: sequential        # 1, 2, 3, ...
+
+      - name: ProductCode
+        data_type: string
+        cardinality: 1000
+        is_key: true
+        key_style: prefixed
+        distribution:
+          prefix: PROD-              # PROD-001, PROD-002, ...
+
+      - name: ProductName
+        data_type: string
+        cardinality: 1000
+        distribution:
+          style: docker              # human-readable, docker-style names
+          avg_length: 18
+
+      - name: Category
+        data_type: string
+        cardinality: 4
+        # Pin specific values with optional frequency weights (0-100 = % of rows).
+        # Plain strings get the leftover share split evenly.
+        values:
+          - value: Electronics
+            frequency: 40
+          - value: Apparel
+            frequency: 30
+          - value: Home
+            frequency: 20
+          - Other                    # remaining 10%
+
+      - name: ListPrice
+        data_type: double
+        cardinality: 800
+        distribution:
+          mean: 75.0
+          std_dev: 30.0
+          skewness: 1.2              # right-skewed: more cheap items than expensive
+          min: 1.0
+
+      - name: IsActive
+        data_type: boolean
+        cardinality: 2
+        nullable: false
+        distribution:
+          true_ratio: 0.85           # 85% true, 15% false
+
+  # ---------------------------------------------------------------------------
+  # Geography dimension — auto-detected geo columns generate valid hierarchies
+  # (cities appear in their correct states/countries).
+  # ---------------------------------------------------------------------------
+  - name: Geography
+    row_count: 200
+    columns:
+      - name: GeographyId
+        data_type: int64
+        cardinality: 200
+        is_key: true
+        key_style: sequential
+
+      - name: Country
+        data_type: string
+        cardinality: 6
+        distribution:
+          style: geo
+          geo_type: country
+
+      - name: State
+        data_type: string
+        cardinality: 60
+        distribution:
+          style: geo
+          geo_type: state
+
+      - name: City
+        data_type: string
+        cardinality: 60
+        distribution:
+          style: geo
+          geo_type: city
+
+      - name: PostalCode
+        data_type: string
+        cardinality: 200
+        distribution:
+          style: geo
+          geo_type: postal_code
+
+  # ---------------------------------------------------------------------------
+  # Date dimension — auto-detected; derived columns (Year, Quarter, MonthName,
+  # DayOfWeek, etc.) are populated from a contiguous date spine.
+  # ---------------------------------------------------------------------------
+  - name: Date
+    row_count: 1827                  # ~5 years
+    columns:
+      - name: DateKey
+        data_type: int64
+        cardinality: 1827
+        is_key: true
+        key_style: sequential        # smart 20260101-style integer
+      - name: Date
+        data_type: datetime
+        cardinality: 1827
+        distribution:
+          start: '2022-01-01'
+          end:   '2026-12-31'
+
+  # ---------------------------------------------------------------------------
+  # Fact table with foreign keys + numeric measures + a histogram
+  # ---------------------------------------------------------------------------
+  - name: Sales
+    row_count: 100000
+    columns:
+      - name: SalesId
+        data_type: int64
+        cardinality: 100000
+        is_key: true
+        key_style: sequential
+
+      - name: ProductId                # FK → Product.ProductId (from .vpax relationships)
+        data_type: int64
+        cardinality: 1000
+
+      - name: GeographyId              # FK → Geography.GeographyId
+        data_type: int64
+        cardinality: 200
+
+      - name: DateKey                  # FK → Date.DateKey
+        data_type: int64
+        cardinality: 1827
+
+      - name: Quantity
+        data_type: int64
+        cardinality: 50
+        distribution:
+          mean: 3.0
+          std_dev: 2.0
+          skewness: 1.5
+          min: 1
+          max: 50
+
+      - name: SalesAmount
+        data_type: double
+        cardinality: 50000
+        distribution:
+          mean: 250.0
+          std_dev: 180.0
+          skewness: 2.0
+          min: 0.0
+
+      - name: CustomerEmail
+        data_type: string
+        cardinality: 8000
+        nullable: true
+        null_ratio: 0.05
+        distribution:
+          style: email                 # auto-generates realistic addresses
+
+    # -------------------------------------------------------------------------
+    # Histograms (optional): pin specific column-value tuples to a target row
+    # count (>=1) or fraction ([0, 1)) of `row_count`. Useful for shaping fact
+    # tables to match an observed slicer/filter distribution, or for
+    # guaranteeing specific combinations exist in the generated data.
+    #
+    # Rules:
+    #   • All `rows` values in one table's histogram must be either fractions
+    #     or counts — mixing the two is an error.
+    #   • Sum of fractions must be <= 1.0; sum of counts must be <= row_count.
+    #   • Remaining rows are generated by the normal distribution.
+    #   • If a pinned column is a foreign key, the referenced parent table's
+    #     PK column is automatically seeded with those values, so FK references
+    #     always resolve. Multiple child histograms may share a parent — the
+    #     required values are de-duplicated.
+    # -------------------------------------------------------------------------
+    histogram:
+      # 15% of Sales rows have ProductId=1 in California (GeographyId=5)
+      - values: {ProductId: 1, GeographyId: 5}
+        rows: 0.15
+      # 5% of Sales rows have ProductId=2 in California
+      - values: {ProductId: 2, GeographyId: 5}
+        rows: 0.05
+      # 10% of Sales rows have ProductId=1 in New York (GeographyId=12)
+      - values: {ProductId: 1, GeographyId: 12}
+        rows: 0.10

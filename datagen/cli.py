@@ -27,8 +27,6 @@ def cmd_parse(args):
         model,
         output_path=args.output_path or "Tables/",
         seed=args.seed,
-        include_hidden=args.include_hidden,
-        include_calculated=args.include_calculated,
     )
 
     if args.dax_trace:
@@ -100,8 +98,6 @@ def cmd_model(args):
         lakehouse_sql_endpoint=args.endpoint,
         model_name=args.model_name,
         mode=args.mode,
-        include_hidden=args.include_hidden,
-        include_calculated=args.include_calculated,
     )
 
 
@@ -118,8 +114,6 @@ def main():
     p_parse.add_argument("-o", "--output", help="Output YAML path (default: <vpax>_config.yaml)")
     p_parse.add_argument("--output-path", default="Tables/", help="Default output_path in config")
     p_parse.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
-    p_parse.add_argument("--include-hidden", action="store_true", help="Include hidden columns")
-    p_parse.add_argument("--include-calculated", action="store_true", help="Include calculated columns")
     p_parse.add_argument("--dax-trace", help="Optional XEvents JSONL trace; literal column "
                          "values from QueryEnd events seed the config.")
     p_parse.add_argument("--top-n", type=int, default=200,
@@ -156,10 +150,8 @@ def main():
     p_model.add_argument("--lakehouse", help="Fabric lakehouse name")
     p_model.add_argument("--endpoint", help="Lakehouse SQL analytics endpoint")
     p_model.add_argument("--model-name", help="Override the model name from the VPAX")
-    p_model.add_argument("--mode", choices=["direct_lake", "import"], default="direct_lake",
-                         help="Model mode: direct_lake (default) or import")
-    p_model.add_argument("--include-hidden", action="store_true", help="Include hidden objects")
-    p_model.add_argument("--include-calculated", action="store_true", help="Include calculated columns")
+    p_model.add_argument("--mode", choices=["direct_lake", "import"], default="import",
+                         help="Model mode: import (default) or direct_lake")
     p_model.set_defaults(func=cmd_model)
 
     args = parser.parse_args()

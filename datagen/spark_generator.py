@@ -154,7 +154,7 @@ def _col_to_dict(col):
     return d
 
 
-def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
+def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=None):
     """Build the partition generator closure for mapInPandas.
 
     Keeping this as a factory avoids serializing the broadcast variables
@@ -169,6 +169,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
         local_cols = cols_bc.value
         base_seed = seed_bc.value
         local_weights = weights_bc.value
+        local_hist = hist_bc.value if hist_bc is not None else []
 
         # Pre-convert pools to numpy arrays once per executor task
         pool_arrays = {}
@@ -281,6 +282,30 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
                 if data_type == "datetime":
                     values = pd.to_datetime(pd.Series(values, dtype=object))
 
+                # --- Histogram pin: override pinned columns at id-range mask ---
+                if local_hist:
+                    for entry in local_hist:
+                        if name not in entry["values"]:
+                            continue
+                        mask = (ids >= entry["start"]) & (ids < entry["end"])
+                        if not mask.any():
+                            continue
+                        pinned = entry["values"][name]
+                        if data_type == "datetime":
+                            pinned = pd.to_datetime(pinned)
+                            if not isinstance(values, pd.Series):
+                                values = pd.Series(values)
+                            values = values.copy()
+                            values[mask] = pinned
+                        else:
+                            if not isinstance(values, np.ndarray):
+                                values = np.array(values, dtype=object)
+                            else:
+                                values = values.copy()
+                            if data_type in ("string", "boolean"):
+                                values = values.astype(object)
+                            values[mask] = pinned
+
                 result[name] = values
 
             yield pd.DataFrame(result)
@@ -288,16 +313,19 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc):
     return partition_generator
 
 
-def generate_table(spark, table_config, output_path, global_seed=42, output_format="delta", allow_overwrite=True):
-    """Generate a single table and write it as a Delta (or parquet) table.
+def generate_table(spark, table_config, output_path, global_seed=42, allow_overwrite=True,
+                   seeded_pk_values=None):
+    """Generate a single table and write it as a Delta table.
 
     Args:
         spark: Active SparkSession.
         table_config: TableConfig dataclass or equivalent dict.
         output_path: Base directory for output.
         global_seed: Seed for reproducible generation.
-        output_format: "delta" (default) or "parquet".
         allow_overwrite: If False, raise an error if the table already exists.
+        seeded_pk_values: Optional ``{column_name: [required_values...]}``
+            mapping. Each required value is forced to appear in that column's
+            generated data (typically the column's PK pool).
     """
     # Normalize access (support both dataclass and dict)
     if hasattr(table_config, "name"):
@@ -410,20 +438,63 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
             if cd.get("name") in (email_col_name, name_col_name):
                 cd["_email_group"] = True
 
+    # ---- Parent PK seeding ----
+    # If this table is the PK side of a histogram-bearing child relationship,
+    # the validator gave us a list of values that MUST appear in that PK
+    # column. Reorder the pool so they sit at the start; in primary-key
+    # mode (cardinality >= row_count) each pool slot maps to exactly one id,
+    # so seeded values appear at ids [0, len(seeded)).
+    if seeded_pk_values:
+        for col_name, required in seeded_pk_values.items():
+            if col_name not in pools or not required:
+                continue
+            current = pools[col_name]
+            req_set = set(required)
+            remaining = [v for v in current if v not in req_set]
+            new_pool = list(required) + remaining
+            # Cap to original pool size (avoid expanding beyond cardinality)
+            new_pool = new_pool[: len(current)]
+            pools[col_name] = new_pool
+
+    # ---- Histogram row plan (child side) ----
+    # Each entry occupies a contiguous id-range starting at 0, so the
+    # partition generator can apply id-based masks. Non-pinned columns
+    # are generated normally per spec.
+    hist_entries = []
+    histogram = (
+        table_config.histogram if hasattr(table_config, "histogram")
+        else table_config.get("histogram", []) if isinstance(table_config, dict)
+        else []
+    ) or []
+    if histogram:
+        from .histogram_validator import _resolve_rows
+        counts = _resolve_rows(histogram, row_count, table_name)
+        cursor = 0
+        for entry, n in zip(histogram, counts):
+            if n <= 0:
+                continue
+            vals = entry.values if hasattr(entry, "values") else entry["values"]
+            hist_entries.append({
+                "start": cursor,
+                "end": cursor + n,
+                "values": dict(vals),
+            })
+            cursor += n
+
     pools_bc = spark.sparkContext.broadcast(pools)
     cols_bc = spark.sparkContext.broadcast(col_dicts)
     seed_bc = spark.sparkContext.broadcast(global_seed)
     weights_bc = spark.sparkContext.broadcast(weights_map)
+    hist_bc = spark.sparkContext.broadcast(hist_entries)
 
     _t2 = _time.time()
 
     # Phase 3 — generate and write
-    gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc)
+    gen_fn = _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc)
     df = spark.range(0, row_count)
     result_df = df.mapInPandas(gen_fn, schema)
 
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(table_name)}"
-    fmt = output_format.lower()
 
     job_desc = f"datagen: {table_name} ({row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{table_name}", job_desc)
@@ -431,7 +502,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     spark.sparkContext.setLocalProperty("callSite.short", job_desc)
     spark.sparkContext.setLocalProperty("callSite.long", job_desc)
     write_mode = "overwrite" if allow_overwrite else "errorIfExists"
-    result_df.write.format(fmt).mode(write_mode) \
+    result_df.write.format("delta").mode(write_mode) \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \
@@ -445,6 +516,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     cols_bc.unpersist()
     seed_bc.unpersist()
     weights_bc.unpersist()
+    hist_bc.unpersist()
 
     # Return timing for caller to display
     return {
@@ -455,14 +527,13 @@ def generate_table(spark, table_config, output_path, global_seed=42, output_form
     }
 
 
-def generate_all_tables(spark, config, output_path=None, output_format="delta", vpax_model=None, overwrite=True, skip_tables=None, skew_recent=False):
+def generate_all_tables(spark, config, output_path=None, vpax_model=None, overwrite=True, skip_tables=None, skew_recent=False, parent_seed_map=None):
     """Generate all tables defined in the configuration.
 
     Args:
         spark: Active SparkSession.
         config: GenerationConfig dataclass, dict, or path to a YAML config file.
         output_path: Override the output_path in the config (optional).
-        output_format: "delta" (default) or "parquet".
         vpax_model: Parsed VPAX model dict (optional). When provided,
             date dimension tables are auto-detected and generated with
             derived column values instead of random data.
@@ -472,6 +543,9 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
             enter-data tables in import mode).
         skew_recent: If True, skew fact table datetime columns towards
             recent dates (~60% in last 2 quarters).
+        parent_seed_map: Optional ``{table: {column: [required_values]}}``
+            mapping from the histogram validator. Required values are
+            forced to appear in the named columns (typically PKs).
     """
     # Load from file if a path is given
     if isinstance(config, (str, Path)):
@@ -495,6 +569,36 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
     if vpax_model:
         for t in vpax_model.get("tables", []):
             vpax_tables[t["name"]] = t
+
+    # Log any column data_type values that differ from the VPAX baseline.
+    # These typically come from auto-aligning relationship types (PK-wins),
+    # but may also be a manual YAML override. Either way, the Delta table
+    # will be written with the config's data_type (used to build the Spark
+    # schema), so it's worth surfacing in the run log.
+    if vpax_model:
+        type_changes = []
+        for table in tables:
+            tname = table.name if hasattr(table, "name") else table["name"]
+            vpax_t = vpax_tables.get(tname)
+            if not vpax_t:
+                continue
+            vpax_col_types = {c["name"]: (c.get("data_type") or "").lower()
+                              for c in vpax_t.get("columns", [])}
+            cols = table.columns if hasattr(table, "columns") else table.get("columns", [])
+            for col in cols:
+                cname = col.name if hasattr(col, "name") else col["name"]
+                cdt = (col.data_type if hasattr(col, "data_type")
+                       else col.get("data_type", "")) or ""
+                cdt = cdt.lower()
+                vdt = vpax_col_types.get(cname)
+                if vdt and cdt and vdt != cdt:
+                    type_changes.append((tname, cname, vdt, cdt))
+        if type_changes:
+            print(f"  ⚠ {len(type_changes)} column data_type(s) differ from the VPAX "
+                  f"baseline — Delta tables will be written with the config types:",
+                  flush=True)
+            for tname, cname, vdt, cdt in type_changes:
+                print(f"      {tname}[{cname}]: {vdt}  →  {cdt}", flush=True)
 
     # Detect schema-enabled lakehouse (Tables/dbo/ exists)
     if out_path.rstrip("/") == "Tables":
@@ -575,7 +679,7 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
         try:
             vpax_table = vpax_tables.get(tname)
             if vpax_table and _is_date_table(vpax_table):
-                _generate_date_table_spark(spark, vpax_table, out_path, output_format)
+                _generate_date_table_spark(spark, vpax_table, out_path)
                 timing = {"total_time": 0}
                 is_date = True
             else:
@@ -590,7 +694,11 @@ def generate_all_tables(spark, config, output_path=None, output_format="delta", 
                             elif isinstance(col, dict):
                                 col["_skew_recent"] = True
 
-                timing = generate_table(spark, table, out_path, seed, output_format, allow_overwrite=overwrite) or {}
+                timing = generate_table(
+                    spark, table, out_path, seed,
+                    allow_overwrite=overwrite,
+                    seeded_pk_values=(parent_seed_map or {}).get(tname),
+                ) or {}
                 is_date = False
 
             total_time = timing.get("total_time", 0)
@@ -646,8 +754,8 @@ def _is_date_table(vpax_table):
     return is_date_table(vpax_table)
 
 
-def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
-    """Generate a date table from VPAX metadata and write it."""
+def _generate_date_table_spark(spark, vpax_table, output_path):
+    """Generate a date table from VPAX metadata and write it as Delta."""
     from .date_table import generate_date_table
     from pyspark.sql.types import StructType, StructField
 
@@ -682,13 +790,12 @@ def _generate_date_table_spark(spark, vpax_table, output_path, output_format):
     sdf = spark.createDataFrame(pdf, schema=schema)
 
     table_path = f"{output_path.rstrip('/')}/{_safe_table_name(tname)}"
-    fmt = output_format.lower()
     job_desc = f"datagen: {tname} (date table, {row_count:,} rows)"
     spark.sparkContext.setJobGroup(f"datagen_{tname}", job_desc)
     spark.sparkContext.setJobDescription(job_desc)
     spark.sparkContext.setLocalProperty("callSite.short", job_desc)
     spark.sparkContext.setLocalProperty("callSite.long", job_desc)
-    sdf.write.format(fmt).mode("overwrite") \
+    sdf.write.format("delta").mode("overwrite") \
         .option("overwriteSchema", "true") \
         .option("delta.columnMapping.mode", "name") \
         .option("delta.minReaderVersion", "2") \

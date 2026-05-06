@@ -1,6 +1,10 @@
 """Datagen - Generate realistic Delta tables from Power BI model metadata (.vpax files)."""
 
-__version__ = "0.8.30"
+from importlib.metadata import version as _v, PackageNotFoundError as _PNF
+try:
+    __version__ = _v("datagen-fabric")
+except _PNF:
+    __version__ = "0.0.0+local"
 
 
 def generate(
@@ -15,12 +19,11 @@ def generate(
     lakehouse=None,
     overwrite_tables=True,
     overwrite_model=True,
-    mode="direct_lake",
-    output_format="delta",
-    include_hidden=False,
-    include_calculated=False,
+    mode="import",
     queries_path=None,
     skew_recent=False,
+    replace_username_with_customdata=False,
+    auto_fix_relationship_types=True,
 ):
     """One-call pipeline: .vpax → Delta tables → semantic model → comparison report.
 
@@ -45,10 +48,7 @@ def generate(
             skip tables that already exist and only generate missing ones.
         overwrite_model: If True, overwrite an existing semantic model.
             If False, fail if the model already exists.
-        mode: ``"direct_lake"`` (default) or ``"import"``.
-        output_format: ``"delta"`` (default) or ``"parquet"``.
-        include_hidden: Include hidden columns/tables from the VPAX.
-        include_calculated: Include calculated columns.
+        mode: ``"import"`` (default) or ``"direct_lake"``.
 
     Returns:
         pandas.DataFrame with the comparison report (if compare=True),
@@ -65,6 +65,7 @@ def generate(
     """
     from .vpax_parser import parse_vpax
     from .config_generator import generate_config
+    from .config import save_config, load_config
     from .spark_generator import generate_all_tables
 
     # Step 1 — infer generation config directly from VPAX
@@ -77,26 +78,45 @@ def generate(
           f"{len(vpax_model.get('relationships', []))} relationships "
           f"({_time.time() - _t0:.1f}s)", flush=True)
 
+    # Companion YAML lives next to the .vpax. If present, it represents
+    # the user's tweaked config and is loaded instead of regenerating.
+    # Otherwise, infer from VPAX and save it for future tweaks.
+    yaml_path = os.path.splitext(vpax_path)[0] + ".yaml"
     _t1 = _time.time()
-    print("Inferring generation config ...", flush=True)
-    config = generate_config(
-        vpax_model,
-        output_path=output_path,
-        seed=seed,
-        include_hidden=include_hidden,
-        include_calculated=include_calculated,
-    )
+    loaded_from_yaml = os.path.exists(yaml_path)
+    if loaded_from_yaml:
+        print(f"Loading existing config: {os.path.basename(yaml_path)}", flush=True)
+        config = load_config(yaml_path)
+        # Honor caller's seed/output_path overrides
+        if output_path:
+            config.output_path = output_path
+        if seed is not None:
+            config.seed = seed
+    else:
+        print("Inferring generation config ...", flush=True)
+        config = generate_config(
+            vpax_model,
+            output_path=output_path,
+            seed=seed,
+        )
 
-    # Extract fixed values from captured queries for low-cardinality columns
-    if queries_path:
-        from .dax_rewriter import extract_query_values
-        n_fixed = extract_query_values(config, queries_path)
+    # Query seeding and BIM cross-ref only apply when freshly generating;
+    # loaded YAML is treated as the source of truth.
+    if not loaded_from_yaml and queries_path:
+        # Detect format: .jsonl (DAX trace) → use new literal extractor;
+        # .json (legacy structured queries) → use old extract_query_values.
+        if str(queries_path).lower().endswith(".jsonl"):
+            from .dax_literal_extractor import seed_config_from_trace
+            n_fixed = seed_config_from_trace(config, queries_path, vpax_model=vpax_model)
+        else:
+            from .dax_rewriter import extract_query_values
+            n_fixed = extract_query_values(config, queries_path)
         if n_fixed:
             print(f"  Applied {n_fixed} column value(s) from queries", flush=True)
 
     # Cross-reference with BIM to add columns missing from VPAX stats
     # (Direct Lake needs all BIM columns in Delta; Import mode doesn't)
-    if deploy_model and mode == "direct_lake":
+    if not loaded_from_yaml and deploy_model and mode == "direct_lake":
         from .model_builder import _extract_bim, _add_missing_bim_columns
         try:
             bim = _extract_bim(vpax_path)
@@ -116,12 +136,41 @@ def generate(
 
     print(f"  Config ready ({_time.time() - _t1:.1f}s)", flush=True)
 
+    # Save the freshly-inferred config so the user can tweak and re-run.
+    # Skip if we loaded from YAML (don't clobber user edits).
+    if not loaded_from_yaml:
+        try:
+            save_config(config, yaml_path)
+            print(f"  Saved config: {os.path.basename(yaml_path)}", flush=True)
+        except Exception as e:
+            print(f"  ⚠ Could not save config to {yaml_path}: {e}", flush=True)
+
+    # Validate per-table histograms and compute parent PK seeding map.
+    # Raises ValueError on any constraint violation (mixing fractions/counts,
+    # multiple histograms in the same relationship cluster, etc.).
+    from .histogram_validator import validate_and_build_seed_map
+    parent_seed_map, _hist_counts = validate_and_build_seed_map(config, vpax_model)
+    if parent_seed_map:
+        n_seeded = sum(len(cols) for cols in parent_seed_map.values())
+        n_hist_tables = sum(1 for t in config.tables if getattr(t, "histogram", None))
+        print(f"  Histogram: {n_hist_tables} table(s) with histograms; "
+              f"seeding {n_seeded} parent column(s) "
+              f"across {len(parent_seed_map)} parent table(s)", flush=True)
+
+    # Direct Lake refuses relationships with mismatched FromColumn/ToColumn types.
+    # Auto-widen by default; log a prominent warning + the YAML snippets the user
+    # can paste to take control (including a narrowing alternative).
+    if mode == "direct_lake":
+        from .relationship_type_fixer import fix_relationship_types
+        fix_relationship_types(config, vpax_model, auto_fix=auto_fix_relationship_types)
+
     # Step 2 — generate Delta tables (pass vpax_model for date table detection)
     succeeded_tables, actual_output_path = generate_all_tables(
         spark, config, output_path=output_path,
-        output_format=output_format, vpax_model=vpax_model,
+        vpax_model=vpax_model,
         overwrite=overwrite_tables, skip_tables=tables_to_skip,
-        skew_recent=skew_recent)
+        skew_recent=skew_recent,
+        parent_seed_map=parent_seed_map)
 
     # Step 3 — deploy semantic model (optional, only for tables that succeeded)
     if deploy_model:
@@ -132,10 +181,10 @@ def generate(
             workspace=workspace,
             lakehouse=lakehouse,
             mode=mode,
-            include_hidden=include_hidden,
-            include_calculated=include_calculated,
             overwrite=overwrite_model,
             table_filter=succeeded_tables,
+            replace_username_with_customdata=replace_username_with_customdata,
+            config=config,
         )
 
     # Step 4 — compare generated tables against config (optional)

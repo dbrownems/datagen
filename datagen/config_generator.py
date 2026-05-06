@@ -490,8 +490,6 @@ def generate_config(
     vpax_model,
     output_path="Tables/",
     seed=42,
-    include_hidden=False,
-    include_calculated=False,
 ):
     """Generate a GenerationConfig from parsed VPAX model metadata.
 
@@ -499,8 +497,6 @@ def generate_config(
         vpax_model: Dict from vpax_parser.parse_vpax().
         output_path: Default output path for Delta tables.
         seed: Random seed for reproducibility.
-        include_hidden: Whether to include hidden columns.
-        include_calculated: Whether to include calculated columns.
 
     Returns:
         GenerationConfig instance.
@@ -522,11 +518,8 @@ def generate_config(
 
         columns = []
         for col_meta in table_meta.get("columns", []):
-            if col_meta.get("is_hidden", False) and not include_hidden:
-                continue
-            # Always include calculated columns — they need to exist in
-            # Delta tables for Direct Lake (calc columns aren't supported)
-
+            # All columns (hidden + calculated) are included so the deployed
+            # semantic model can reference them as physical Delta columns.
             col_config = _infer_column_config(col_meta, row_count, relationship_columns, table_name)
             columns.append(col_config)
 
