@@ -220,6 +220,38 @@ def generate(
         except Exception as e:
             print(f"  ⚠ Could not save config to {yaml_path}: {e}", flush=True)
 
+    # Optional histograms sidecar: <vpax-stem>.histograms.yaml
+    # Lets users keep table histograms across regenerations of the main
+    # YAML. Sidecar entries override per-table whatever (if anything) was
+    # already on the config.
+    from .histograms_sidecar import (
+        sidecar_path_for, load_histograms_sidecar, apply_histograms_to_config,
+    )
+    hist_sidecar_path = sidecar_path_for(vpax_path)
+    if os.path.exists(hist_sidecar_path):
+        try:
+            sidecar_map = load_histograms_sidecar(hist_sidecar_path)
+            patched, unknown = apply_histograms_to_config(config, sidecar_map)
+            if patched:
+                print(
+                    f"  Applied histograms from "
+                    f"{os.path.basename(hist_sidecar_path)} "
+                    f"to {patched} table(s)",
+                    flush=True,
+                )
+            if unknown:
+                print(
+                    f"  ⚠ Histograms sidecar references unknown table(s) "
+                    f"(skipped): {sorted(unknown)}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"  ⚠ Could not apply histograms sidecar "
+                f"{os.path.basename(hist_sidecar_path)}: {e}",
+                flush=True,
+            )
+
     # Validate per-table histograms and compute parent PK seeding map.
     # Raises ValueError on any constraint violation (mixing fractions/counts,
     # multiple histograms in the same relationship cluster, etc.).

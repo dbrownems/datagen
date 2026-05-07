@@ -147,6 +147,30 @@ Rules:
 - Sum of fractions must be `<= 1.0`; sum of counts must be `<= row_count`. Remaining rows fall back to the normal distribution.
 - If a pinned column is a foreign key, the parent table's PK is automatically seeded with those values so the FK always resolves.
 
+#### Preserving histograms across regeneration: `<vpax>.histograms.yaml`
+
+The main YAML is regenerated from the `.vpax` whenever it is missing, which would erase any hand-edited histograms. To keep histograms across regenerations, put them in an optional sidecar file named `<vpax-stem>.histograms.yaml` next to the main config (typically the lakehouse `Files/datagen/` folder):
+
+```yaml
+# my_model.histograms.yaml
+tables:
+  Sales:
+    - values: {ProductId: 1, RegionId: 5}
+      rows: 0.15
+    - values: {ProductId: 2, RegionId: 5}
+      rows: 0.05
+  Returns:
+    - values: {Region: "EU"}
+      rows: 200000
+```
+
+`generate()` loads the sidecar (if present) on every run and overlays its histograms onto the config, replacing whatever (if anything) the main YAML had for those tables. To migrate existing histograms out of a main YAML one time:
+
+```
+python -m datagen extract-histograms my_model.yaml
+# → writes my_model.histograms.yaml; then delete the histogram blocks from my_model.yaml
+```
+
 ## How Generation Works
 
 **Key columns** are detected by name pattern (`Key`, `Id`, `Code`, …), relationship membership, and cardinality ratio. Integer keys are sequential (`1, 2, …`); string keys are prefixed (`PROD-001, …`); GUID-shaped string keys generate random GUIDs.

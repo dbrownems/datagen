@@ -65,6 +65,26 @@ def cmd_seed_literals(args):
     print(f"Seeded {n} columns; config written to: {out_file}")
 
 
+def cmd_extract_histograms(args):
+    """Extract histograms from an existing YAML config into a sidecar file."""
+    from .config import load_config
+    from .histograms_sidecar import (
+        extract_histograms_from_config, save_histograms_sidecar,
+        sidecar_path_for,
+    )
+
+    config = load_config(args.config_file)
+    sidecar_map = extract_histograms_from_config(config)
+    if not sidecar_map:
+        print(f"No histograms found in {args.config_file}; nothing to extract.")
+        return
+    out = args.output or sidecar_path_for(args.config_file)
+    save_histograms_sidecar(sidecar_map, out)
+    n_entries = sum(len(v) for v in sidecar_map.values())
+    print(f"Extracted histograms for {len(sidecar_map)} table(s) "
+          f"({n_entries} entries) → {out}")
+
+
 def cmd_generate(args):
     """Generate Delta tables from a YAML config (requires PySpark)."""
     try:
@@ -139,6 +159,16 @@ def main():
     p_seed.add_argument("--observed-share", type=float, default=0.7)
     p_seed.add_argument("--verbose", action="store_true")
     p_seed.set_defaults(func=cmd_seed_literals)
+
+    # -- extract-histograms --
+    p_eh = subparsers.add_parser(
+        "extract-histograms",
+        help="Extract histograms from an existing YAML config to a sidecar "
+             "(<config>.histograms.yaml) so they survive regeneration.")
+    p_eh.add_argument("config_file", help="Existing YAML config containing histograms")
+    p_eh.add_argument("-o", "--output", help="Output sidecar path "
+                      "(default: <config>.histograms.yaml)")
+    p_eh.set_defaults(func=cmd_extract_histograms)
 
     # -- generate --
     p_gen = subparsers.add_parser("generate", help="Generate Delta tables from YAML config")
