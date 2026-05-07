@@ -468,7 +468,7 @@ def generate_table(spark, table_config, output_path, global_seed=42, allow_overw
     ) or []
     if histogram:
         from .histogram_validator import _resolve_rows
-        counts = _resolve_rows(histogram, row_count, table_name)
+        counts, _mode = _resolve_rows(histogram, row_count, table_name)
         cursor = 0
         for entry, n in zip(histogram, counts):
             if n <= 0:

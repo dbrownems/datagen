@@ -46,7 +46,7 @@ def _resolve_rows(entries, table_row_count, table_name):
     Returns list[int] aligned with ``entries``.
     """
     if not entries:
-        return []
+        return [], "empty"
 
     fractions = []
     counts = []
@@ -90,16 +90,11 @@ def _resolve_rows(entries, table_row_count, table_name):
         for i, f in fractions:
             resolved[i] = int(round(f * table_row_count))
     else:
-        total = sum(c for _, c in counts)
-        if total > table_row_count:
-            raise ValueError(
-                f"Histogram on table '{table_name}' row counts sum to "
-                f"{total} > table row_count {table_row_count}."
-            )
         for i, c in counts:
             resolved[i] = c
 
-    return resolved
+    mode = "fractions" if fractions else "counts" if counts else "empty"
+    return resolved, mode
 
 
 def validate_and_build_seed_map(config, vpax_model):
@@ -159,8 +154,32 @@ def validate_and_build_seed_map(config, vpax_model):
                     )
 
         # Resolve rows + global per-table totals
-        counts = _resolve_rows(entries, table.row_count, table.name)
+        counts, mode = _resolve_rows(entries, table.row_count, table.name)
         resolved_counts[table.name] = counts
+
+        # Reconcile pinned-row total vs the table's target row_count.
+        # Only meaningful for absolute counts; fractions already cap at
+        # row_count by construction in _resolve_rows.
+        if mode == "counts":
+            pinned_total = sum(counts)
+            if pinned_total > table.row_count:
+                print(
+                    f"  Histogram on '{table.name}': pinned rows sum to "
+                    f"{pinned_total:,} > target row_count "
+                    f"{table.row_count:,}; overriding row_count to "
+                    f"{pinned_total:,}.",
+                    flush=True,
+                )
+                table.row_count = pinned_total
+            elif pinned_total < table.row_count:
+                fill = table.row_count - pinned_total
+                print(
+                    f"  Histogram on '{table.name}': pinned rows sum to "
+                    f"{pinned_total:,} < target row_count "
+                    f"{table.row_count:,}; generating {fill:,} additional "
+                    f"row(s) to fill.",
+                    flush=True,
+                )
 
         # Coerce values to declared column types in-place
         col_types = {c.name: c.data_type for c in table.columns}
