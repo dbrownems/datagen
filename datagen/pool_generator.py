@@ -180,6 +180,68 @@ def generate_datetime_pool(dist, cardinality, seed=42):
     return dates
 
 
+def generate_sequential_date_pool(cardinality):
+    """Generate a pool of unique sequential daily dates ending at the start
+    of the current year and going backwards.
+
+    Output strings match the format used by ``generate_datetime_pool`` so
+    downstream code (Pandas/Spark conversion) treats them identically.
+    """
+    if cardinality <= 0:
+        return []
+    end_dt = datetime(datetime.now().year, 1, 1)
+    start_dt = end_dt - timedelta(days=cardinality - 1)
+    return [
+        (start_dt + timedelta(days=i)).strftime("%Y-%m-%d %H:%M:%S")
+        for i in range(cardinality)
+    ]
+
+
+def generate_sequential_month_pool(cardinality, anchor="end"):
+    """Generate a pool of unique month-anchored dates (one per month).
+
+    Anchored at the start or end of each month, ending at the most recent
+    completed month before the current month and going back ``cardinality``
+    months. Used for datetime key columns whose name implies monthly
+    granularity (e.g. ``MonthEndDate``, ``MonthStartDate``).
+    """
+    if cardinality <= 0:
+        return []
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Newest month is the month BEFORE the current month, so all values are
+    # in fully-completed months.
+    if today.month == 1:
+        latest_year, latest_month = today.year - 1, 12
+    else:
+        latest_year, latest_month = today.year, today.month - 1
+
+    months = []
+    for i in range(cardinality):
+        offset = i  # 0 = newest, cardinality-1 = oldest
+        m = latest_month - offset
+        y = latest_year
+        while m <= 0:
+            m += 12
+            y -= 1
+        months.append((y, m))
+    months.reverse()  # oldest first, matches sequential ordering
+
+    result = []
+    for (y, m) in months:
+        if anchor == "start":
+            dt = datetime(y, m, 1)
+        else:  # "end"
+            # Last day of month: jump to next month, subtract a day
+            if m == 12:
+                next_first = datetime(y + 1, 1, 1)
+            else:
+                next_first = datetime(y, m + 1, 1)
+            dt = next_first - timedelta(days=1)
+        result.append(dt.strftime("%Y-%m-%d %H:%M:%S"))
+    return result
+
+
 def generate_boolean_pool(dist, cardinality, seed=42):
     """Generate a pool of boolean values."""
     if cardinality <= 1:
@@ -357,6 +419,12 @@ def generate_value_pool(col_config, global_seed=42, table_name=""):
             )
         if key_style == "guid":
             return generate_guid_pool(cardinality, seed=col_seed)
+        if key_style == "sequential_date":
+            return generate_sequential_date_pool(cardinality)
+        if key_style == "sequential_month_end":
+            return generate_sequential_month_pool(cardinality, anchor="end")
+        if key_style == "sequential_month_start":
+            return generate_sequential_month_pool(cardinality, anchor="start")
 
     # Generate the pool with fixed values at the front
     gen_cardinality = max(0, cardinality - len(fixed_values))

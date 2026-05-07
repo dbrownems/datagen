@@ -69,6 +69,33 @@ def _is_key_name(col_name):
     return any(lower.endswith(s) for s in _KEY_SUFFIXES)
 
 
+# Monthly-granularity datetime key patterns. Normalized form (lowercase,
+# separators stripped) is checked.
+_MONTH_END_DATE_PATTERNS = {
+    "monthenddate", "monthend", "endofmonth", "endofmonthdate", "eomdate",
+    "lastdayofmonth", "lastdateofmonth", "monthlastdate", "monthclosedate",
+    "monthcloseddate",
+}
+_MONTH_START_DATE_PATTERNS = {
+    "monthstartdate", "monthstart", "startofmonth", "startofmonthdate",
+    "bomdate", "firstdayofmonth", "firstdateofmonth", "monthbegindate",
+    "monthbeginningdate", "monthfirstdate", "monthopendate",
+    "beginningofmonth", "beginningofmonthdate",
+}
+
+
+def _detect_monthly_date_key_style(col_name):
+    """If the name suggests a one-row-per-month datetime key, return the
+    matching key_style ("sequential_month_end" or "sequential_month_start"),
+    else None."""
+    norm = col_name.lower().replace("_", "").replace(" ", "").replace("-", "")
+    if norm in _MONTH_END_DATE_PATTERNS:
+        return "sequential_month_end"
+    if norm in _MONTH_START_DATE_PATTERNS:
+        return "sequential_month_start"
+    return None
+
+
 def _is_guid_column(col_name, avg_length):
     """Detect if a string column likely stores GUIDs.
 
@@ -172,7 +199,12 @@ def _detect_key(col_meta, row_count, relationship_columns):
         if _is_guid_column(name, avg_len):
             return True, "guid"
         return True, "prefixed"
-    # Other types (double, datetime) are unusual as keys — mark but no style
+    if data_type == "datetime":
+        monthly_style = _detect_monthly_date_key_style(name)
+        if monthly_style:
+            return True, monthly_style
+        return True, "sequential_date"
+    # Other types (double) are unusual as keys — mark but no style
     return True, None
 
 
@@ -402,6 +434,15 @@ def _infer_column_config(col_meta, row_count, relationship_columns=None, table_n
 
         if key_style == "guid":
             dist = DistributionConfig(avg_length=36)
+            return ColumnConfig(
+                name=name, data_type=data_type, cardinality=cardinality,
+                selection=selection, zipf_exponent=zipf_exp,
+                is_key=True, key_style=key_style, distribution=dist,
+            )
+
+        if key_style in ("sequential_date", "sequential_month_end",
+                         "sequential_month_start"):
+            dist = DistributionConfig()
             return ColumnConfig(
                 name=name, data_type=data_type, cardinality=cardinality,
                 selection=selection, zipf_exponent=zipf_exp,
