@@ -82,7 +82,7 @@ def cmd_extract_histograms(args):
     save_histograms_sidecar(sidecar_map, out)
     n_entries = sum(len(v) for v in sidecar_map.values())
     print(f"Extracted histograms for {len(sidecar_map)} table(s) "
-          f"({n_entries} entries) → {out}")
+          f"({n_entries} entries) -> {out}")
 
 
 def cmd_generate(args):
