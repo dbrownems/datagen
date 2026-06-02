@@ -198,6 +198,8 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=No
             # Pre-compute shared geo indices (all geo columns use the same index)
             geo_indices = None
             email_indices = None
+            # Cache of indices keyed by column name, for sort-by-column groups
+            indices_by_col = {}
 
             for col in local_cols:
                 name = col["name"]
@@ -218,10 +220,22 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=No
                     else:
                         values = rng.random(n) < true_ratio
 
+                # --- Sort-by-column: reuse the sort column's row indices ---
+                elif col.get("_sort_group"):
+                    sort_col_name = col["_sort_group"]
+                    sort_indices = indices_by_col.get(sort_col_name)
+                    if sort_indices is None:
+                        # Fallback: random selection (sort col not yet seen
+                        # — this shouldn't happen because we topo-sort
+                        # col_dicts so the sort col comes first)
+                        sort_indices = rng.integers(0, cardinality, size=n)
+                    values = pool[sort_indices % cardinality]
+
                 # --- Primary key: direct ID-based indexing (each value once) ---
                 elif col.get("_primary_key_mode"):
                     indices = (ids % cardinality).astype(np.int64)
                     values = pool[indices]
+                    indices_by_col[name] = indices
 
                 # --- Correlated geo column: share indices with other geo cols ---
                 elif col.get("_geo_group"):
@@ -230,6 +244,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=No
                         geo_rng = np.random.default_rng(geo_seed)
                         geo_indices = geo_rng.integers(0, cardinality, size=n)
                     values = pool[geo_indices % cardinality]
+                    indices_by_col[name] = geo_indices % cardinality
 
                 # --- Correlated email+name: share indices ---
                 elif col.get("_email_group"):
@@ -238,6 +253,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=No
                         email_rng = np.random.default_rng(email_seed)
                         email_indices = email_rng.integers(0, cardinality, size=n)
                     values = pool[email_indices % cardinality]
+                    indices_by_col[name] = email_indices % cardinality
 
                 # --- All other types: pool-based selection ---
                 else:
@@ -265,6 +281,7 @@ def _make_partition_generator(pools_bc, cols_bc, seed_bc, weights_bc, hist_bc=No
                         indices = rng.integers(0, cardinality, size=n)
 
                     values = pool[indices]
+                    indices_by_col[name] = indices
 
                 # --- Null injection ---
                 null_ratio = col.get("null_ratio", 0.0) or 0.0
@@ -437,6 +454,69 @@ def generate_table(spark, table_config, output_path, global_seed=42, allow_overw
         for cd in col_dicts:
             if cd.get("name") in (email_col_name, name_col_name):
                 cd["_email_group"] = True
+
+    # ---- Sort-by-column groups ----
+    # For each column with sort_by_column == S, rebuild its pool aligned
+    # to S's pool: a length-N_S array drawn from N_D distinct display
+    # values. Each S row index then deterministically picks one D value,
+    # which guarantees the engine constraint that D is a function of S.
+    by_name = {cd.get("name"): cd for cd in col_dicts}
+    for cd in col_dicts:
+        sb = cd.get("sort_by_column")
+        if not sb:
+            continue
+        sib = by_name.get(sb)
+        cname = cd.get("name")
+        if sib is None or cname not in pools or sb not in pools:
+            continue
+        n_s = len(pools[sb])
+        d_pool_orig = pools.get(cname) or []
+        n_d = cd.get("cardinality", 0) or len(d_pool_orig)
+        if n_s == 0 or not d_pool_orig:
+            continue
+        if n_d > n_s:
+            print(
+                f"  ⚠ Sort-by '{cname}' (card={n_d}) > sort col '{sb}' "
+                f"(card={n_s}); clamping display cardinality to {n_s}.",
+                flush=True,
+            )
+            n_d = n_s
+        d_distinct = list(dict.fromkeys(d_pool_orig))[:n_d]
+        if not d_distinct:
+            continue
+        # Round-robin assign each S slot to a distinct D value -> every
+        # D value appears at least once and D is a function of S index.
+        paired = [d_distinct[i % len(d_distinct)] for i in range(n_s)]
+        pools[cname] = paired
+        cd["_sort_group"] = sb
+        cd["cardinality"] = len(d_distinct)
+        # Drop weights -- paired pool overrides
+        weights_map.pop(cname, None)
+
+    # Reorder col_dicts so any sort-source column is processed before its
+    # dependent column (the partition generator caches indices by column
+    # name as it goes).
+    if any(cd.get("_sort_group") for cd in col_dicts):
+        ordered = []
+        seen = set()
+        def _emit(c):
+            n = c.get("name")
+            if n in seen:
+                return
+            sb = c.get("_sort_group")
+            if sb and sb in by_name and sb not in seen:
+                _emit(by_name[sb])
+            ordered.append(c)
+            seen.add(n)
+        for c in col_dicts:
+            _emit(c)
+        col_dicts = ordered
+        # Rebuild schema in matching order so DataFrame columns align.
+        cols_by_name = {
+            (c.name if hasattr(c, "name") else c["name"]): c for c in columns
+        }
+        columns = [cols_by_name[cd["name"]] for cd in col_dicts]
+        schema = _build_schema(columns)
 
     # ---- Parent PK seeding ----
     # If this table is the PK side of a histogram-bearing child relationship,

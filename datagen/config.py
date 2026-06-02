@@ -48,6 +48,13 @@ class ColumnConfig:
     is_key: bool = False
     key_style: Optional[str] = None  # "sequential" | "prefixed" | "guid"
 
+    # Sort-by-column constraint: when set, this column's value at each row
+    # must be a function of the named sibling column's value (and the
+    # sibling must have at least as many distinct values). Generation
+    # synthesises a paired pool so each value of *this* column always pairs
+    # with a single value of the sort column.
+    sort_by_column: Optional[str] = None
+
     # Fixed values to include in the pool.
     # Each entry is either a plain value or a dict with "value" and "frequency".
     # Plain values appear with the same frequency as generated values.
@@ -175,6 +182,7 @@ def _clean_column(col_dict):
         "is_key": False,
         "key_style": None,
         "values": None,
+        "sort_by_column": None,
     }
     for key, default in defaults_to_strip.items():
         if col_dict.get(key) == default:

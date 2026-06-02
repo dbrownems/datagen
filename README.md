@@ -171,6 +171,21 @@ python -m datagen extract-histograms my_model.yaml
 # → writes my_model.histograms.yaml; then delete the histogram blocks from my_model.yaml
 ```
 
+### Sort-by columns
+
+When the source model declares `SortByColumn` (e.g. display column `Quarter Name` sorted by `Quarter Sort Id`), the Tabular engine requires that each display value pair with exactly one sort value — otherwise refresh logs `"Cannot order [X] by [Y] because at least one value in [X] has multiple distinct values in [Y]"`.
+
+datagen now reads `sort_by_column` from the VPAX, plumbs it onto `ColumnConfig`, and at generation time builds the display column's value pool *paired* to the sort column's pool (round-robin) so the constraint always holds. No user action is required — the YAML simply has:
+
+```yaml
+- name: Quarter Name
+  data_type: string
+  cardinality: 4
+  sort_by_column: Quarter Sort Id
+```
+
+If display cardinality exceeds sort cardinality (which the engine wouldn't permit anyway), datagen clamps and warns.
+
 ## How Generation Works
 
 **Key columns** are detected by name pattern (`Key`, `Id`, `Code`, …), relationship membership, and cardinality ratio. Integer keys are sequential (`1, 2, …`); string keys are prefixed (`PROD-001, …`); GUID-shaped string keys generate random GUIDs.

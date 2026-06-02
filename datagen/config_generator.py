@@ -562,6 +562,9 @@ def generate_config(
             # All columns (hidden + calculated) are included so the deployed
             # semantic model can reference them as physical Delta columns.
             col_config = _infer_column_config(col_meta, row_count, relationship_columns, table_name)
+            sort_by = col_meta.get("sort_by_column")
+            if sort_by and sort_by != col_config.name:
+                col_config.sort_by_column = sort_by
             columns.append(col_config)
 
         if columns:
